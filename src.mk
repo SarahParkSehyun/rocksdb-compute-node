@@ -264,7 +264,6 @@ LIB_SOURCES =                                                   \
   util/string_util.cc                                           \
   util/thread_local.cc                                          \
   util/threadpool_imp.cc                                        \
-  util/io_dispatcher_imp.cc                                     \
   util/udt_util.cc                                              \
   util/write_batch_util.cc                                      \
   util/xxhash.cc                                                \
@@ -337,6 +336,8 @@ LIB_SOURCES =                                                   \
   utilities/wal_filter.cc                                       \
   utilities/write_batch_with_index/write_batch_with_index.cc    \
   utilities/write_batch_with_index/write_batch_with_index_internal.cc    \
+  tools/bloomcheck.pb.cc                                        \
+  tools/bloomcheck.grpc.pb.cc                                   \
 
 ifeq (,$(shell $(CXX) -fsyntax-only -maltivec -xc /dev/null 2>&1))
 LIB_SOURCES_ASM =\
@@ -621,7 +622,6 @@ TEST_MAIN_SOURCES =                                                     \
   util/hash_test.cc                                                     \
   util/heap_test.cc                                                     \
   util/interval_test.cc                                                 \
-  util/io_dispatcher_test.cc                                            \
   util/random_test.cc                                                   \
   util/rate_limiter_test.cc                                             \
   util/repeatable_thread_test.cc                                        \

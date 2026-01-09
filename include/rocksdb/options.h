@@ -2266,6 +2266,11 @@ struct ReadOptions {
   // an application level request that results in multiple RocksDB api calls
   const std::string* request_id = nullptr;
 
+  // Internal use only: BloomCheck filter result.
+  // Points to std::unordered_set<uint64_t>* containing file numbers that may match.
+  // If nullptr, BloomCheck filtering is disabled.
+  void* bloomcheck_may_match_files = nullptr;
+
   // *** END per-request settings for internal team use only ***
 
   ReadOptions() {}

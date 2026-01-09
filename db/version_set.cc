@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "db/blob/blob_fetcher.h"
@@ -2738,6 +2739,14 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                 storage_info_.num_non_empty_levels_,
                 &storage_info_.file_indexer_, user_comparator(),
                 internal_comparator());
+  
+  // BloomCheck 필터: may_match=true인 파일 번호 Set
+  const std::unordered_set<uint64_t>* bloomcheck_may_match_files = nullptr;
+  if (read_options.bloomcheck_may_match_files != nullptr) {
+    bloomcheck_may_match_files = static_cast<const std::unordered_set<uint64_t>*>(
+        read_options.bloomcheck_may_match_files);
+  }
+  
   FdWithKeyRange* f = fp.GetNextFile();
 
   while (f != nullptr) {
@@ -2746,6 +2755,18 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       // stop here.
       break;
     }
+    
+    // BloomCheck 필터링: may_match=false인 파일은 스킵
+    if (bloomcheck_may_match_files != nullptr) {
+      uint64_t file_number = f->file_metadata->fd.GetNumber();
+      if (bloomcheck_may_match_files->find(file_number) == 
+          bloomcheck_may_match_files->end()) {
+        // may_match=false인 파일은 스킵하고 다음 파일로
+        f = fp.GetNextFile();
+        continue;
+      }
+    }
+    
     if (get_context.sample()) {
       sample_file_read_inc(f->file_metadata);
     }

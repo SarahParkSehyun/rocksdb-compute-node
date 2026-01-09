@@ -257,6 +257,9 @@ ROCKSDB_PLUGIN_TESTS = $(foreach p, $(ROCKSDB_PLUGINS), $(foreach test, $($(p)_T
 CXXFLAGS += $(foreach plugin, $(ROCKSDB_PLUGINS), $($(plugin)_CXXFLAGS))
 PLATFORM_LDFLAGS += $(ROCKSDB_PLUGIN_LDFLAGS)
 
+# gRPC 라이브러리 링크 (BloomCheck 서비스용)
+PLATFORM_LDFLAGS += -lgrpc++ -lprotobuf -lgpr -labsl_synchronization -pthread
+
 # Patch up the link flags for JNI from the plugins
 JAVA_LDFLAGS += $(ROCKSDB_PLUGIN_LDFLAGS)
 JAVA_STATIC_LDFLAGS += $(ROCKSDB_PLUGIN_LDFLAGS)
@@ -1920,9 +1923,6 @@ blob_source_test: $(OBJ_DIR)/db/blob/blob_source_test.o $(TEST_LIBRARY) $(LIBRAR
 	$(AM_LINK)
 
 blob_garbage_meter_test: $(OBJ_DIR)/db/blob/blob_garbage_meter_test.o $(TEST_LIBRARY) $(LIBRARY)
-	$(AM_LINK)
-
-io_dispatcher_test: $(OBJ_DIR)/util/io_dispatcher_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 timer_test: $(OBJ_DIR)/util/timer_test.o $(TEST_LIBRARY) $(LIBRARY)

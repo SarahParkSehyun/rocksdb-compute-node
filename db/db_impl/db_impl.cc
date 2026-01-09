@@ -8,7 +8,9 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "db/db_impl/db_impl.h"
 
+#include "tools/bloomcheck_client_lib.h"
 #include <cstdint>
+#include <cstdlib>
 #ifdef OS_SOLARIS
 #include <alloca.h>
 #endif
@@ -23,6 +25,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -275,6 +278,25 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
                             std::memory_order_relaxed);
   if (write_buffer_manager_) {
     wbm_stall_.reset(new WBMStallInterface());
+  }
+
+  // BloomCheck 서비스 초기화 (환경 변수에서 읽기)
+  // 성능을 위해 lazy initialization으로 변경 가능
+  const char* bloomcheck_server = std::getenv("BLOOMCHECK_SERVER");
+  if (bloomcheck_server && bloomcheck_server[0] != '\0') {
+    bloomcheck_server_address_ = std::string(bloomcheck_server);
+    try {
+      bloomcheck_client_ = std::make_unique<BloomCheckServiceClient>(
+          bloomcheck_server_address_);
+      bloomcheck_enabled_.store(true, std::memory_order_relaxed);
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "BloomCheck service enabled: %s\n",
+                     bloomcheck_server_address_.c_str());
+    } catch (...) {
+      // gRPC 초기화 실패 시 무시
+      ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                     "BloomCheck service initialization failed\n");
+    }
   }
 }
 
@@ -1177,38 +1199,23 @@ FSDirectory* DBImpl::GetDataDir(ColumnFamilyData* cfd, size_t path_id) const {
 }
 
 Status DBImpl::SetOptions(
-    const std::unordered_map<ColumnFamilyHandle*,
-                             std::unordered_map<std::string, std::string>>&
-        column_families_opts_map) {
+    ColumnFamilyHandle* column_family,
+    const std::unordered_map<std::string, std::string>& options_map) {
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
   const WriteOptions write_options;
 
-  if (column_families_opts_map.empty()) {
-    return Status::OK();
-  }
-
-  for (const auto& cf_opts : column_families_opts_map) {
-    if (cf_opts.second.empty()) {
-      ROCKS_LOG_WARN(immutable_db_options_.info_log,
-                     "SetOptions() on column family [%s], empty input",
-                     cf_opts.first->GetName().c_str());
-      return Status::InvalidArgument("empty input");
-    }
-  }
-
-  autovector<std::pair<ColumnFamilyData*,
-                       const std::unordered_map<std::string, std::string>*>>
-      column_family_datas;
-  for (const auto& cf_opts : column_families_opts_map) {
-    column_family_datas.push_back(
-        {static_cast_with_check<ColumnFamilyHandleImpl>(cf_opts.first)->cfd(),
-         &cf_opts.second});
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+  if (options_map.empty()) {
+    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                   "SetOptions() on column family [%s], empty input",
+                   cfd->GetName().c_str());
+    return Status::InvalidArgument("empty input");
   }
 
   InstrumentedMutexLock ol(&options_mutex_);
-  autovector<MutableCFOptions>
-      new_options_copy;  // For logging outside of DB mutex
+  MutableCFOptions new_options_copy;  // For logging outside of DB mutex
   Status s;
   Status persist_options_status;
   SuperVersionContext sv_context(/* create_superversion */ true);
@@ -1231,104 +1238,68 @@ Status DBImpl::SetOptions(
     // Thus aren't releasing the DB mutex from LogAndApply calling pre_cb,
     // through installing the new Version until the end of this block, after
     // installing the new SuperVersion.
+    auto pre_cb = [&]() -> Status {
+      Status cb_s = cfd->SetOptions(db_options, options_map);
+      if (cb_s.ok()) {
+        new_options_copy = cfd->GetLatestMutableCFOptions();
+      }
+      return cb_s;
+    };
     VersionEdit dummy_edit;
     dummy_edit.MarkNoManifestWriteDummy();
     TEST_SYNC_POINT_CALLBACK("DBImpl::SetOptions:dummy_edit", &dummy_edit);
-    for (const auto& cfd_opts : column_family_datas) {
-      auto* cfd = cfd_opts.first;
-      const auto* options_map_ptr = cfd_opts.second;
-      auto pre_cb = [&]() -> Status {
-        Status cb_s = cfd->SetOptions(db_options, *options_map_ptr);
-        if (cb_s.ok()) {
-          new_options_copy.emplace_back(cfd->GetLatestMutableCFOptions());
-        }
-        return cb_s;
-      };
-
-      s = versions_->LogAndApply(
-          cfd, read_options, write_options, &dummy_edit, &mutex_,
-          directories_.GetDbDir(), false /*new_descriptor_log=*/,
-          nullptr /*new_opts*/, {} /*manifest_wcb*/, pre_cb);
-      if (!versions_->io_status().ok()) {
-        assert(!s.ok());
-        error_handler_.SetBGError(versions_->io_status(),
-                                  BackgroundErrorReason::kManifestWrite);
-      }
-      if (!s.ok()) {
-        break;
-      }
+    s = versions_->LogAndApply(
+        cfd, read_options, write_options, &dummy_edit, &mutex_,
+        directories_.GetDbDir(), false /*new_descriptor_log=*/,
+        nullptr /*new_opts*/, {} /*manifest_wcb*/, pre_cb);
+    if (!versions_->io_status().ok()) {
+      assert(!s.ok());
+      error_handler_.SetBGError(versions_->io_status(),
+                                BackgroundErrorReason::kManifestWrite);
     }
 
     if (s.ok()) {
       // Trigger possible flush/compactions. This has to be before we persist
       // options to file, otherwise there will be a deadlock with writer
       // thread.
-      for (const auto& cfd_opts : column_family_datas) {
-        InstallSuperVersionForConfigChange(cfd_opts.first, &sv_context);
-      }
+      InstallSuperVersionForConfigChange(cfd, &sv_context);
       persist_options_status =
           WriteOptionsFile(write_options, true /*db_mutex_already_held*/);
       bg_cv_.SignalAll();
 
-#ifndef NDEBUG
-      for (size_t i = 0; i < column_family_datas.size(); ++i) {
-        auto* cfd = column_family_datas[i].first;
-        assert(new_options_copy[i] == cfd->GetLatestMutableCFOptions());
-        assert(cfd->GetLatestMutableCFOptions() ==
-               cfd->GetCurrentMutableCFOptions());
-        assert(cfd->GetCurrentMutableCFOptions() ==
-               cfd->current()->GetMutableCFOptions());
-      }
-#endif
+      assert(new_options_copy == cfd->GetLatestMutableCFOptions());
+      assert(cfd->GetLatestMutableCFOptions() ==
+             cfd->GetCurrentMutableCFOptions());
+      assert(cfd->GetCurrentMutableCFOptions() ==
+             cfd->current()->GetMutableCFOptions());
     }
   }
   sv_context.Clean();
 
-  if (s.ok()) {
-    bool needs_seqno_worker = false;
-    for (const auto& cf_opts : column_families_opts_map) {
-      if (cf_opts.second.count("preserve_internal_time_seconds") > 0 ||
-          cf_opts.second.count("preclude_last_level_data_seconds") > 0) {
-        needs_seqno_worker = true;
-        break;
-      }
-    }
-    if (needs_seqno_worker) {
-      s = RegisterRecordSeqnoTimeWorker();
-    }
+  if (s.ok() && (options_map.count("preserve_internal_time_seconds") > 0 ||
+                 options_map.count("preclude_last_level_data_seconds") > 0)) {
+    s = RegisterRecordSeqnoTimeWorker();
   }
 
-  ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                 "SetOptions() on [%zu] column families, inputs:",
-                 column_family_datas.size());
-  for (size_t i = 0; i < column_family_datas.size(); ++i) {
-    const auto* cfd = column_family_datas[i].first;
-    const auto* options_map_ptr = column_family_datas[i].second;
-    ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                   "Set options on column family [%s] (%zu/%zu), inputs:",
-                   cfd->GetName().c_str(), i, column_family_datas.size());
-    for (const auto& o : *options_map_ptr) {
-      ROCKS_LOG_INFO(immutable_db_options_.info_log, "%s: %s\n",
-                     o.first.c_str(), o.second.c_str());
-    }
+  ROCKS_LOG_INFO(
+      immutable_db_options_.info_log,
+      "SetOptions() on column family [%s], inputs:", cfd->GetName().c_str());
+  for (const auto& o : options_map) {
+    ROCKS_LOG_INFO(immutable_db_options_.info_log, "%s: %s\n", o.first.c_str(),
+                   o.second.c_str());
   }
   if (s.ok()) {
-    for (size_t i = 0; i < column_family_datas.size(); ++i) {
-      const auto* cfd = column_family_datas[i].first;
-      ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                     "Set options on column family [%s] (%zu/%zu) succeeded, "
-                     "updated CF options:",
-                     cfd->GetName().c_str(), i, column_family_datas.size());
-      new_options_copy[i].Dump(immutable_db_options_.info_log.get());
-    }
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[%s] SetOptions() succeeded", cfd->GetName().c_str());
+    new_options_copy.Dump(immutable_db_options_.info_log.get());
     if (!persist_options_status.ok()) {
       // NOTE: WriteOptionsFile already logs on failure
       s = persist_options_status;
     }
   } else {
     persist_options_status.PermitUncheckedError();  // less important
-    ROCKS_LOG_WARN(immutable_db_options_.info_log, "SetOptions() failed: %s",
-                   s.ToString().c_str());
+    ROCKS_LOG_WARN(immutable_db_options_.info_log, "[%s] SetOptions() failed",
+                   cfd->GetName().c_str());
   }
   LogFlush(immutable_db_options_.info_log);
   return s;
@@ -2580,9 +2551,88 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   TEST_SYNC_POINT("DBImpl::GetImpl:PostMemTableGet:1");
   PinnedIteratorsManager pinned_iters_mgr;
   if (!done) {
+    // ===== BloomCheck 서비스 호출 (추가) =====
+    std::unique_ptr<std::unordered_set<uint64_t>> bloomcheck_may_match_files;
+    if (bloomcheck_enabled_.load(std::memory_order_relaxed) && 
+        bloomcheck_client_) {
+      Slice user_key = ExtractUserKey(lkey.internal_key());
+      std::string user_key_str = user_key.ToString();
+      
+      // Version에서 user key와 overlapping하는 SST 파일들 수집
+      std::vector<std::pair<uint64_t, std::string>> file_numbers_and_paths;
+      auto* vstorage = sv->current->storage_info();
+      const auto& ioptions = cfd->ioptions();
+      
+      // 각 레벨에서 overlapping 파일 찾기
+      InternalKey ikey_start(user_key, kMaxSequenceNumber, kValueTypeForSeek);
+      InternalKey ikey_end(user_key, 0, kTypeValue);
+      
+      for (int level = 0; level < cfd->NumberLevels(); level++) {
+        std::vector<FileMetaData*> overlapping_files;
+        vstorage->GetOverlappingInputs(level, &ikey_start, &ikey_end,
+                                       &overlapping_files);
+        
+        for (const auto* file : overlapping_files) {
+          uint32_t path_id = file->fd.GetPathId();
+          std::string file_path;
+          if (path_id < ioptions.cf_paths.size()) {
+            file_path = ioptions.cf_paths[path_id].path;
+          } else if (!ioptions.cf_paths.empty()) {
+            file_path = ioptions.cf_paths.back().path;
+          }
+          
+          if (!file_path.empty()) {
+            uint64_t file_number = file->fd.GetNumber();
+            std::string filename = MakeTableFileName("", file_number);
+            std::string full_path = file_path + "/" + filename;
+            file_numbers_and_paths.emplace_back(file_number, full_path);
+          }
+        }
+      }
+      
+      // BloomCheck 배치 요청으로 모든 파일 체크
+      if (!file_numbers_and_paths.empty()) {
+        bloomcheck::BatchRequest request;
+        bloomcheck::KeyRequest* key_req = request.add_reqs();
+        key_req->set_user_key(user_key_str);
+        for (const auto& file_num_path : file_numbers_and_paths) {
+          key_req->add_sst_paths(file_num_path.second);
+        }
+        
+        bloomcheck::BatchResponse response;
+        bool check_ok = bloomcheck_client_->CheckBatch(request, &response);
+        
+        if (check_ok && response.resps_size() > 0) {
+          const auto& key_resp = response.resps(0);
+          
+          // may_match=true인 파일들의 번호를 Set으로 저장
+          bloomcheck_may_match_files = std::make_unique<std::unordered_set<uint64_t>>();
+          
+          // may_match_sst_paths에서 파일 경로를 파싱하여 파일 번호 추출
+          for (int i = 0; i < key_resp.may_match_sst_paths_size(); i++) {
+            const std::string& may_match_path = key_resp.may_match_sst_paths(i);
+            // 파일 경로에서 파일 번호 찾기
+            for (const auto& file_num_path : file_numbers_and_paths) {
+              if (file_num_path.second == may_match_path) {
+                bloomcheck_may_match_files->insert(file_num_path.first);
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+    // ===== BloomCheck 끝 =====
+    
+    // ReadOptions에 BloomCheck 결과 설정
+    ReadOptions read_options_with_filter = read_options;
+    if (bloomcheck_may_match_files) {
+      read_options_with_filter.bloomcheck_may_match_files = bloomcheck_may_match_files.get();
+    }
+    
     PERF_TIMER_GUARD(get_from_output_files_time);
     sv->current->Get(
-        read_options, lkey, get_impl_options.value, get_impl_options.columns,
+        read_options_with_filter, lkey, get_impl_options.value, get_impl_options.columns,
         timestamp, &s, &merge_context, &max_covering_tombstone_seq,
         &pinned_iters_mgr,
         get_impl_options.get_value ? get_impl_options.value_found : nullptr,

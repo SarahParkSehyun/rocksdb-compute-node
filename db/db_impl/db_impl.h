@@ -458,9 +458,8 @@ class DBImpl : public DB {
 
   using DB::SetOptions;
   Status SetOptions(
-      const std::unordered_map<ColumnFamilyHandle*,
-                               std::unordered_map<std::string, std::string>>&
-          column_families_opts_map) override;
+      ColumnFamilyHandle* column_family,
+      const std::unordered_map<std::string, std::string>& options_map) override;
 
   Status SetDBOptions(
       const std::unordered_map<std::string, std::string>& options_map) override;
@@ -1387,6 +1386,11 @@ class DBImpl : public DB {
   std::unique_ptr<Tracer> tracer_;
   InstrumentedMutex trace_mutex_;
   BlockCacheTracer block_cache_tracer_;
+
+  // BloomCheck 서비스 클라이언트 (옵션)
+  std::unique_ptr<class BloomCheckServiceClient> bloomcheck_client_;
+  std::string bloomcheck_server_address_;  // 예: "10.1.1.1:50051"
+  std::atomic<bool> bloomcheck_enabled_{false};
 
   // constant false canceled flag, used when the compaction is not manual
   const std::atomic<bool> kManualCompactionCanceledFalse_{false};
