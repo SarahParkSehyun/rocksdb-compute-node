@@ -2574,19 +2574,11 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
         
         for (const auto* file : overlapping_files) {
           uint32_t path_id = file->fd.GetPathId();
-          std::string file_path;
-          if (path_id < ioptions.cf_paths.size()) {
-            file_path = ioptions.cf_paths[path_id].path;
-          } else if (!ioptions.cf_paths.empty()) {
-            file_path = ioptions.cf_paths.back().path;
-          }
+          uint64_t file_number = file->fd.GetNumber();
           
-          if (!file_path.empty()) {
-            uint64_t file_number = file->fd.GetNumber();
-            std::string filename = MakeTableFileName("", file_number);
-            std::string full_path = file_path + "/" + filename;
-            file_numbers_and_paths.emplace_back(file_number, full_path);
-          }
+          // TableFileName을 사용하여 올바른 전체 경로 생성
+          std::string full_path = TableFileName(ioptions.cf_paths, file_number, path_id);
+          file_numbers_and_paths.emplace_back(file_number, full_path);
         }
       }
       
@@ -2609,16 +2601,24 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
           bloomcheck_may_match_files = std::make_unique<std::unordered_set<uint64_t>>();
           
           // may_match_sst_paths에서 파일 경로를 파싱하여 파일 번호 추출
+          int may_match_count = 0;
           for (int i = 0; i < key_resp.may_match_sst_paths_size(); i++) {
             const std::string& may_match_path = key_resp.may_match_sst_paths(i);
             // 파일 경로에서 파일 번호 찾기
             for (const auto& file_num_path : file_numbers_and_paths) {
               if (file_num_path.second == may_match_path) {
                 bloomcheck_may_match_files->insert(file_num_path.first);
+                may_match_count++;
                 break;
               }
             }
           }
+          
+          // 디버깅: 로그 출력 (필요 시 활성화)
+          // ROCKS_LOG_INFO(immutable_db_options_.info_log,
+          //                "BloomCheck: checked %zu files, %d may_match, will skip %zu files",
+          //                file_numbers_and_paths.size(), may_match_count,
+          //                file_numbers_and_paths.size() - may_match_count);
         }
       }
     }
