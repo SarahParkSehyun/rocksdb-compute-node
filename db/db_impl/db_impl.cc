@@ -2615,8 +2615,35 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
         bloomcheck::BatchResponse response;
         bool check_ok = bloomcheck_client_->CheckBatch(request, &response);
         
+        ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                       "[BloomCheck] GetImpl: received response: check_ok=%d, response_size=%d",
+                       check_ok ? 1 : 0, response.resps_size());
+        
         if (check_ok && response.resps_size() > 0) {
           const auto& key_resp = response.resps(0);
+          
+          ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                         "[BloomCheck] GetImpl: may_match_sst_paths_count=%d",
+                         key_resp.may_match_sst_paths_size());
+          
+          // 디버깅: 요청된 경로와 응답 경로 비교
+          std::string requested_paths_str;
+          for (size_t i = 0; i < file_numbers_and_paths.size(); i++) {
+            if (i > 0) requested_paths_str += ",";
+            requested_paths_str += file_numbers_and_paths[i].second;
+          }
+          ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                         "[BloomCheck] GetImpl: requested_paths=[%s]",
+                         requested_paths_str.c_str());
+          
+          std::string may_match_paths_str;
+          for (int i = 0; i < key_resp.may_match_sst_paths_size(); i++) {
+            if (i > 0) may_match_paths_str += ",";
+            may_match_paths_str += key_resp.may_match_sst_paths(i);
+          }
+          ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                         "[BloomCheck] GetImpl: may_match_paths=[%s]",
+                         may_match_paths_str.c_str());
           
           // may_match=true인 파일들의 번호를 Set으로 저장
           bloomcheck_may_match_files = std::make_unique<std::unordered_set<uint64_t>>();
