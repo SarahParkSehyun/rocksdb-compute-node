@@ -2553,10 +2553,17 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   if (!done) {
     // ===== BloomCheck 서비스 호출 (추가) =====
     std::unique_ptr<std::unordered_set<uint64_t>> bloomcheck_may_match_files;
-    if (bloomcheck_enabled_.load(std::memory_order_relaxed) && 
-        bloomcheck_client_) {
+    bool bloomcheck_enabled = bloomcheck_enabled_.load(std::memory_order_relaxed);
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[BloomCheck] GetImpl: bloomcheck_enabled=%d, client=%p",
+                   bloomcheck_enabled ? 1 : 0, bloomcheck_client_.get());
+    
+    if (bloomcheck_enabled && bloomcheck_client_) {
       Slice user_key = ExtractUserKey(lkey.internal_key());
       std::string user_key_str = user_key.ToString();
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "[BloomCheck] GetImpl: user_key=%s (len=%zu)",
+                     user_key_str.c_str(), user_key_str.size());
       
       // Version에서 user key와 overlapping하는 SST 파일들 수집
       std::vector<std::pair<uint64_t, std::string>> file_numbers_and_paths;
@@ -2582,8 +2589,22 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
         }
       }
       
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "[BloomCheck] GetImpl: collected %zu candidate SST files",
+                     file_numbers_and_paths.size());
+      
       // BloomCheck 배치 요청으로 모든 파일 체크
       if (!file_numbers_and_paths.empty()) {
+        // 디버깅: 파일 번호 목록 출력
+        std::string file_numbers_str;
+        for (size_t i = 0; i < file_numbers_and_paths.size(); i++) {
+          if (i > 0) file_numbers_str += ",";
+          file_numbers_str += std::to_string(file_numbers_and_paths[i].first);
+        }
+        ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                       "[BloomCheck] GetImpl: candidate file_numbers=[%s]",
+                       file_numbers_str.c_str());
+        
         bloomcheck::BatchRequest request;
         bloomcheck::KeyRequest* key_req = request.add_reqs();
         key_req->set_user_key(user_key_str);
@@ -2614,11 +2635,11 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
             }
           }
           
-          // 디버깅: 로그 출력 (필요 시 활성화)
-          // ROCKS_LOG_INFO(immutable_db_options_.info_log,
-          //                "BloomCheck: checked %zu files, %d may_match, will skip %zu files",
-          //                file_numbers_and_paths.size(), may_match_count,
-          //                file_numbers_and_paths.size() - may_match_count);
+          // 디버깅: 로그 출력
+          ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                         "[BloomCheck] GetImpl: checked %zu files, %d may_match, will skip %zu files",
+                         file_numbers_and_paths.size(), may_match_count,
+                         static_cast<size_t>(file_numbers_and_paths.size()) - may_match_count);
         }
       }
     }

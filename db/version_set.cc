@@ -2745,9 +2745,17 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   if (read_options.bloomcheck_may_match_files != nullptr) {
     bloomcheck_may_match_files = static_cast<const std::unordered_set<uint64_t>*>(
         read_options.bloomcheck_may_match_files);
+    ROCKS_LOG_INFO(info_log_,
+                   "[BloomCheck] Version::Get: bloomcheck filter active with %zu may_match files",
+                   bloomcheck_may_match_files->size());
+  } else {
+    ROCKS_LOG_INFO(info_log_,
+                   "[BloomCheck] Version::Get: no bloomcheck filter, using traditional bloom filter");
   }
   
   FdWithKeyRange* f = fp.GetNextFile();
+  size_t files_checked = 0;
+  size_t files_skipped = 0;
 
   while (f != nullptr) {
     if (*max_covering_tombstone_seq > 0) {
@@ -2756,15 +2764,21 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       break;
     }
     
+    uint64_t file_number = f->file_metadata->fd.GetNumber();
+    
     // BloomCheck 필터링: may_match=false인 파일은 스킵
     if (bloomcheck_may_match_files != nullptr) {
-      uint64_t file_number = f->file_metadata->fd.GetNumber();
       if (bloomcheck_may_match_files->find(file_number) == 
           bloomcheck_may_match_files->end()) {
         // may_match=false인 파일은 스킵하고 다음 파일로
+        files_skipped++;
+        ROCKS_LOG_INFO(info_log_,
+                       "[BloomCheck] Version::Get: skipping file %" PRIu64 " (may_match=false)",
+                       file_number);
         f = fp.GetNextFile();
         continue;
       }
+      files_checked++;
     }
     
     if (get_context.sample()) {
@@ -2870,6 +2884,14 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     }
     f = fp.GetNextFile();
   }
+  
+  // 디버깅: BloomCheck 필터링 통계 출력
+  if (bloomcheck_may_match_files != nullptr) {
+    ROCKS_LOG_INFO(info_log_,
+                   "[BloomCheck] Version::Get: files_checked=%zu, files_skipped=%zu",
+                   files_checked, files_skipped);
+  }
+  
   if (db_statistics_ != nullptr) {
     get_context.ReportCounters();
   }
