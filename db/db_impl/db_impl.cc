@@ -2551,136 +2551,16 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   TEST_SYNC_POINT("DBImpl::GetImpl:PostMemTableGet:1");
   PinnedIteratorsManager pinned_iters_mgr;
   if (!done) {
-    // ===== BloomCheck 서비스 호출 (추가) =====
-    std::unique_ptr<std::unordered_set<uint64_t>> bloomcheck_may_match_files;
+    // ReadOptions에 BloomCheck client 설정 (Version::Get에서 사용)
+    ReadOptions read_options_with_bloomcheck = read_options;
     bool bloomcheck_enabled = bloomcheck_enabled_.load(std::memory_order_relaxed);
-    ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                   "[BloomCheck] GetImpl: bloomcheck_enabled=%d, client=%p",
-                   bloomcheck_enabled ? 1 : 0, bloomcheck_client_.get());
-    
     if (bloomcheck_enabled && bloomcheck_client_) {
-      Slice user_key = ExtractUserKey(lkey.internal_key());
-      std::string user_key_str = user_key.ToString();
-      ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                     "[BloomCheck] GetImpl: user_key=%s (len=%zu)",
-                     user_key_str.c_str(), user_key_str.size());
-      
-      // Version에서 user key와 overlapping하는 SST 파일들 수집
-      std::vector<std::pair<uint64_t, std::string>> file_numbers_and_paths;
-      auto* vstorage = sv->current->storage_info();
-      const auto& ioptions = cfd->ioptions();
-      
-      // 각 레벨에서 overlapping 파일 찾기
-      InternalKey ikey_start(user_key, kMaxSequenceNumber, kValueTypeForSeek);
-      InternalKey ikey_end(user_key, 0, kTypeValue);
-      
-      for (int level = 0; level < cfd->NumberLevels(); level++) {
-        std::vector<FileMetaData*> overlapping_files;
-        vstorage->GetOverlappingInputs(level, &ikey_start, &ikey_end,
-                                       &overlapping_files);
-        
-        for (const auto* file : overlapping_files) {
-          uint32_t path_id = file->fd.GetPathId();
-          uint64_t file_number = file->fd.GetNumber();
-          
-          // TableFileName을 사용하여 올바른 전체 경로 생성
-          std::string full_path = TableFileName(ioptions.cf_paths, file_number, path_id);
-          file_numbers_and_paths.emplace_back(file_number, full_path);
-        }
-      }
-      
-      ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                     "[BloomCheck] GetImpl: collected %zu candidate SST files",
-                     file_numbers_and_paths.size());
-      
-      // BloomCheck 배치 요청으로 모든 파일 체크
-      if (!file_numbers_and_paths.empty()) {
-        // 디버깅: 파일 번호 목록 출력
-        std::string file_numbers_str;
-        for (size_t i = 0; i < file_numbers_and_paths.size(); i++) {
-          if (i > 0) file_numbers_str += ",";
-          file_numbers_str += std::to_string(file_numbers_and_paths[i].first);
-        }
-        ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                       "[BloomCheck] GetImpl: candidate file_numbers=[%s]",
-                       file_numbers_str.c_str());
-        
-        bloomcheck::BatchRequest request;
-        bloomcheck::KeyRequest* key_req = request.add_reqs();
-        key_req->set_user_key(user_key_str);
-        for (const auto& file_num_path : file_numbers_and_paths) {
-          key_req->add_sst_paths(file_num_path.second);
-        }
-        
-        bloomcheck::BatchResponse response;
-        bool check_ok = bloomcheck_client_->CheckBatch(request, &response);
-        
-        ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                       "[BloomCheck] GetImpl: received response: check_ok=%d, response_size=%d",
-                       check_ok ? 1 : 0, response.resps_size());
-        
-        if (check_ok && response.resps_size() > 0) {
-          const auto& key_resp = response.resps(0);
-          
-          ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                         "[BloomCheck] GetImpl: may_match_sst_paths_count=%d",
-                         key_resp.may_match_sst_paths_size());
-          
-          // 디버깅: 요청된 경로와 응답 경로 비교
-          std::string requested_paths_str;
-          for (size_t i = 0; i < file_numbers_and_paths.size(); i++) {
-            if (i > 0) requested_paths_str += ",";
-            requested_paths_str += file_numbers_and_paths[i].second;
-          }
-          ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                         "[BloomCheck] GetImpl: requested_paths=[%s]",
-                         requested_paths_str.c_str());
-          
-          std::string may_match_paths_str;
-          for (int i = 0; i < key_resp.may_match_sst_paths_size(); i++) {
-            if (i > 0) may_match_paths_str += ",";
-            may_match_paths_str += key_resp.may_match_sst_paths(i);
-          }
-          ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                         "[BloomCheck] GetImpl: may_match_paths=[%s]",
-                         may_match_paths_str.c_str());
-          
-          // may_match=true인 파일들의 번호를 Set으로 저장
-          bloomcheck_may_match_files = std::make_unique<std::unordered_set<uint64_t>>();
-          
-          // may_match_sst_paths에서 파일 경로를 파싱하여 파일 번호 추출
-          int may_match_count = 0;
-          for (int i = 0; i < key_resp.may_match_sst_paths_size(); i++) {
-            const std::string& may_match_path = key_resp.may_match_sst_paths(i);
-            // 파일 경로에서 파일 번호 찾기
-            for (const auto& file_num_path : file_numbers_and_paths) {
-              if (file_num_path.second == may_match_path) {
-                bloomcheck_may_match_files->insert(file_num_path.first);
-                may_match_count++;
-                break;
-              }
-            }
-          }
-          
-          // 디버깅: 로그 출력
-          ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                         "[BloomCheck] GetImpl: checked %zu files, %d may_match, will skip %zu files",
-                         file_numbers_and_paths.size(), may_match_count,
-                         static_cast<size_t>(file_numbers_and_paths.size()) - may_match_count);
-        }
-      }
-    }
-    // ===== BloomCheck 끝 =====
-    
-    // ReadOptions에 BloomCheck 결과 설정
-    ReadOptions read_options_with_filter = read_options;
-    if (bloomcheck_may_match_files) {
-      read_options_with_filter.bloomcheck_may_match_files = bloomcheck_may_match_files.get();
+      read_options_with_bloomcheck.bloomcheck_client = bloomcheck_client_.get();
     }
     
     PERF_TIMER_GUARD(get_from_output_files_time);
     sv->current->Get(
-        read_options_with_filter, lkey, get_impl_options.value, get_impl_options.columns,
+        read_options_with_bloomcheck, lkey, get_impl_options.value, get_impl_options.columns,
         timestamp, &s, &merge_context, &max_covering_tombstone_seq,
         &pinned_iters_mgr,
         get_impl_options.get_value ? get_impl_options.value_found : nullptr,
@@ -2690,7 +2570,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
         get_impl_options.get_value);
     RecordTick(stats_, MEMTABLE_MISS);
   }
-
+  
   {
     PERF_TIMER_GUARD(get_post_process_time);
 

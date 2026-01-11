@@ -2271,6 +2271,11 @@ struct ReadOptions {
   // If nullptr, BloomCheck filtering is disabled.
   void* bloomcheck_may_match_files = nullptr;
 
+  // Internal use only: BloomCheck service client pointer.
+  // Points to BloomCheckServiceClient* instance.
+  // If nullptr, BloomCheck is disabled.
+  void* bloomcheck_client = nullptr;
+
   // *** END per-request settings for internal team use only ***
 
   ReadOptions() {}

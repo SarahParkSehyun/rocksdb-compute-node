@@ -45,6 +45,7 @@
 #include "db/wide/wide_columns_helper.h"
 #include "file/file_util.h"
 #include "table/compaction_merging_iterator.h"
+#include "tools/bloomcheck_client_lib.h"
 
 #if USE_COROUTINES
 #include "folly/coro/BlockingWait.h"
@@ -2735,27 +2736,94 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     pinned_iters_mgr->StartPinning();
   }
 
+  // ===== BloomCheck batch precheck =====
+  std::unique_ptr<std::unordered_set<uint64_t>> bloomcheck_may_match_files;
+  bool bloomcheck_enabled = false;
+  
+  // read_tier가 kBlockCacheTier 등일 때는 BloomCheck 건너뛰기 (네트워크 I/O 방지)
+  if (read_options.bloomcheck_client != nullptr &&
+      read_options.read_tier == kReadAllTier) {
+    BloomCheckServiceClient* client = 
+        static_cast<BloomCheckServiceClient*>(read_options.bloomcheck_client);
+    bloomcheck_enabled = true;
+    
+    // FilePicker dry-run: 실제로 순회할 파일 목록 수집
+    FilePicker fp_probe(user_key, ikey, &storage_info_.level_files_brief_,
+                        storage_info_.num_non_empty_levels_,
+                        &storage_info_.file_indexer_, user_comparator(),
+                        internal_comparator());
+    
+    // 중복 제거를 위한 set (방어적)
+    std::unordered_set<uint64_t> seen_file_numbers;
+    std::vector<std::pair<uint64_t, std::string>> file_numbers_and_paths;
+    // 경로 → 파일 번호 매핑 (O(1) 조회를 위해)
+    std::unordered_map<std::string, uint64_t> path_to_file_number;
+    const auto& ioptions = cfd_->ioptions();
+    
+    FdWithKeyRange* f_probe = fp_probe.GetNextFile();
+    while (f_probe != nullptr) {
+      uint64_t file_number = f_probe->file_metadata->fd.GetNumber();
+      
+      // 중복 제거
+      if (seen_file_numbers.find(file_number) == seen_file_numbers.end()) {
+        seen_file_numbers.insert(file_number);
+        uint32_t path_id = f_probe->file_metadata->fd.GetPathId();
+        std::string full_path = TableFileName(ioptions.cf_paths, file_number, path_id);
+        file_numbers_and_paths.emplace_back(file_number, full_path);
+        path_to_file_number[full_path] = file_number;
+      }
+      
+      f_probe = fp_probe.GetNextFile();
+    }
+    
+    // 배치 gRPC 호출 (딱 한 번)
+    if (!file_numbers_and_paths.empty()) {
+      std::string user_key_str = user_key.ToString();
+      bloomcheck::BatchRequest request;
+      bloomcheck::KeyRequest* key_req = request.add_reqs();
+      key_req->set_user_key(user_key_str);
+      for (const auto& file_num_path : file_numbers_and_paths) {
+        key_req->add_sst_paths(file_num_path.second);
+      }
+      
+      bloomcheck::BatchResponse response;
+      bool check_ok = client->CheckBatch(request, &response);
+      
+      // BloomCheck 실패 시 기존 RocksDB 동작으로 fallback (correctness 우선)
+      if (check_ok && response.resps_size() > 0) {
+        const auto& key_resp = response.resps(0);
+        
+        // may_match_sst_paths가 비어있으면 fallback (오류/누락 가능성)
+        // empty set은 "모든 파일 false"를 의미할 수도 있지만, 안전을 위해 fallback
+        if (key_resp.may_match_sst_paths_size() > 0) {
+          bloomcheck_may_match_files = std::make_unique<std::unordered_set<uint64_t>>();
+          
+          // O(1) 매핑으로 may_match=true인 파일들의 번호를 Set으로 변환
+          for (int i = 0; i < key_resp.may_match_sst_paths_size(); i++) {
+            const std::string& may_match_path = key_resp.may_match_sst_paths(i);
+            auto it = path_to_file_number.find(may_match_path);
+            if (it != path_to_file_number.end()) {
+              bloomcheck_may_match_files->insert(it->second);
+            }
+          }
+          
+          // may_match set이 비어있으면 fallback (정상 응답이지만 매칭 실패)
+          if (bloomcheck_may_match_files->empty()) {
+            bloomcheck_may_match_files.reset();
+          }
+        }
+      }
+    }
+  }
+  // ===== BloomCheck batch precheck 끝 =====
+
+  // 실제 FilePicker 생성 (검색용)
   FilePicker fp(user_key, ikey, &storage_info_.level_files_brief_,
                 storage_info_.num_non_empty_levels_,
                 &storage_info_.file_indexer_, user_comparator(),
                 internal_comparator());
   
-  // BloomCheck 필터: may_match=true인 파일 번호 Set
-  const std::unordered_set<uint64_t>* bloomcheck_may_match_files = nullptr;
-  if (read_options.bloomcheck_may_match_files != nullptr) {
-    bloomcheck_may_match_files = static_cast<const std::unordered_set<uint64_t>*>(
-        read_options.bloomcheck_may_match_files);
-    ROCKS_LOG_INFO(info_log_,
-                   "[BloomCheck] Version::Get: bloomcheck filter active with %zu may_match files",
-                   bloomcheck_may_match_files->size());
-  } else {
-    ROCKS_LOG_INFO(info_log_,
-                   "[BloomCheck] Version::Get: no bloomcheck filter, using traditional bloom filter");
-  }
-  
   FdWithKeyRange* f = fp.GetNextFile();
-  size_t files_checked = 0;
-  size_t files_skipped = 0;
 
   while (f != nullptr) {
     if (*max_covering_tombstone_seq > 0) {
@@ -2767,18 +2835,13 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     uint64_t file_number = f->file_metadata->fd.GetNumber();
     
     // BloomCheck 필터링: may_match=false인 파일은 스킵
-    if (bloomcheck_may_match_files != nullptr) {
+    if (bloomcheck_enabled && bloomcheck_may_match_files != nullptr) {
       if (bloomcheck_may_match_files->find(file_number) == 
           bloomcheck_may_match_files->end()) {
         // may_match=false인 파일은 스킵하고 다음 파일로
-        files_skipped++;
-        ROCKS_LOG_INFO(info_log_,
-                       "[BloomCheck] Version::Get: skipping file %" PRIu64 " (may_match=false)",
-                       file_number);
         f = fp.GetNextFile();
         continue;
       }
-      files_checked++;
     }
     
     if (get_context.sample()) {
@@ -2883,13 +2946,6 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         return;
     }
     f = fp.GetNextFile();
-  }
-  
-  // 디버깅: BloomCheck 필터링 통계 출력
-  if (bloomcheck_may_match_files != nullptr) {
-    ROCKS_LOG_INFO(info_log_,
-                   "[BloomCheck] Version::Get: files_checked=%zu, files_skipped=%zu",
-                   files_checked, files_skipped);
   }
   
   if (db_statistics_ != nullptr) {
