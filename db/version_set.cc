@@ -2698,16 +2698,21 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                   PinnedIteratorsManager* pinned_iters_mgr, bool* value_found,
                   bool* key_exists, SequenceNumber* seq, ReadCallback* callback,
                   bool* is_blob, bool do_merge) {
-  Slice ikey = k.internal_key();
-  Slice user_key = k.user_key();
+  Slice ikey = k.internal_key();  // user_key+sequence number+type
+  Slice user_key = k.user_key();  // 유저가 넘겨준 key
 
   assert(status->ok() || status->IsMergeInProgress());
 
   if (key_exists != nullptr) {
     // will falsify below if not found
-    *key_exists = true;
+    *key_exists = true;  // 일단 기본값을 true로 설정
   }
 
+  // block cache 접근/히트/미스 등을 추적하는 tracer가 있음
+  // tracing이 켜져 있으면 이 Get 요청을 대표하는 unique id를 하나
+  // 뽑음(NextGetId)
+  // 이후 table reader나 block cache lookup context 등에 이 id를 넣어 “이 Get
+  // 때문에 어떤 블록을 읽었는지”를 연결할 수 있음
   uint64_t tracing_get_id = BlockCacheTraceHelper::kReservedGetId;
   if (vset_ && vset_->block_cache_tracer_ &&
       vset_->block_cache_tracer_->is_tracing_enabled()) {
@@ -2717,11 +2722,18 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   // Note: the old StackableDB-based BlobDB passes in
   // GetImplOptions::is_blob_index; for the integrated BlobDB implementation, we
   // need to provide it here.
+
+  // filter read path로 prune만 할 거면 blob은 무시해도 됨
+  // GetContext를 계속 쓸 거면 형식상 필요한 필드만 안전하게 채워주고, 실제 blob
+  // fetch는 안 하게 두면 됨
   bool is_blob_index = false;
   bool* const is_blob_to_use = is_blob ? is_blob : &is_blob_index;
   BlobFetcher blob_fetcher(this, read_options);
 
   assert(pinned_iters_mgr);
+  // GetContext는 Version::Get 경로 전체에서 “현재 Get 요청의 상태 머신” 역할
+  // status가 OK면 아직 못 찾았음(kNotFound) 상태로 시작
+  // 이미 merge 진행 상태면 merge 처리 중(kMerge) 상태로 시작
   GetContext get_context(
       user_comparator(), merge_operator_, info_log_, db_statistics_,
       status->ok() ? GetContext::kNotFound : GetContext::kMerge, user_key,
@@ -2737,80 +2749,214 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   }
 
   // ===== BloomCheck batch precheck =====
+  // bloomcheck 결과로 true라고 나온 SST들의 file number만 모아두려는 용도
+  // unique_ptr인 이유는 bloomcheck 쓰는 경우에만 생성하려고
   std::unique_ptr<std::unordered_set<uint64_t>> bloomcheck_may_match_files;
+  // 아래 조건을 만족하면 bloomcheck 프리체크가 켜졌다는 플래그
   bool bloomcheck_enabled = false;
-  
-  // read_tier가 kBlockCacheTier 등일 때는 BloomCheck 건너뛰기 (네트워크 I/O 방지)
+
+  // cache-only 모드에서는 bloomcheck 건너뛰기 (네트워크 I/O 방지)
   if (read_options.bloomcheck_client != nullptr &&
       read_options.read_tier == kReadAllTier) {
-    BloomCheckServiceClient* client = 
+    // 실제 구현 타입 BloomCheckServiceClient*로 캐스팅해서 사용 준비
+    BloomCheckServiceClient* client =
         static_cast<BloomCheckServiceClient*>(read_options.bloomcheck_client);
     bloomcheck_enabled = true;
-    
+
     // FilePicker dry-run: 실제로 순회할 파일 목록 수집
+    // 기존에는 레벨/파일 후보 고르고 각 파일에서 바로 filter/index/data
+    // 블록을 보며 내려감
+    // 나는 그 전에 앞으로 어떤 파일들을 방문하게 될지만 탐색하려고 FilePicker
+    // 하나 더 만듦
     FilePicker fp_probe(user_key, ikey, &storage_info_.level_files_brief_,
                         storage_info_.num_non_empty_levels_,
                         &storage_info_.file_indexer_, user_comparator(),
                         internal_comparator());
-    
+
     // 중복 제거를 위한 set (방어적)
     std::unordered_set<uint64_t> seen_file_numbers;
     std::vector<std::pair<uint64_t, std::string>> file_numbers_and_paths;
-    // 경로 → 파일 번호 매핑 (O(1) 조회를 위해)
+    // 경로 → 파일 번호 매핑을 O(1)로 조회 하기 위해 만든 해시맵
     std::unordered_map<std::string, uint64_t> path_to_file_number;
+    // TableFileName을 만들 때 cf_paths가 필요
+    // 파일 번호가 실제 파일 시스템에서 어디 경로인지를 ioptions 기반으로 계산
     const auto& ioptions = cfd_->ioptions();
-    
+
+    // fp_probe.GetNextFile()로 Get이 방문할 다음 SST 후보를 하나 가져옴
     FdWithKeyRange* f_probe = fp_probe.GetNextFile();
     while (f_probe != nullptr) {
       uint64_t file_number = f_probe->file_metadata->fd.GetNumber();
-      
+
       // 중복 제거
       if (seen_file_numbers.find(file_number) == seen_file_numbers.end()) {
         seen_file_numbers.insert(file_number);
         uint32_t path_id = f_probe->file_metadata->fd.GetPathId();
-        std::string full_path = TableFileName(ioptions.cf_paths, file_number, path_id);
+        std::string full_path =
+            TableFileName(ioptions.cf_paths, file_number, path_id);
+        // 이번 Get에서 후보로 고려될 수 있는 SST들의 (번호, 경로) 리스트
         file_numbers_and_paths.emplace_back(file_number, full_path);
+        // 경로 → 번호 lookup 테이블
         path_to_file_number[full_path] = file_number;
       }
-      
+
       f_probe = fp_probe.GetNextFile();
     }
-    
+
     // 배치 gRPC 호출 (딱 한 번)
     if (!file_numbers_and_paths.empty()) {
       std::string user_key_str = user_key.ToString();
       bloomcheck::BatchRequest request;
+      // 우선은 key 1개만 보내도록 구현(add_reqs 1회 호출)
       bloomcheck::KeyRequest* key_req = request.add_reqs();
       key_req->set_user_key(user_key_str);
+      // 각 후보 파일에 대해 sst_paths 넣음
       for (const auto& file_num_path : file_numbers_and_paths) {
         key_req->add_sst_paths(file_num_path.second);
       }
-      
+
+      // 디버깅: 요청 전송 전 로그
+      if (info_log_) {
+        std::string key_hex;
+        for (unsigned char c : user_key_str) {
+          char hex[3];
+          snprintf(hex, sizeof(hex), "%02X", c);
+          key_hex += hex;
+        }
+        ROCKS_LOG_INFO(info_log_,
+                      "[BloomCheck] Sending request: user_key_hex=%s, "
+                      "input_sst_paths_count=%zu",
+                      key_hex.c_str(), file_numbers_and_paths.size());
+        for (size_t i = 0; i < file_numbers_and_paths.size(); ++i) {
+          ROCKS_LOG_INFO(info_log_,
+                         "[BloomCheck] input_sst_paths[%zu]: %s (file_number=%lu)",
+                         i, file_numbers_and_paths[i].second.c_str(),
+                         file_numbers_and_paths[i].first);
+        }
+      }
+
+      // check_ok는 RPC 통신 성공+서버 응답 수신 나타냄
       bloomcheck::BatchResponse response;
       bool check_ok = client->CheckBatch(request, &response);
-      
+
+      // 디버깅: 응답 수신 후 로그 (요청 키 포함)
+      if (info_log_) {
+        std::string resp_key_hex;
+        for (unsigned char c : user_key_str) {
+          char hex[3];
+          snprintf(hex, sizeof(hex), "%02X", c);
+          resp_key_hex += hex;
+        }
+        ROCKS_LOG_INFO(info_log_,
+                       "[BloomCheck] Received response: user_key_hex=%s, "
+                       "check_ok=%d, response.resps_size()=%d",
+                       resp_key_hex.c_str(), check_ok ? 1 : 0,
+                       response.resps_size());
+      }
+
       // BloomCheck 실패 시 기존 RocksDB 동작으로 fallback (correctness 우선)
       if (check_ok && response.resps_size() > 0) {
         const auto& key_resp = response.resps(0);
-        
+
+        // 디버깅: may_match_sst_paths 정보
+        if (info_log_) {
+          ROCKS_LOG_INFO(info_log_,
+                         "[BloomCheck] key_resp.may_match_sst_paths_size()=%d",
+                         key_resp.may_match_sst_paths_size());
+        }
+
         // may_match_sst_paths가 비어있으면 fallback (오류/누락 가능성)
-        // empty set은 "모든 파일 false"를 의미할 수도 있지만, 안전을 위해 fallback
+        // empty set은 "모든 파일 false"를 의미할 수도 있지만, 안전을 위해
+        // fallback
         if (key_resp.may_match_sst_paths_size() > 0) {
-          bloomcheck_may_match_files = std::make_unique<std::unordered_set<uint64_t>>();
-          
+          bloomcheck_may_match_files =
+              std::make_unique<std::unordered_set<uint64_t>>();
+
+          // 디버깅: may_match_paths 목록 출력
+          if (info_log_) {
+            ROCKS_LOG_INFO(info_log_,
+                           "[BloomCheck] output_may_match_count=%d",
+                           key_resp.may_match_sst_paths_size());
+          }
+
           // O(1) 매핑으로 may_match=true인 파일들의 번호를 Set으로 변환
           for (int i = 0; i < key_resp.may_match_sst_paths_size(); i++) {
             const std::string& may_match_path = key_resp.may_match_sst_paths(i);
+            
+            // 디버깅: 각 may_match_path 출력
+            if (info_log_) {
+              ROCKS_LOG_INFO(info_log_,
+                             "[BloomCheck] may_match_paths[%d]: %s", i,
+                             may_match_path.c_str());
+            }
+
             auto it = path_to_file_number.find(may_match_path);
             if (it != path_to_file_number.end()) {
               bloomcheck_may_match_files->insert(it->second);
+              
+              // 디버깅: 파일 번호 매핑 성공
+              if (info_log_) {
+                ROCKS_LOG_INFO(info_log_,
+                               "[BloomCheck] Mapped path to file_number=%lu",
+                               it->second);
+              }
+            } else {
+              // 검증: 응답의 may_match_path가 요청의 input_sst_paths에 없는 경우
+              // 이는 스토리지 노드가 잘못된 경로를 반환했거나, 경로 변환 문제일 수 있음
+              if (info_log_) {
+                std::string input_paths_str;
+                for (size_t j = 0; j < file_numbers_and_paths.size(); ++j) {
+                  if (j > 0) input_paths_str += ", ";
+                  input_paths_str += file_numbers_and_paths[j].second;
+                }
+                ROCKS_LOG_WARN(info_log_,
+                               "[BloomCheck] VALIDATION ERROR: may_match_path '%s' "
+                               "not found in input_sst_paths [%s]. This may indicate "
+                               "a mismatch between request and response.",
+                               may_match_path.c_str(), input_paths_str.c_str());
+              }
             }
           }
-          
+
+          // 디버깅: 최종 변환된 file_numbers set 출력
+          if (info_log_ && bloomcheck_may_match_files) {
+            ROCKS_LOG_INFO(info_log_,
+                           "[BloomCheck] Final may_match_file_numbers set "
+                           "size=%zu",
+                           bloomcheck_may_match_files->size());
+            std::string file_nums_str;
+            for (uint64_t fn : *bloomcheck_may_match_files) {
+              if (!file_nums_str.empty()) file_nums_str += ", ";
+              file_nums_str += std::to_string(fn);
+            }
+            ROCKS_LOG_INFO(info_log_,
+                           "[BloomCheck] may_match_file_numbers=[%s]",
+                           file_nums_str.c_str());
+          }
+
           // may_match set이 비어있으면 fallback (정상 응답이지만 매칭 실패)
           if (bloomcheck_may_match_files->empty()) {
+            if (info_log_) {
+              ROCKS_LOG_WARN(info_log_,
+                             "[BloomCheck] WARNING: may_match_file_numbers set "
+                             "is empty after conversion, falling back");
+            }
             bloomcheck_may_match_files.reset();
           }
+        } else {
+          // 디버깅: may_match_sst_paths가 비어있는 경우
+          if (info_log_) {
+            ROCKS_LOG_INFO(info_log_,
+                           "[BloomCheck] key_resp.may_match_sst_paths_size()=0, "
+                           "falling back to traditional behavior");
+          }
+        }
+      } else {
+        // 디버깅: RPC 실패 또는 빈 응답
+        if (info_log_) {
+          ROCKS_LOG_WARN(info_log_,
+                         "[BloomCheck] RPC failed or empty response: "
+                         "check_ok=%d, resps_size=%d, falling back",
+                         check_ok ? 1 : 0, response.resps_size());
         }
       }
     }
@@ -2822,7 +2968,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                 storage_info_.num_non_empty_levels_,
                 &storage_info_.file_indexer_, user_comparator(),
                 internal_comparator());
-  
+
   FdWithKeyRange* f = fp.GetNextFile();
 
   while (f != nullptr) {
@@ -2831,19 +2977,19 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       // stop here.
       break;
     }
-    
+
     uint64_t file_number = f->file_metadata->fd.GetNumber();
-    
+
     // BloomCheck 필터링: may_match=false인 파일은 스킵
     if (bloomcheck_enabled && bloomcheck_may_match_files != nullptr) {
-      if (bloomcheck_may_match_files->find(file_number) == 
+      if (bloomcheck_may_match_files->find(file_number) ==
           bloomcheck_may_match_files->end()) {
         // may_match=false인 파일은 스킵하고 다음 파일로
         f = fp.GetNextFile();
         continue;
       }
     }
-    
+
     if (get_context.sample()) {
       sample_file_read_inc(f->file_metadata);
     }
@@ -2947,7 +3093,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     }
     f = fp.GetNextFile();
   }
-  
+
   if (db_statistics_ != nullptr) {
     get_context.ReportCounters();
   }
