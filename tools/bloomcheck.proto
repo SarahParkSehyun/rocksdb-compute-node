@@ -1,29 +1,23 @@
 syntax = "proto3";
-
 package bloomcheck;
 
-// KeyRequest represents a single key and its candidate SST files
 message KeyRequest {
-  bytes user_key = 1;           // User key (binary, may contain timestamp)
-  repeated string sst_paths = 2; // Full paths to candidate SST files
+  bytes user_key = 1;
+  repeated uint64 sst_file_numbers = 2; // candidates
 }
 
-// BatchRequest contains multiple key requests
 message BatchRequest {
   repeated KeyRequest reqs = 1;
 }
 
-// KeyResponse contains may_match SST paths for a single key
 message KeyResponse {
-  repeated string may_match_sst_paths = 1; // SST paths where key may exist
+  repeated uint64 may_match_sst_file_numbers = 1;
 }
 
-// BatchResponse contains responses for all keys
 message BatchResponse {
   repeated KeyResponse resps = 1;
 }
 
-// BloomCheck service for checking keys against SST bloom filters
 service BloomCheck {
   rpc Check(BatchRequest) returns (BatchResponse);
 }

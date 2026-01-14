@@ -189,32 +189,30 @@ class KeyRequest final :
   // accessors -------------------------------------------------------
 
   enum : int {
-    kSstPathsFieldNumber = 2,
+    kSstFileNumbersFieldNumber = 2,
     kUserKeyFieldNumber = 1,
   };
-  // repeated string sst_paths = 2;
-  int sst_paths_size() const;
+  // repeated uint64 sst_file_numbers = 2;
+  int sst_file_numbers_size() const;
   private:
-  int _internal_sst_paths_size() const;
+  int _internal_sst_file_numbers_size() const;
   public:
-  void clear_sst_paths();
-  const std::string& sst_paths(int index) const;
-  std::string* mutable_sst_paths(int index);
-  void set_sst_paths(int index, const std::string& value);
-  void set_sst_paths(int index, std::string&& value);
-  void set_sst_paths(int index, const char* value);
-  void set_sst_paths(int index, const char* value, size_t size);
-  std::string* add_sst_paths();
-  void add_sst_paths(const std::string& value);
-  void add_sst_paths(std::string&& value);
-  void add_sst_paths(const char* value);
-  void add_sst_paths(const char* value, size_t size);
-  const ::PROTOBUF_NAMESPACE_ID::RepeatedPtrField<std::string>& sst_paths() const;
-  ::PROTOBUF_NAMESPACE_ID::RepeatedPtrField<std::string>* mutable_sst_paths();
+  void clear_sst_file_numbers();
   private:
-  const std::string& _internal_sst_paths(int index) const;
-  std::string* _internal_add_sst_paths();
+  uint64_t _internal_sst_file_numbers(int index) const;
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      _internal_sst_file_numbers() const;
+  void _internal_add_sst_file_numbers(uint64_t value);
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      _internal_mutable_sst_file_numbers();
   public:
+  uint64_t sst_file_numbers(int index) const;
+  void set_sst_file_numbers(int index, uint64_t value);
+  void add_sst_file_numbers(uint64_t value);
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      sst_file_numbers() const;
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      mutable_sst_file_numbers();
 
   // bytes user_key = 1;
   void clear_user_key();
@@ -238,7 +236,8 @@ class KeyRequest final :
   typedef void InternalArenaConstructable_;
   typedef void DestructorSkippable_;
   struct Impl_ {
-    ::PROTOBUF_NAMESPACE_ID::RepeatedPtrField<std::string> sst_paths_;
+    ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t > sst_file_numbers_;
+    mutable std::atomic<int> _sst_file_numbers_cached_byte_size_;
     ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr user_key_;
     mutable ::PROTOBUF_NAMESPACE_ID::internal::CachedSize _cached_size_;
   };
@@ -525,31 +524,29 @@ class KeyResponse final :
   // accessors -------------------------------------------------------
 
   enum : int {
-    kMayMatchSstPathsFieldNumber = 1,
+    kMayMatchSstFileNumbersFieldNumber = 1,
   };
-  // repeated string may_match_sst_paths = 1;
-  int may_match_sst_paths_size() const;
+  // repeated uint64 may_match_sst_file_numbers = 1;
+  int may_match_sst_file_numbers_size() const;
   private:
-  int _internal_may_match_sst_paths_size() const;
+  int _internal_may_match_sst_file_numbers_size() const;
   public:
-  void clear_may_match_sst_paths();
-  const std::string& may_match_sst_paths(int index) const;
-  std::string* mutable_may_match_sst_paths(int index);
-  void set_may_match_sst_paths(int index, const std::string& value);
-  void set_may_match_sst_paths(int index, std::string&& value);
-  void set_may_match_sst_paths(int index, const char* value);
-  void set_may_match_sst_paths(int index, const char* value, size_t size);
-  std::string* add_may_match_sst_paths();
-  void add_may_match_sst_paths(const std::string& value);
-  void add_may_match_sst_paths(std::string&& value);
-  void add_may_match_sst_paths(const char* value);
-  void add_may_match_sst_paths(const char* value, size_t size);
-  const ::PROTOBUF_NAMESPACE_ID::RepeatedPtrField<std::string>& may_match_sst_paths() const;
-  ::PROTOBUF_NAMESPACE_ID::RepeatedPtrField<std::string>* mutable_may_match_sst_paths();
+  void clear_may_match_sst_file_numbers();
   private:
-  const std::string& _internal_may_match_sst_paths(int index) const;
-  std::string* _internal_add_may_match_sst_paths();
+  uint64_t _internal_may_match_sst_file_numbers(int index) const;
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      _internal_may_match_sst_file_numbers() const;
+  void _internal_add_may_match_sst_file_numbers(uint64_t value);
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      _internal_mutable_may_match_sst_file_numbers();
   public:
+  uint64_t may_match_sst_file_numbers(int index) const;
+  void set_may_match_sst_file_numbers(int index, uint64_t value);
+  void add_may_match_sst_file_numbers(uint64_t value);
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      may_match_sst_file_numbers() const;
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      mutable_may_match_sst_file_numbers();
 
   // @@protoc_insertion_point(class_scope:bloomcheck.KeyResponse)
  private:
@@ -559,7 +556,8 @@ class KeyResponse final :
   typedef void InternalArenaConstructable_;
   typedef void DestructorSkippable_;
   struct Impl_ {
-    ::PROTOBUF_NAMESPACE_ID::RepeatedPtrField<std::string> may_match_sst_paths_;
+    ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t > may_match_sst_file_numbers_;
+    mutable std::atomic<int> _may_match_sst_file_numbers_cached_byte_size_;
     mutable ::PROTOBUF_NAMESPACE_ID::internal::CachedSize _cached_size_;
   };
   union { Impl_ _impl_; };
@@ -783,79 +781,51 @@ inline void KeyRequest::set_allocated_user_key(std::string* user_key) {
   // @@protoc_insertion_point(field_set_allocated:bloomcheck.KeyRequest.user_key)
 }
 
-// repeated string sst_paths = 2;
-inline int KeyRequest::_internal_sst_paths_size() const {
-  return _impl_.sst_paths_.size();
+// repeated uint64 sst_file_numbers = 2;
+inline int KeyRequest::_internal_sst_file_numbers_size() const {
+  return _impl_.sst_file_numbers_.size();
 }
-inline int KeyRequest::sst_paths_size() const {
-  return _internal_sst_paths_size();
+inline int KeyRequest::sst_file_numbers_size() const {
+  return _internal_sst_file_numbers_size();
 }
-inline void KeyRequest::clear_sst_paths() {
-  _impl_.sst_paths_.Clear();
+inline void KeyRequest::clear_sst_file_numbers() {
+  _impl_.sst_file_numbers_.Clear();
 }
-inline std::string* KeyRequest::add_sst_paths() {
-  std::string* _s = _internal_add_sst_paths();
-  // @@protoc_insertion_point(field_add_mutable:bloomcheck.KeyRequest.sst_paths)
-  return _s;
+inline uint64_t KeyRequest::_internal_sst_file_numbers(int index) const {
+  return _impl_.sst_file_numbers_.Get(index);
 }
-inline const std::string& KeyRequest::_internal_sst_paths(int index) const {
-  return _impl_.sst_paths_.Get(index);
+inline uint64_t KeyRequest::sst_file_numbers(int index) const {
+  // @@protoc_insertion_point(field_get:bloomcheck.KeyRequest.sst_file_numbers)
+  return _internal_sst_file_numbers(index);
 }
-inline const std::string& KeyRequest::sst_paths(int index) const {
-  // @@protoc_insertion_point(field_get:bloomcheck.KeyRequest.sst_paths)
-  return _internal_sst_paths(index);
+inline void KeyRequest::set_sst_file_numbers(int index, uint64_t value) {
+  _impl_.sst_file_numbers_.Set(index, value);
+  // @@protoc_insertion_point(field_set:bloomcheck.KeyRequest.sst_file_numbers)
 }
-inline std::string* KeyRequest::mutable_sst_paths(int index) {
-  // @@protoc_insertion_point(field_mutable:bloomcheck.KeyRequest.sst_paths)
-  return _impl_.sst_paths_.Mutable(index);
+inline void KeyRequest::_internal_add_sst_file_numbers(uint64_t value) {
+  _impl_.sst_file_numbers_.Add(value);
 }
-inline void KeyRequest::set_sst_paths(int index, const std::string& value) {
-  _impl_.sst_paths_.Mutable(index)->assign(value);
-  // @@protoc_insertion_point(field_set:bloomcheck.KeyRequest.sst_paths)
+inline void KeyRequest::add_sst_file_numbers(uint64_t value) {
+  _internal_add_sst_file_numbers(value);
+  // @@protoc_insertion_point(field_add:bloomcheck.KeyRequest.sst_file_numbers)
 }
-inline void KeyRequest::set_sst_paths(int index, std::string&& value) {
-  _impl_.sst_paths_.Mutable(index)->assign(std::move(value));
-  // @@protoc_insertion_point(field_set:bloomcheck.KeyRequest.sst_paths)
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+KeyRequest::_internal_sst_file_numbers() const {
+  return _impl_.sst_file_numbers_;
 }
-inline void KeyRequest::set_sst_paths(int index, const char* value) {
-  GOOGLE_DCHECK(value != nullptr);
-  _impl_.sst_paths_.Mutable(index)->assign(value);
-  // @@protoc_insertion_point(field_set_char:bloomcheck.KeyRequest.sst_paths)
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+KeyRequest::sst_file_numbers() const {
+  // @@protoc_insertion_point(field_list:bloomcheck.KeyRequest.sst_file_numbers)
+  return _internal_sst_file_numbers();
 }
-inline void KeyRequest::set_sst_paths(int index, const char* value, size_t size) {
-  _impl_.sst_paths_.Mutable(index)->assign(
-    reinterpret_cast<const char*>(value), size);
-  // @@protoc_insertion_point(field_set_pointer:bloomcheck.KeyRequest.sst_paths)
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+KeyRequest::_internal_mutable_sst_file_numbers() {
+  return &_impl_.sst_file_numbers_;
 }
-inline std::string* KeyRequest::_internal_add_sst_paths() {
-  return _impl_.sst_paths_.Add();
-}
-inline void KeyRequest::add_sst_paths(const std::string& value) {
-  _impl_.sst_paths_.Add()->assign(value);
-  // @@protoc_insertion_point(field_add:bloomcheck.KeyRequest.sst_paths)
-}
-inline void KeyRequest::add_sst_paths(std::string&& value) {
-  _impl_.sst_paths_.Add(std::move(value));
-  // @@protoc_insertion_point(field_add:bloomcheck.KeyRequest.sst_paths)
-}
-inline void KeyRequest::add_sst_paths(const char* value) {
-  GOOGLE_DCHECK(value != nullptr);
-  _impl_.sst_paths_.Add()->assign(value);
-  // @@protoc_insertion_point(field_add_char:bloomcheck.KeyRequest.sst_paths)
-}
-inline void KeyRequest::add_sst_paths(const char* value, size_t size) {
-  _impl_.sst_paths_.Add()->assign(reinterpret_cast<const char*>(value), size);
-  // @@protoc_insertion_point(field_add_pointer:bloomcheck.KeyRequest.sst_paths)
-}
-inline const ::PROTOBUF_NAMESPACE_ID::RepeatedPtrField<std::string>&
-KeyRequest::sst_paths() const {
-  // @@protoc_insertion_point(field_list:bloomcheck.KeyRequest.sst_paths)
-  return _impl_.sst_paths_;
-}
-inline ::PROTOBUF_NAMESPACE_ID::RepeatedPtrField<std::string>*
-KeyRequest::mutable_sst_paths() {
-  // @@protoc_insertion_point(field_mutable_list:bloomcheck.KeyRequest.sst_paths)
-  return &_impl_.sst_paths_;
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+KeyRequest::mutable_sst_file_numbers() {
+  // @@protoc_insertion_point(field_mutable_list:bloomcheck.KeyRequest.sst_file_numbers)
+  return _internal_mutable_sst_file_numbers();
 }
 
 // -------------------------------------------------------------------
@@ -906,79 +876,51 @@ BatchRequest::reqs() const {
 
 // KeyResponse
 
-// repeated string may_match_sst_paths = 1;
-inline int KeyResponse::_internal_may_match_sst_paths_size() const {
-  return _impl_.may_match_sst_paths_.size();
+// repeated uint64 may_match_sst_file_numbers = 1;
+inline int KeyResponse::_internal_may_match_sst_file_numbers_size() const {
+  return _impl_.may_match_sst_file_numbers_.size();
 }
-inline int KeyResponse::may_match_sst_paths_size() const {
-  return _internal_may_match_sst_paths_size();
+inline int KeyResponse::may_match_sst_file_numbers_size() const {
+  return _internal_may_match_sst_file_numbers_size();
 }
-inline void KeyResponse::clear_may_match_sst_paths() {
-  _impl_.may_match_sst_paths_.Clear();
+inline void KeyResponse::clear_may_match_sst_file_numbers() {
+  _impl_.may_match_sst_file_numbers_.Clear();
 }
-inline std::string* KeyResponse::add_may_match_sst_paths() {
-  std::string* _s = _internal_add_may_match_sst_paths();
-  // @@protoc_insertion_point(field_add_mutable:bloomcheck.KeyResponse.may_match_sst_paths)
-  return _s;
+inline uint64_t KeyResponse::_internal_may_match_sst_file_numbers(int index) const {
+  return _impl_.may_match_sst_file_numbers_.Get(index);
 }
-inline const std::string& KeyResponse::_internal_may_match_sst_paths(int index) const {
-  return _impl_.may_match_sst_paths_.Get(index);
+inline uint64_t KeyResponse::may_match_sst_file_numbers(int index) const {
+  // @@protoc_insertion_point(field_get:bloomcheck.KeyResponse.may_match_sst_file_numbers)
+  return _internal_may_match_sst_file_numbers(index);
 }
-inline const std::string& KeyResponse::may_match_sst_paths(int index) const {
-  // @@protoc_insertion_point(field_get:bloomcheck.KeyResponse.may_match_sst_paths)
-  return _internal_may_match_sst_paths(index);
+inline void KeyResponse::set_may_match_sst_file_numbers(int index, uint64_t value) {
+  _impl_.may_match_sst_file_numbers_.Set(index, value);
+  // @@protoc_insertion_point(field_set:bloomcheck.KeyResponse.may_match_sst_file_numbers)
 }
-inline std::string* KeyResponse::mutable_may_match_sst_paths(int index) {
-  // @@protoc_insertion_point(field_mutable:bloomcheck.KeyResponse.may_match_sst_paths)
-  return _impl_.may_match_sst_paths_.Mutable(index);
+inline void KeyResponse::_internal_add_may_match_sst_file_numbers(uint64_t value) {
+  _impl_.may_match_sst_file_numbers_.Add(value);
 }
-inline void KeyResponse::set_may_match_sst_paths(int index, const std::string& value) {
-  _impl_.may_match_sst_paths_.Mutable(index)->assign(value);
-  // @@protoc_insertion_point(field_set:bloomcheck.KeyResponse.may_match_sst_paths)
+inline void KeyResponse::add_may_match_sst_file_numbers(uint64_t value) {
+  _internal_add_may_match_sst_file_numbers(value);
+  // @@protoc_insertion_point(field_add:bloomcheck.KeyResponse.may_match_sst_file_numbers)
 }
-inline void KeyResponse::set_may_match_sst_paths(int index, std::string&& value) {
-  _impl_.may_match_sst_paths_.Mutable(index)->assign(std::move(value));
-  // @@protoc_insertion_point(field_set:bloomcheck.KeyResponse.may_match_sst_paths)
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+KeyResponse::_internal_may_match_sst_file_numbers() const {
+  return _impl_.may_match_sst_file_numbers_;
 }
-inline void KeyResponse::set_may_match_sst_paths(int index, const char* value) {
-  GOOGLE_DCHECK(value != nullptr);
-  _impl_.may_match_sst_paths_.Mutable(index)->assign(value);
-  // @@protoc_insertion_point(field_set_char:bloomcheck.KeyResponse.may_match_sst_paths)
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+KeyResponse::may_match_sst_file_numbers() const {
+  // @@protoc_insertion_point(field_list:bloomcheck.KeyResponse.may_match_sst_file_numbers)
+  return _internal_may_match_sst_file_numbers();
 }
-inline void KeyResponse::set_may_match_sst_paths(int index, const char* value, size_t size) {
-  _impl_.may_match_sst_paths_.Mutable(index)->assign(
-    reinterpret_cast<const char*>(value), size);
-  // @@protoc_insertion_point(field_set_pointer:bloomcheck.KeyResponse.may_match_sst_paths)
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+KeyResponse::_internal_mutable_may_match_sst_file_numbers() {
+  return &_impl_.may_match_sst_file_numbers_;
 }
-inline std::string* KeyResponse::_internal_add_may_match_sst_paths() {
-  return _impl_.may_match_sst_paths_.Add();
-}
-inline void KeyResponse::add_may_match_sst_paths(const std::string& value) {
-  _impl_.may_match_sst_paths_.Add()->assign(value);
-  // @@protoc_insertion_point(field_add:bloomcheck.KeyResponse.may_match_sst_paths)
-}
-inline void KeyResponse::add_may_match_sst_paths(std::string&& value) {
-  _impl_.may_match_sst_paths_.Add(std::move(value));
-  // @@protoc_insertion_point(field_add:bloomcheck.KeyResponse.may_match_sst_paths)
-}
-inline void KeyResponse::add_may_match_sst_paths(const char* value) {
-  GOOGLE_DCHECK(value != nullptr);
-  _impl_.may_match_sst_paths_.Add()->assign(value);
-  // @@protoc_insertion_point(field_add_char:bloomcheck.KeyResponse.may_match_sst_paths)
-}
-inline void KeyResponse::add_may_match_sst_paths(const char* value, size_t size) {
-  _impl_.may_match_sst_paths_.Add()->assign(reinterpret_cast<const char*>(value), size);
-  // @@protoc_insertion_point(field_add_pointer:bloomcheck.KeyResponse.may_match_sst_paths)
-}
-inline const ::PROTOBUF_NAMESPACE_ID::RepeatedPtrField<std::string>&
-KeyResponse::may_match_sst_paths() const {
-  // @@protoc_insertion_point(field_list:bloomcheck.KeyResponse.may_match_sst_paths)
-  return _impl_.may_match_sst_paths_;
-}
-inline ::PROTOBUF_NAMESPACE_ID::RepeatedPtrField<std::string>*
-KeyResponse::mutable_may_match_sst_paths() {
-  // @@protoc_insertion_point(field_mutable_list:bloomcheck.KeyResponse.may_match_sst_paths)
-  return &_impl_.may_match_sst_paths_;
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+KeyResponse::mutable_may_match_sst_file_numbers() {
+  // @@protoc_insertion_point(field_mutable_list:bloomcheck.KeyResponse.may_match_sst_file_numbers)
+  return _internal_mutable_may_match_sst_file_numbers();
 }
 
 // -------------------------------------------------------------------

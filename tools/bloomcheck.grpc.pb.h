@@ -27,7 +27,6 @@
 
 namespace bloomcheck {
 
-// BloomCheck service for checking keys against SST bloom filters
 class BloomCheck final {
  public:
   static constexpr char const* service_full_name() {

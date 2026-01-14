@@ -17,13 +17,13 @@ class BloomCheckServiceClient {
       : channel_(grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials())),
         stub_(bloomcheck::BloomCheck::NewStub(channel_)) {}
 
-  // Check if a key may exist in the given SST file
+  // Check if a key may exist in the given SST file (by file_number)
   // Returns true if key may exist (or on error for safety), false if definitely not
-  bool CheckKey(const std::string& user_key, const std::string& sst_path) {
+  bool CheckKey(const std::string& user_key, uint64_t sst_file_number) {
     bloomcheck::BatchRequest request;
     bloomcheck::KeyRequest* key_req = request.add_reqs();
     key_req->set_user_key(user_key);
-    key_req->add_sst_paths(sst_path);
+    key_req->add_sst_file_numbers(sst_file_number);
 
     bloomcheck::BatchResponse response;
     grpc::ClientContext context;
@@ -36,8 +36,8 @@ class BloomCheckServiceClient {
 
     if (response.resps_size() > 0) {
       const auto& key_resp = response.resps(0);
-      // If any SST path is in may_match, return true
-      return key_resp.may_match_sst_paths_size() > 0;
+      // If any SST file_number is in may_match, return true
+      return key_resp.may_match_sst_file_numbers_size() > 0;
     }
 
     return true;  // Safe default
