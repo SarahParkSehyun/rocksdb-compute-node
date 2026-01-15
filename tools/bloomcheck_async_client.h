@@ -23,16 +23,43 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// BloomHint: 캐시된 BloomCheck 결과
-struct BloomHint {
-  std::unordered_set<uint64_t> may_match_files;
-  std::chrono::steady_clock::time_point ts;
+// FileHint: file_number별 캐시된 BloomCheck 결과
+// positive: 최근에 may_match=true였던 시각
+// negative: 최근에 may_match=false였던 시각
+struct FileHint {
+  std::chrono::steady_clock::time_point positive_ts;  // may_match=true였던 시각
+  std::chrono::steady_clock::time_point negative_ts;  // may_match=false였던 시각
   
-  BloomHint() : ts(std::chrono::steady_clock::now()) {}
+  FileHint() {
+    // 초기값: 매우 오래된 시각 (캐시 미스로 처리)
+    positive_ts = std::chrono::steady_clock::time_point::min();
+    negative_ts = std::chrono::steady_clock::time_point::min();
+  }
   
-  bool IsExpired(std::chrono::milliseconds ttl) const {
+  void UpdatePositive() {
+    positive_ts = std::chrono::steady_clock::now();
+  }
+  
+  void UpdateNegative() {
+    negative_ts = std::chrono::steady_clock::now();
+  }
+  
+  // negative가 최근인지 확인 (예: 5ms 이내)
+  bool IsRecentNegative(std::chrono::milliseconds threshold) const {
+    if (negative_ts == std::chrono::steady_clock::time_point::min()) {
+      return false;
+    }
     auto now = std::chrono::steady_clock::now();
-    return (now - ts) > ttl;
+    return (now - negative_ts) < threshold;
+  }
+  
+  // positive가 최근인지 확인
+  bool IsRecentPositive(std::chrono::milliseconds threshold) const {
+    if (positive_ts == std::chrono::steady_clock::time_point::min()) {
+      return false;
+    }
+    auto now = std::chrono::steady_clock::now();
+    return (now - positive_ts) < threshold;
   }
 };
 
@@ -231,35 +258,30 @@ class BloomCheckAsyncClient {
     return true;
   }
   
-  // 캐시에서 BloomHint 조회 (non-blocking)
-  const BloomHint* GetHint(const std::string& user_key) {
+  // file_number별 힌트 조회 (non-blocking)
+  // negative가 최근이면 true 반환 (스킵 권장)
+  // positive가 최근이면 false 반환 (처리 권장)
+  bool ShouldSkipFile(uint64_t file_number) {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     
-    auto it = hint_cache_.find(user_key);
-    if (it == hint_cache_.end()) {
+    auto it = file_hint_cache_.find(file_number);
+    if (it == file_hint_cache_.end()) {
       stats_.cache_misses.fetch_add(1, std::memory_order_relaxed);
-      return nullptr;
+      return false;  // 힌트 없음 → 처리
     }
     
-    if (it->second.IsExpired(hint_ttl_)) {
-      hint_cache_.erase(it);
-      stats_.cache_misses.fetch_add(1, std::memory_order_relaxed);
-      return nullptr;
+    // negative가 최근(예: 5ms)이면 스킵 권장
+    if (it->second.IsRecentNegative(std::chrono::milliseconds(5))) {
+      stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
+      return true;  // 스킵
     }
     
     stats_.cache_hits.fetch_add(1, std::memory_order_relaxed);
-    
-    // 캐시 hit 시 may_match_files.size() 샘플 로깅 (초기 100회 또는 1000회마다)
-    static std::atomic<uint64_t> cache_hit_counter{0};
-    uint64_t hit_id = cache_hit_counter.fetch_add(1, std::memory_order_relaxed);
-    if (hit_id < 100 || hit_id % 1000 == 0) {
-      size_t cached_size = it->second.may_match_files.size();
-      std::cerr << "[BloomCheck] GetHint hit #" << hit_id 
-                << ": may_match_files=" << cached_size << std::endl;
-    }
-    
-    return &it->second;
+    return false;  // 처리
   }
+  
+  // 레거시 호환성: GetHint는 더 이상 사용하지 않음 (제거됨)
+  // file_number별 힌트는 ShouldSkipFile()로 조회
   
   // 스킵된 파일 수 기록
   void RecordSkippedFiles(uint64_t count) {
@@ -441,71 +463,112 @@ class BloomCheckAsyncClient {
       
       // 성공: 응답 처리 및 캐시 저장
       // CRITICAL: call->response는 Finish() 후에 채워짐
-      // 로그를 한 덩어리 문자열로 만들어서 원자적으로 출력
-      {
-        std::ostringstream oss;
-        oss << "[BloomCheck] call_id=" << call->call_id
-            << " resps_size=" << call->response.resps_size();
-        
-        size_t key0_size = 0;
-        if (call->response.resps_size() > 0) {
-          key0_size = call->response.resps(0).may_match_sst_file_numbers_size();
-        }
-        oss << " key0_size=" << key0_size
-            << " resp=" << call->response.DebugString();
-        
-        // ROCKS_LOG_INFO는 thread-safe하므로 사용
-        if (logger_) {
-          ROCKS_LOG_INFO(logger_, "%s", oss.str().c_str());
-        } else {
-          // logger가 없으면 std::cerr 사용 (mutex로 보호)
-          static std::mutex log_mutex;
-          std::lock_guard<std::mutex> lock(log_mutex);
-          std::cerr << oss.str() << std::endl;
-        }
-      }
+      // 로그를 한 덩어리 문자열로 만들어서 원자적으로 출력 - 주석처리
+      // {
+      //   std::ostringstream oss;
+      //   oss << "[BloomCheck] call_id=" << call->call_id
+      //       << " resps_size=" << call->response.resps_size();
+      //   
+      //   size_t key0_size = 0;
+      //   if (call->response.resps_size() > 0) {
+      //     key0_size = call->response.resps(0).may_match_sst_file_numbers_size();
+      //   }
+      //   oss << " key0_size=" << key0_size
+      //       << " resp=" << call->response.DebugString();
+      //   
+      //   // ROCKS_LOG_INFO는 thread-safe하므로 사용
+      //   if (logger_) {
+      //     ROCKS_LOG_INFO(logger_, "%s", oss.str().c_str());
+      //   } else {
+      //     // logger가 없으면 std::cerr 사용 (mutex로 보호)
+      //     static std::mutex log_mutex;
+      //     std::lock_guard<std::mutex> lock(log_mutex);
+      //     std::cerr << oss.str() << std::endl;
+      //   }
+      // }
       
       if (call->response.resps_size() > 0) {
         const auto& key_resp = call->response.resps(0);
         
-        // BloomHint 생성 및 캐시 저장
-        BloomHint hint;
-        hint.ts = std::chrono::steady_clock::now();
-        
+        // file_number별 힌트 캐시 업데이트
+        std::unordered_set<uint64_t> may_match_files;
         for (uint64_t file_number : key_resp.may_match_sst_file_numbers()) {
-          hint.may_match_files.insert(file_number);
+          may_match_files.insert(file_number);
         }
         
-        // CRITICAL: std::move 이전에 size 저장 및 로그 출력
-        size_t may_match_count = hint.may_match_files.size();
-        
-        // may_match_files=0일 때 요청/응답 덤프 출력 (move 이전)
-        if (may_match_count == 0) {
-          std::ostringstream oss;
-          oss << "[BloomCheck] RPC success: may_match_files=0 call_id=" << call->call_id;
-          if (logger_) {
-            ROCKS_LOG_INFO(logger_, "%s", oss.str().c_str());
-          } else {
-            static std::mutex log_mutex;
-            std::lock_guard<std::mutex> lock(log_mutex);
-            std::cerr << oss.str() << std::endl;
+        // 요청에 포함된 모든 candidate 파일 번호 수집
+        std::unordered_set<uint64_t> candidate_files;
+        for (const auto& req : call->request.reqs()) {
+          for (uint64_t file_number : req.sst_file_numbers()) {
+            candidate_files.insert(file_number);
           }
         }
         
         {
           std::lock_guard<std::mutex> lock(cache_mutex_);
-          hint_cache_[call->user_key] = std::move(hint);  // move 이후 hint는 사용하지 않음
           
-          // 캐시 크기 제한 (10000개)
-          if (hint_cache_.size() > 10000) {
-            // 가장 오래된 항목 제거 (O(n) 스캔)
-            auto oldest = hint_cache_.begin();
-            for (auto it = hint_cache_.begin(); it != hint_cache_.end(); ++it) {
-              if (it->second.ts < oldest->second.ts) {
-                oldest = it;
+          // 각 candidate 파일에 대해 positive/negative 업데이트
+          for (uint64_t file_number : candidate_files) {
+            auto it = file_hint_cache_.find(file_number);
+            if (it == file_hint_cache_.end()) {
+              // 새 파일 힌트 생성
+              FileHint hint;
+              if (may_match_files.find(file_number) != may_match_files.end()) {
+                hint.UpdatePositive();
+              } else {
+                hint.UpdateNegative();
+              }
+              file_hint_cache_[file_number] = hint;
+            } else {
+              // 기존 힌트 업데이트
+              if (may_match_files.find(file_number) != may_match_files.end()) {
+                it->second.UpdatePositive();
+              } else {
+                it->second.UpdateNegative();
               }
             }
-            hint_cache_.erase(oldest);
+          }
+          
+          // 캐시 크기 제한 (10000개)
+          if (file_hint_cache_.size() > 10000) {
+            // 가장 오래된 negative 힌트부터 제거
+            uint64_t oldest_file = 0;
+            auto oldest_time = std::chrono::steady_clock::time_point::max();
+            for (const auto& pair : file_hint_cache_) {
+              auto time = std::min(pair.second.positive_ts, pair.second.negative_ts);
+              if (time < oldest_time) {
+                oldest_time = time;
+                oldest_file = pair.first;
+              }
+            }
+            if (oldest_file != 0) {
+              file_hint_cache_.erase(oldest_file);
+            }
+          }
+          
+          // 디버깅: 캐시 업데이트 로깅
+          static std::atomic<uint64_t> cache_update_log_counter{0};
+          uint64_t cache_update_log_id = cache_update_log_counter.fetch_add(1, std::memory_order_relaxed);
+          if (cache_update_log_id < 100 || cache_update_log_id % 1000 == 0) {
+            size_t cache_size = file_hint_cache_.size();
+            size_t positive_count = 0;
+            size_t negative_count = 0;
+            for (const auto& pair : file_hint_cache_) {
+              if (pair.second.IsRecentPositive(std::chrono::milliseconds(100))) {
+                positive_count++;
+              }
+              if (pair.second.IsRecentNegative(std::chrono::milliseconds(100))) {
+                negative_count++;
+              }
+            }
+            if (logger_) {
+              ROCKS_LOG_INFO(logger_,
+                             "[BloomCheck] CQ cache_update: call_id=%lu "
+                             "candidate_files=%zu may_match_files=%zu "
+                             "cache_size=%zu positive_recent=%zu negative_recent=%zu",
+                             call->call_id, candidate_files.size(), may_match_files.size(),
+                             cache_size, positive_count, negative_count);
+            }
           }
         }
         
@@ -547,9 +610,9 @@ class BloomCheckAsyncClient {
   std::mutex inflight_mutex_;
   std::unordered_map<AsyncCall*, std::unique_ptr<AsyncCall>> inflight_requests_;
   
-  // BloomHint 캐시
+  // FileHint 캐시 (file_number -> FileHint)
   std::mutex cache_mutex_;
-  std::unordered_map<std::string, BloomHint> hint_cache_;
+  std::unordered_map<uint64_t, FileHint> file_hint_cache_;
   
   struct StatsInternal {
     std::atomic<uint64_t> inflight_rpc_count{0};

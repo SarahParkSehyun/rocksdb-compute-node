@@ -2754,9 +2754,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   }
 
   // ===== BloomCheck 비동기 힌트 시스템 =====
-  // BloomCheck는 비동기적으로 발사되며, 결과는 캐시에 저장됨
+  // BloomCheck는 비동기적으로 발사되며, 결과는 file_number별 캐시에 저장됨
   // 이번 Get에는 결과를 기다리지 않고, 캐시에 있는 힌트만 사용
-  const BloomHint* bloom_hint = nullptr;
   bool bloomcheck_enabled = false;
 
   // cache-only 모드에서는 bloomcheck 건너뛰기 (네트워크 I/O 방지)
@@ -2770,8 +2769,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     // user_key는 이미 user key (timestamp 포함 가능)
     std::string user_key_str = user_key.ToString();
     
-    // 1. 캐시에서 힌트 조회 (non-blocking)
-    bloom_hint = async_client->GetHint(user_key_str);
+    // 1. file_number별 힌트는 FilePicker 루프에서 직접 조회
+    // (GetHint는 더 이상 사용하지 않음)
 
     // 2. 조건부 비동기 RPC 발사 (샘플링/레이트리밋 적용)
     // 환경변수 읽기 (한 번만 읽기 위해 static 사용)
@@ -2914,12 +2913,14 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     uint64_t file_number = f->file_metadata->fd.GetNumber();
     bloom_hint_total_files++;
 
-    // BloomCheck 힌트 필터링: 힌트가 있고 may_match=false인 파일은 스킵
+    // BloomCheck 힌트 필터링: file_number별 negative 힌트가 최근이면 스킵
     // 힌트가 없으면 baseline 동작 (모든 파일 검사)
-    if (bloomcheck_enabled && bloom_hint != nullptr) {
-      if (bloom_hint->may_match_files.find(file_number) ==
-          bloom_hint->may_match_files.end()) {
-        // 힌트에 따르면 may_match=false → 스킵
+    if (bloomcheck_enabled && read_options.bloomcheck_client != nullptr) {
+      BloomCheckAsyncClient* async_client =
+          static_cast<BloomCheckAsyncClient*>(read_options.bloomcheck_client);
+      
+      if (async_client->ShouldSkipFile(file_number)) {
+        // negative 힌트가 최근(5ms 이내) → 스킵
         bloom_hint_skipped_files++;
         f = fp.GetNextFile();
         continue;
@@ -3035,8 +3036,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     BloomCheckAsyncClient* async_client =
         static_cast<BloomCheckAsyncClient*>(read_options.bloomcheck_client);
     
-    // 스킵된 파일 수를 통계에 반영 (힌트가 있는 경우에만)
-    if (bloom_hint != nullptr && bloom_hint_skipped_files > 0) {
+    // 스킵된 파일 수를 통계에 반영
+    if (bloom_hint_skipped_files > 0) {
       async_client->RecordSkippedFiles(bloom_hint_skipped_files);
     }
     
