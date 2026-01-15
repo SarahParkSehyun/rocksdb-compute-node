@@ -1387,8 +1387,10 @@ class DBImpl : public DB {
   InstrumentedMutex trace_mutex_;
   BlockCacheTracer block_cache_tracer_;
 
-  // BloomCheck 서비스 클라이언트 (옵션)
+  // BloomCheck 서비스 클라이언트 (옵션) - 레거시 동기 클라이언트 (deprecated)
   std::unique_ptr<class BloomCheckServiceClient> bloomcheck_client_;
+  // BloomCheck 비동기 클라이언트 (힌트 기반)
+  std::unique_ptr<class BloomCheckAsyncClient> bloomcheck_async_client_;
   std::string bloomcheck_server_address_;  // 예: "10.1.1.1:50051"
   std::atomic<bool> bloomcheck_enabled_{false};
 

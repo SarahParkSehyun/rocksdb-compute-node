@@ -9,6 +9,7 @@
 #include "db/db_impl/db_impl.h"
 
 #include "tools/bloomcheck_client_lib.h"
+#include "tools/bloomcheck_async_client.h"
 #include <cstdint>
 #include <cstdlib>
 #ifdef OS_SOLARIS
@@ -281,21 +282,35 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   }
 
   // BloomCheck 서비스 초기화 (환경 변수에서 읽기)
-  // 성능을 위해 lazy initialization으로 변경 가능
+  // 비동기 클라이언트 사용 (힌트 기반)
   const char* bloomcheck_server = std::getenv("BLOOMCHECK_SERVER");
   if (bloomcheck_server && bloomcheck_server[0] != '\0') {
     bloomcheck_server_address_ = std::string(bloomcheck_server);
     try {
-      bloomcheck_client_ = std::make_unique<BloomCheckServiceClient>(
-          bloomcheck_server_address_);
+      // 비동기 클라이언트 생성 (max_inflight=32, hint_ttl=5ms)
+      size_t max_inflight = 32;
+      const char* max_inflight_env = std::getenv("BLOOMCHECK_MAX_INFLIGHT");
+      if (max_inflight_env) {
+        max_inflight = std::stoul(max_inflight_env);
+      }
+      
+      std::chrono::milliseconds hint_ttl(5);
+      const char* hint_ttl_env = std::getenv("BLOOMCHECK_HINT_TTL_MS");
+      if (hint_ttl_env) {
+        hint_ttl = std::chrono::milliseconds(std::stoul(hint_ttl_env));
+      }
+      
+      bloomcheck_async_client_ = std::make_unique<BloomCheckAsyncClient>(
+          bloomcheck_server_address_, max_inflight, hint_ttl,
+          immutable_db_options_.info_log.get());
       bloomcheck_enabled_.store(true, std::memory_order_relaxed);
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                     "BloomCheck service enabled: %s\n",
-                     bloomcheck_server_address_.c_str());
+                     "BloomCheck async service enabled: %s (max_inflight=%zu, hint_ttl=%ldms)\n",
+                     bloomcheck_server_address_.c_str(), max_inflight, hint_ttl.count());
     } catch (...) {
       // gRPC 초기화 실패 시 무시
       ROCKS_LOG_WARN(immutable_db_options_.info_log,
-                     "BloomCheck service initialization failed\n");
+                     "BloomCheck async service initialization failed\n");
     }
   }
 }
@@ -2551,11 +2566,11 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   TEST_SYNC_POINT("DBImpl::GetImpl:PostMemTableGet:1");
   PinnedIteratorsManager pinned_iters_mgr;
   if (!done) {
-    // ReadOptions에 BloomCheck client 설정 (Version::Get에서 사용)
+    // ReadOptions에 BloomCheck async client 설정 (Version::Get에서 사용)
     ReadOptions read_options_with_bloomcheck = read_options;
     bool bloomcheck_enabled = bloomcheck_enabled_.load(std::memory_order_relaxed);
-    if (bloomcheck_enabled && bloomcheck_client_) {
-      read_options_with_bloomcheck.bloomcheck_client = bloomcheck_client_.get();
+    if (bloomcheck_enabled && bloomcheck_async_client_) {
+      read_options_with_bloomcheck.bloomcheck_client = bloomcheck_async_client_.get();
     }
     
     PERF_TIMER_GUARD(get_from_output_files_time);
