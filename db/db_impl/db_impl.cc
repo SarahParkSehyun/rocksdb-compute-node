@@ -287,14 +287,14 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   if (bloomcheck_server && bloomcheck_server[0] != '\0') {
     bloomcheck_server_address_ = std::string(bloomcheck_server);
     try {
-      // 비동기 클라이언트 생성 (max_inflight=32, hint_ttl=5ms)
-      size_t max_inflight = 32;
+      // 비동기 클라이언트 생성 (max_inflight=128, hint_ttl=100ms)
+      size_t max_inflight = 128;
       const char* max_inflight_env = std::getenv("BLOOMCHECK_MAX_INFLIGHT");
       if (max_inflight_env) {
         max_inflight = std::stoul(max_inflight_env);
       }
       
-      std::chrono::milliseconds hint_ttl(5);
+      std::chrono::milliseconds hint_ttl(100);  // 기본값 100ms로 증가
       const char* hint_ttl_env = std::getenv("BLOOMCHECK_HINT_TTL_MS");
       if (hint_ttl_env) {
         hint_ttl = std::chrono::milliseconds(std::stoul(hint_ttl_env));

@@ -2767,12 +2767,35 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         static_cast<BloomCheckAsyncClient*>(read_options.bloomcheck_client);
     bloomcheck_enabled = true;
 
+    // user_key는 이미 user key (timestamp 포함 가능)
     std::string user_key_str = user_key.ToString();
     
     // 1. 캐시에서 힌트 조회 (non-blocking)
     bloom_hint = async_client->GetHint(user_key_str);
 
-    // 2. 비동기 RPC 발사 (non-blocking, 결과는 캐시에 저장)
+    // 2. 조건부 비동기 RPC 발사 (샘플링/레이트리밋 적용)
+    // 환경변수 읽기 (한 번만 읽기 위해 static 사용)
+    // 기본값을 더 관대하게 설정: 샘플링 4 (25%), min_candidates 1, cooldown 5ms
+    static size_t sample_n = []() {
+      const char* env = std::getenv("BLOOMCHECK_SAMPLE_N");
+      return env ? std::stoul(env) : 4;  // 기본값: 4번에 1번 (25%)
+    }();
+    
+    static size_t min_candidates = []() {
+      const char* env = std::getenv("BLOOMCHECK_MIN_CANDIDATES");
+      return env ? std::stoul(env) : 1;  // 기본값: 1개 이상이면 발사
+    }();
+    
+    static std::chrono::milliseconds key_cooldown_ms = []() {
+      const char* env = std::getenv("BLOOMCHECK_KEY_COOLDOWN_MS");
+      return env ? std::chrono::milliseconds(std::stoul(env)) : std::chrono::milliseconds(5);  // 기본값: 5ms
+    }();
+    
+    // per-key cooldown 관리 (LRU 스타일, 최근 K개만 유지)
+    static constexpr size_t COOLDOWN_MAP_SIZE = 1000;
+    static std::mutex cooldown_mutex;
+    static std::unordered_map<std::string, std::chrono::steady_clock::time_point> key_cooldown_map;
+    
     // FilePicker dry-run으로 후보 파일 수집
     FilePicker fp_probe(user_key, ikey, &storage_info_.level_files_brief_,
                         storage_info_.num_non_empty_levels_,
@@ -2787,9 +2810,84 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       f_probe = fp_probe.GetNextFile();
     }
 
-    // 비동기 RPC 발사 (기다리지 않음)
+    // 조건부 발사 결정
+    bool should_fire = false;
+    static std::atomic<uint64_t> version_get_counter{0};
+    uint64_t get_id = version_get_counter.fetch_add(1, std::memory_order_relaxed);
+    
     if (!candidate_file_numbers.empty()) {
-      async_client->FireAsyncCheck(user_key_str, candidate_file_numbers);
+      // 조건 1: 샘플링 (get_id & (sample_n-1)) == 0
+      bool sample_match = (get_id & (sample_n - 1)) == 0;
+      
+      // 조건 2: 최소 후보 파일 수
+      bool min_candidates_ok = candidate_file_numbers.size() >= min_candidates;
+      
+      // 조건 3: per-key cooldown 체크
+      bool cooldown_ok = true;
+      {
+        std::lock_guard<std::mutex> lock(cooldown_mutex);
+        auto it = key_cooldown_map.find(user_key_str);
+        if (it != key_cooldown_map.end()) {
+          auto elapsed = std::chrono::steady_clock::now() - it->second;
+          if (elapsed < key_cooldown_ms) {
+            cooldown_ok = false;
+          } else {
+            // cooldown 만료 - 시간 업데이트
+            it->second = std::chrono::steady_clock::now();
+          }
+        } else {
+          // 새 키 - cooldown map에 추가
+          if (key_cooldown_map.size() >= COOLDOWN_MAP_SIZE) {
+            // 가장 오래된 항목 제거 (간단히 첫 번째 항목)
+            key_cooldown_map.erase(key_cooldown_map.begin());
+          }
+          key_cooldown_map[user_key_str] = std::chrono::steady_clock::now();
+        }
+      }
+      
+      // 조건부 발사: 샘플링은 필수, 나머지는 선택적
+      // 샘플링만 적용하고, min_candidates와 cooldown은 "권장" 수준으로만 사용
+      // (너무 제한적이면 힌트가 쌓이지 않음)
+      should_fire = sample_match && min_candidates_ok && cooldown_ok;
+      
+      // 디버깅: 처음 100개는 조건별로 로그 출력
+      if (get_id < 100) {
+        ROCKS_LOG_INFO(info_log_,
+                      "[BloomCheck] Version::Get #%lu: should_fire=%d, "
+                      "candidate_files=%zu, sample_match=%d (sample_n=%zu), "
+                      "min_candidates_ok=%d (min=%zu), cooldown_ok=%d",
+                      get_id, should_fire ? 1 : 0,
+                      candidate_file_numbers.size(),
+                      sample_match ? 1 : 0, sample_n,
+                      min_candidates_ok ? 1 : 0, min_candidates,
+                      cooldown_ok ? 1 : 0);
+      }
+      
+      if (should_fire) {
+        bool fired = async_client->FireAsyncCheck(user_key_str, candidate_file_numbers);
+        if (!fired) {
+          // FireAsyncCheck 실패 (drop) - 통계는 클라이언트에서 관리
+          if (get_id < 10 || get_id % 10000 == 0) {
+            ROCKS_LOG_INFO(info_log_, 
+                          "[BloomCheck] Version::Get #%lu: FireAsyncCheck returned false (dropped), "
+                          "candidate_files=%zu, sample_match=%d, min_candidates_ok=%d, cooldown_ok=%d",
+                          get_id, candidate_file_numbers.size(), 
+                          sample_match ? 1 : 0, min_candidates_ok ? 1 : 0, cooldown_ok ? 1 : 0);
+          }
+        } else if (get_id < 10 || get_id % 10000 == 0) {
+          std::string user_key_hex = BloomCheckAsyncClient::KeyToHex(user_key_str);
+          ROCKS_LOG_INFO(info_log_, 
+                        "[BloomCheck] Version::Get #%lu: FireAsyncCheck fired, "
+                        "candidate_files=%zu, user_key_hex=%s",
+                        get_id, candidate_file_numbers.size(), user_key_hex.c_str());
+        }
+      } else if (get_id < 10 || get_id % 10000 == 0) {
+        ROCKS_LOG_INFO(info_log_, 
+                      "[BloomCheck] Version::Get #%lu: FireAsyncCheck skipped (rate limit), "
+                      "candidate_files=%zu, sample_match=%d, min_candidates_ok=%d, cooldown_ok=%d",
+                      get_id, candidate_file_numbers.size(),
+                      sample_match ? 1 : 0, min_candidates_ok ? 1 : 0, cooldown_ok ? 1 : 0);
+      }
     }
   }
   // ===== BloomCheck 비동기 힌트 시스템 끝 =====
@@ -2937,32 +3035,34 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     BloomCheckAsyncClient* async_client =
         static_cast<BloomCheckAsyncClient*>(read_options.bloomcheck_client);
     
-    // 스킵된 파일 수를 통계에 반영
-    if (bloom_hint_skipped_files > 0) {
+    // 스킵된 파일 수를 통계에 반영 (힌트가 있는 경우에만)
+    if (bloom_hint != nullptr && bloom_hint_skipped_files > 0) {
       async_client->RecordSkippedFiles(bloom_hint_skipped_files);
     }
     
-    // 주기적으로 통계 출력 (1000번마다) - 디버깅 중이므로 잠시 비활성화
-    // static std::atomic<uint64_t> stats_counter{0};
-    // uint64_t counter = stats_counter.fetch_add(1, std::memory_order_relaxed);
-    // 
-    // if (counter % 1000 == 0 && info_log_) {
-    //   auto stats = async_client->GetStats();
-    //   
-    //   double cache_hit_rate = 0.0;
-    //   if (stats.cache_hits + stats.cache_misses > 0) {
-    //     cache_hit_rate = 100.0 * stats.cache_hits / 
-    //                      (stats.cache_hits + stats.cache_misses);
-    //   }
-    //   
-    //   ROCKS_LOG_INFO(info_log_,
-    //                  "[BloomCheck Stats] inflight_rpc=%lu, cache_hit_rate=%.2f%%, "
-    //                  "rpc_dropped=%lu, rpc_timeout=%lu, rpc_success=%lu, "
-    //                  "sst_files_skipped=%lu",
-    //                  stats.inflight_rpc_count, cache_hit_rate,
-    //                  stats.rpc_dropped, stats.rpc_timeout, stats.rpc_success,
-    //                  stats.sst_files_skipped);
-    // }
+    // 주기적으로 통계 출력 (1000번마다)
+    static std::atomic<uint64_t> stats_counter{0};
+    uint64_t counter = stats_counter.fetch_add(1, std::memory_order_relaxed);
+    
+    if (counter % 1000 == 0 && info_log_) {
+      auto stats = async_client->GetStats();
+      
+      double cache_hit_rate = 0.0;
+      if (stats.cache_hits + stats.cache_misses > 0) {
+        cache_hit_rate = 100.0 * stats.cache_hits / 
+                         (stats.cache_hits + stats.cache_misses);
+      }
+      
+      ROCKS_LOG_INFO(info_log_,
+                     "[BloomCheck Stats] inflight_rpc=%lu, cache_hit_rate=%.2f%%, "
+                     "rpc_started=%lu, rpc_completed=%lu, rpc_ok=%lu, rpc_failed=%lu, "
+                     "rpc_cancelled=%lu, rpc_dropped=%lu, rpc_timed_out=%lu, "
+                     "sst_files_skipped=%lu",
+                     stats.inflight_rpc_count, cache_hit_rate,
+                     stats.rpc_started, stats.rpc_completed, stats.rpc_ok, stats.rpc_failed,
+                     stats.rpc_cancelled, stats.rpc_dropped, stats.rpc_timed_out,
+                     stats.sst_files_skipped);
+    }
   }
 
   if (db_statistics_ != nullptr) {
