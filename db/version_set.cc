@@ -2753,6 +2753,9 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     pinned_iters_mgr->StartPinning();
   }
 
+  // BloomCheck per-call state (이번 Get 요청에만 적용)
+  uint64_t bloomcheck_call_id = 0;  // 0 = RPC 미발사 또는 실패
+
   // ===== BloomCheck 비동기 힌트 시스템 =====
   // BloomCheck는 비동기적으로 발사되며, 결과는 file_number별 캐시에 저장됨
   // 이번 Get에는 결과를 기다리지 않고, 캐시에 있는 힌트만 사용
@@ -2863,27 +2866,10 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       //                 cooldown_ok ? 1 : 0);
       // }
       
+      // BloomCheck RPC 발사 (call_id 반환)
       if (should_fire) {
-        // fired 변수 미사용 - 로그 주석처리로 인해
-        // bool fired = async_client->FireAsyncCheck(user_key_str, candidate_file_numbers);
-        async_client->FireAsyncCheck(user_key_str, candidate_file_numbers);
-        // 로그 주석처리
-        // if (!fired) {
-        //   // FireAsyncCheck 실패 (drop) - 통계는 클라이언트에서 관리
-        //   if (get_id < 10 || get_id % 10000 == 0) {
-        //     ROCKS_LOG_INFO(info_log_, 
-        //                   "[BloomCheck] Version::Get #%lu: FireAsyncCheck returned false (dropped), "
-        //                   "candidate_files=%zu, sample_match=%d, min_candidates_ok=%d, cooldown_ok=%d",
-        //                   get_id, candidate_file_numbers.size(), 
-        //                   sample_match ? 1 : 0, min_candidates_ok ? 1 : 0, cooldown_ok ? 1 : 0);
-        //   }
-        // } else if (get_id < 10 || get_id % 10000 == 0) {
-        //   std::string user_key_hex = BloomCheckAsyncClient::KeyToHex(user_key_str);
-        //   ROCKS_LOG_INFO(info_log_, 
-        //                 "[BloomCheck] Version::Get #%lu: FireAsyncCheck fired, "
-        //                 "candidate_files=%zu, user_key_hex=%s",
-        //                 get_id, candidate_file_numbers.size(), user_key_hex.c_str());
-        // }
+        bloomcheck_call_id = async_client->FireAsyncCheck(user_key_str, candidate_file_numbers);
+        // call_id == 0이면 실패/스킵 (baseline 경로로 진행)
       } else {
         // rate limiting으로 drop된 경우 - 원인별 카운터 증가
         // 주의: 샘플링은 drop으로 간주하지 않음 (의도된 정책)
@@ -2917,6 +2903,13 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   // BloomCheck 힌트 통계
   uint64_t bloom_hint_skipped_files = 0;
   uint64_t bloom_hint_total_files = 0;
+  
+  // BloomCheck per-call state (이번 Get 요청에만 적용)
+  PerCallState* bloomcheck_result = nullptr;
+  bool bloomcheck_result_ready = false;
+  
+  // BloomCheck 결과 Poll (최대 1회만 체크 - 이후는 캐시된 결과 사용)
+  bool bloomcheck_polled = false;
 
   while (f != nullptr) {
     if (*max_covering_tombstone_seq > 0) {
@@ -2928,17 +2921,45 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     uint64_t file_number = f->file_metadata->fd.GetNumber();
     bloom_hint_total_files++;
 
-    // BloomCheck 힌트 필터링: file_number별 negative 힌트가 최근이면 스킵
-    // 힌트가 없으면 baseline 동작 (모든 파일 검사)
-    if (bloomcheck_enabled && read_options.bloomcheck_client != nullptr) {
+    // BloomCheck per-call 결과 Poll (루프 중 최초 1회만)
+    if (bloomcheck_enabled && read_options.bloomcheck_client != nullptr && 
+        bloomcheck_call_id != 0 && !bloomcheck_polled) {
       BloomCheckAsyncClient* async_client =
           static_cast<BloomCheckAsyncClient*>(read_options.bloomcheck_client);
       
-      if (async_client->ShouldSkipFile(file_number)) {
-        // negative 힌트가 최근(5ms 이내) → 스킵
+      PerCallState* polled_state = nullptr;
+      if (async_client->TryPollResult(bloomcheck_call_id, &polled_state)) {
+        // 완전한 결과 도착 (ready && complete)
+        bloomcheck_result = polled_state;
+        bloomcheck_result_ready = true;
+      }
+      bloomcheck_polled = true;  // 최초 1회만 Poll
+    }
+
+    // BloomCheck fast-path: complete == true일 때만 may_match_files로 restrict
+    if (bloomcheck_result_ready && bloomcheck_result && bloomcheck_result->complete) {
+      // 서버가 모든 candidate를 검사했고, 결과가 완전함
+      // may_match_files에 없는 파일은 skip (fast-path)
+      if (!bloomcheck_result->IsMayMatch(file_number)) {
+        // may_match == false → skip
         bloom_hint_skipped_files++;
         f = fp.GetNextFile();
         continue;
+      }
+      // may_match == true → 계속 처리
+    } else {
+      // BloomCheck 힌트 필터링 (fallback): file_number별 negative 힌트가 최근이면 스킵
+      // 힌트가 없으면 baseline 동작 (모든 파일 검사)
+      if (bloomcheck_enabled && read_options.bloomcheck_client != nullptr) {
+        BloomCheckAsyncClient* async_client =
+            static_cast<BloomCheckAsyncClient*>(read_options.bloomcheck_client);
+        
+        if (async_client->ShouldSkipFile(file_number)) {
+          // negative 힌트가 최근(5ms 이내) → 스킵
+          bloom_hint_skipped_files++;
+          f = fp.GetNextFile();
+          continue;
+        }
       }
     }
 
@@ -3054,6 +3075,11 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     // 스킵된 파일 수를 통계에 반영
     if (bloom_hint_skipped_files > 0) {
       async_client->RecordSkippedFiles(bloom_hint_skipped_files);
+    }
+    
+    // BloomCheck per-call state 정리 (이번 Get 요청 완료)
+    if (bloomcheck_call_id != 0) {
+      async_client->ReleaseCallState(bloomcheck_call_id);
     }
     
     // 주기적으로 통계 출력 (1000번마다)

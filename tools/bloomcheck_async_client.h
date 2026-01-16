@@ -23,6 +23,34 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// PerCallState: Get 요청 단위로 BloomCheck 결과를 추적하는 구조
+struct PerCallState {
+  std::unordered_set<uint64_t> candidate_file_numbers;  // 원래 요청한 파일 번호들
+  std::unordered_set<uint64_t> may_match_file_numbers;  // 서버가 반환한 may_match 파일 번호들
+  bool complete;  // 완전한 응답인지 여부
+  bool ready;  // 결과가 준비되었는지 여부
+  
+  PerCallState() : complete(false), ready(false) {}
+  
+  // 결과 설정
+  void SetResult(const std::unordered_set<uint64_t>& candidates,
+                 const std::unordered_set<uint64_t>& may_match,
+                 bool is_complete) {
+    candidate_file_numbers = candidates;
+    may_match_file_numbers = may_match;
+    complete = is_complete;
+    ready = true;
+  }
+  
+  // 파일이 may_match인지 확인 (ready && complete일 때만 신뢰 가능)
+  bool IsMayMatch(uint64_t file_number) const {
+    if (!ready || !complete) {
+      return true;  // 신뢰할 수 없으면 안전하게 true 반환
+    }
+    return may_match_file_numbers.find(file_number) != may_match_file_numbers.end();
+  }
+};
+
 // FileHint: file_number별 캐시된 BloomCheck 결과
 // positive: 최근에 may_match=true였던 시각
 // negative: 최근에 may_match=false였던 시각
@@ -214,14 +242,15 @@ class BloomCheckAsyncClient {
   }
   
   // 비동기로 BloomCheck RPC 발사 (non-blocking)
+  // 반환값: call_id (0 = 실패/스킵, 0이 아니면 성공한 call_id)
   // 조건부 발사는 호출 측에서 처리
-  bool FireAsyncCheck(const std::string& user_key,
-                      const std::unordered_set<uint64_t>& candidate_file_numbers) {
+  uint64_t FireAsyncCheck(const std::string& user_key,
+                          const std::unordered_set<uint64_t>& candidate_file_numbers) {
     static std::atomic<uint64_t> fire_counter{0};
     uint64_t fire_id = fire_counter.fetch_add(1, std::memory_order_relaxed);
     
     if (shutdown_.load(std::memory_order_relaxed)) {
-      return false;
+      return 0;  // 0 = 실패
     }
     
     // 1. Overload cooldown 체크
@@ -231,14 +260,14 @@ class BloomCheckAsyncClient {
     uint64_t next_allowed = next_fire_allowed_ts_.load(std::memory_order_acquire);
     if (static_cast<int64_t>(now_ns) < static_cast<int64_t>(next_allowed)) {
       stats_.skipped_due_to_overload_cooldown.fetch_add(1, std::memory_order_relaxed);
-      return false;  // skip (not counted as dropped)
+      return 0;  // 0 = skip (not counted as dropped)
     }
     
     // 2. Token bucket 체크
     uint64_t tokens = tokens_.load(std::memory_order_acquire);
     if (tokens == 0) {
       stats_.skipped_due_to_tokens.fetch_add(1, std::memory_order_relaxed);
-      return false;  // skip (not counted as dropped)
+      return 0;  // 0 = skip (not counted as dropped)
     }
     
     // 토큰 소비 시도 (compare-and-swap)
@@ -248,16 +277,19 @@ class BloomCheckAsyncClient {
                                           std::memory_order_acquire)) {
       if (expected == 0) {
         stats_.skipped_due_to_tokens.fetch_add(1, std::memory_order_relaxed);
-        return false;  // skip (not counted as dropped)
+        return 0;  // 0 = skip (not counted as dropped)
       }
       tokens = expected;
       expected = tokens;
     }
     
-    // 1. AsyncCall 생성 (new로 할당)
+    // 3. Per-call state 생성 (call_id로 추적)
+    uint64_t call_id = fire_id + 1;  // 0이 아닌 값으로 사용 (fire_id는 0부터 시작)
+    
+    // 4. AsyncCall 생성 (new로 할당)
     AsyncCall* call = new AsyncCall();
     call->user_key = user_key;
-    call->call_id = fire_id;  // 디버깅용 call ID 설정
+    call->call_id = call_id;  // call ID 설정
     
     bloomcheck::KeyRequest* key_req = call->request.add_reqs();
     key_req->set_user_key(user_key);
@@ -265,13 +297,29 @@ class BloomCheckAsyncClient {
       key_req->add_sst_file_numbers(file_number);
     }
     
-    // 2. inflight에 먼저 등록 (CRITICAL: Finish 전에 등록)
+    // 5. Per-call state 초기 등록 (결과 도착 전까지 ready=false)
+    {
+      std::lock_guard<std::mutex> lock(per_call_state_mutex_);
+      PerCallState& state = per_call_states_[call_id];
+      state.candidate_file_numbers = candidate_file_numbers;
+      state.ready = false;
+      state.complete = false;
+    }
+    
+    // 6. inflight에 먼저 등록 (CRITICAL: Finish 전에 등록)
     {
       std::lock_guard<std::mutex> lock(inflight_mutex_);
       
       // max_inflight 체크 - 포화 시 그냥 drop (cancel 없음)
       if (inflight_requests_.size() >= max_inflight_) {
         delete call;  // 아직 inflight에 등록하지 않았으므로 여기서 삭제 가능
+        
+        // Per-call state 정리
+        {
+          std::lock_guard<std::mutex> lock2(per_call_state_mutex_);
+          per_call_states_.erase(call_id);
+        }
+        
         stats_.drop_due_to_inflight_full.fetch_add(1, std::memory_order_relaxed);
         stats_.rpc_dropped.fetch_add(1, std::memory_order_relaxed);
         
@@ -287,7 +335,7 @@ class BloomCheckAsyncClient {
         //                   fire_id, max_inflight_);
         //   }
         // }
-        return false;
+        return 0;  // 0 = 실패
       }
       
       // inflight에 등록
@@ -296,7 +344,7 @@ class BloomCheckAsyncClient {
       stats_.rpc_started.fetch_add(1, std::memory_order_relaxed);
     }
     
-    // 3. PrepareAsync (CQ 사용)
+    // 7. PrepareAsync (CQ 사용)
     call->rpc = stub_->PrepareAsyncCheck(&call->ctx, call->request, &cq_);
     
     if (!call->rpc) {
@@ -312,19 +360,58 @@ class BloomCheckAsyncClient {
         inflight_requests_.erase(call);
         stats_.inflight_rpc_count.store(inflight_requests_.size(), std::memory_order_relaxed);
       }
+      
+      // Per-call state 정리
+      {
+        std::lock_guard<std::mutex> lock2(per_call_state_mutex_);
+        per_call_states_.erase(call_id);
+      }
+      
       stats_.drop_due_to_other.fetch_add(1, std::memory_order_relaxed);
       stats_.rpc_dropped.fetch_add(1, std::memory_order_relaxed);
       delete call;
-      return false;
+      return 0;  // 0 = 실패
     }
     
-    // 4. StartCall()
+    // 8. StartCall()
     call->rpc->StartCall();
     
-    // 5. Finish(tag=call) - call 포인터가 tag가 됨
+    // 9. Finish(tag=call) - call 포인터가 tag가 됨
     call->rpc->Finish(&call->response, &call->status, call);
     
-    return true;
+    return call_id;  // call_id 반환
+  }
+  
+  // Get 요청에서 BloomCheck 결과를 Poll (non-blocking)
+  // 반환값: true = 결과 도착 (ready && complete), false = 아직 없음 또는 incomplete
+  bool TryPollResult(uint64_t call_id, PerCallState** out_state) {
+    if (call_id == 0) {
+      return false;  // 유효하지 않은 call_id
+    }
+    
+    std::lock_guard<std::mutex> lock(per_call_state_mutex_);
+    auto it = per_call_states_.find(call_id);
+    if (it == per_call_states_.end()) {
+      return false;  // 상태 없음 (이미 정리되었거나 존재하지 않음)
+    }
+    
+    PerCallState& state = it->second;
+    if (state.ready && state.complete) {
+      *out_state = &state;
+      return true;  // 완전한 결과 도착
+    }
+    
+    return false;  // 아직 없음 또는 incomplete
+  }
+  
+  // Get 요청 완료 시 per-call state 정리 (call_id로)
+  void ReleaseCallState(uint64_t call_id) {
+    if (call_id == 0) {
+      return;
+    }
+    
+    std::lock_guard<std::mutex> lock(per_call_state_mutex_);
+    per_call_states_.erase(call_id);
   }
   
   // file_number별 힌트 조회 (non-blocking)
@@ -640,6 +727,12 @@ class BloomCheckAsyncClient {
       if (call->response.resps_size() > 0) {
         const auto& key_resp = call->response.resps(0);
         
+        // 응답에서 완전성 정보 추출
+        bool complete = key_resp.complete();  // 서버가 모든 파일을 검사했는지
+        // checked_count와 total_candidates는 나중에 로그/통계에 사용 가능
+        // uint64_t checked_count = key_resp.checked_count();
+        // uint64_t total_candidates = key_resp.total_candidates();
+        
         // file_number별 힌트 캐시 업데이트
         std::unordered_set<uint64_t> may_match_files;
         for (uint64_t file_number : key_resp.may_match_sst_file_numbers()) {
@@ -652,6 +745,16 @@ class BloomCheckAsyncClient {
           for (uint64_t file_number : req.sst_file_numbers()) {
             candidate_files.insert(file_number);
           }
+        }
+        
+        // Per-call state 업데이트 (이번 Get 요청에 즉시 적용 가능)
+        {
+          std::lock_guard<std::mutex> lock(per_call_state_mutex_);
+          auto it = per_call_states_.find(call->call_id);
+          if (it != per_call_states_.end()) {
+            it->second.SetResult(candidate_files, may_match_files, complete);
+          }
+          // call_id가 없으면 무시 (이미 정리되었거나 잘못된 call_id)
         }
         
         {
@@ -803,6 +906,10 @@ class BloomCheckAsyncClient {
   // FileHint 캐시 (file_number -> FileHint)
   std::mutex cache_mutex_;
   std::unordered_map<uint64_t, FileHint> file_hint_cache_;
+  
+  // Per-call state 관리 (call_id -> PerCallState)
+  std::mutex per_call_state_mutex_;
+  std::unordered_map<uint64_t, PerCallState> per_call_states_;
   
   struct StatsInternal {
     std::atomic<uint64_t> inflight_rpc_count{0};
