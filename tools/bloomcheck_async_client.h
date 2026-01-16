@@ -126,13 +126,20 @@ class BloomCheckAsyncClient {
       }
     }
     
-    // CompletionQueue 처리 스레드 시작
+    // CompletionQueue 처리 스레드 시작 (여러 개)
+    // N = min(8, hardware_concurrency()/4)로 설정
+    size_t num_cq_threads = std::min(static_cast<size_t>(8), 
+                                      std::max(static_cast<size_t>(1), 
+                                               static_cast<size_t>(std::thread::hardware_concurrency()) / 4));
     if (logger_) {
-      ROCKS_LOG_INFO(logger_, "[BloomCheck] Starting ProcessCompletionQueue thread...");
+      ROCKS_LOG_INFO(logger_, "[BloomCheck] Starting %zu ProcessCompletionQueue threads...", num_cq_threads);
     }
-    cq_thread_ = std::thread(&BloomCheckAsyncClient::ProcessCompletionQueue, this);
+    cq_threads_.reserve(num_cq_threads);
+    for (size_t i = 0; i < num_cq_threads; ++i) {
+      cq_threads_.emplace_back(&BloomCheckAsyncClient::ProcessCompletionQueue, this);
+    }
     if (logger_) {
-      ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread started");
+      ROCKS_LOG_INFO(logger_, "[BloomCheck] %zu ProcessCompletionQueue threads started", num_cq_threads);
     }
     
     // 스레드가 시작될 시간 제공
@@ -158,9 +165,11 @@ class BloomCheckAsyncClient {
     // 3. CompletionQueue 종료
     cq_.Shutdown();
     
-    // 4. CQ thread 종료 대기
-    if (cq_thread_.joinable()) {
-      cq_thread_.join();
+    // 4. CQ threads 종료 대기
+    for (auto& thread : cq_threads_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
     }
     
     // 5. 남은 inflight call 정리 (CQ thread가 이미 종료되었으므로 안전)
@@ -321,8 +330,11 @@ class BloomCheckAsyncClient {
   
  private:
   void ProcessCompletionQueue() {
+    static std::atomic<uint64_t> thread_id_counter{0};
+    uint64_t thread_id = thread_id_counter.fetch_add(1);
+    
     if (logger_) {
-      ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread started");
+      ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu started", thread_id);
     }
     
     void* tag = nullptr;
@@ -330,15 +342,14 @@ class BloomCheckAsyncClient {
     uint64_t total_responses = 0;
     
     while (true) {
-      // AsyncNext 올바른 사용법: enum 반환값 처리
-      // GPR_TIMESPAN을 사용하여 duration을 나타냄
-      gpr_timespec deadline =
+      // 첫 번째 AsyncNext: 긴 deadline(1초)으로 이벤트 확보
+      gpr_timespec long_deadline =
           gpr_time_add(gpr_now(GPR_CLOCK_MONOTONIC),
                        gpr_time_from_millis(1000, GPR_TIMESPAN));
       
-      auto next_status = cq_.AsyncNext(&tag, &ok, deadline);
+      auto next_status = cq_.AsyncNext(&tag, &ok, long_deadline);
       
-      // TIMEOUT: continue
+      // TIMEOUT: continue (큐가 비어있음)
       if (next_status == grpc::CompletionQueue::NextStatus::TIMEOUT) {
         continue;
       }
@@ -346,28 +357,74 @@ class BloomCheckAsyncClient {
       // SHUTDOWN: break
       if (next_status == grpc::CompletionQueue::NextStatus::SHUTDOWN) {
         if (logger_) {
-          ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue: CQ shutdown");
+          ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu: CQ shutdown", thread_id);
         }
         break;
       }
       
-      // GOT_EVENT: tag와 ok 사용
+      // GOT_EVENT: 첫 이벤트 처리
       if (next_status != grpc::CompletionQueue::NextStatus::GOT_EVENT) {
         continue;
       }
       
-      total_responses++;
-      stats_.rpc_completed.fetch_add(1, std::memory_order_relaxed);
+      // 첫 이벤트 처리
+      ProcessEvent(tag, ok, &total_responses);
       
-      // tag가 nullptr인 경우 무시
-      if (tag == nullptr) {
-        if (total_responses <= 100 || total_responses % 1000 == 0) {
+      // 이벤트가 있는 동안 연속으로 drain (공격적 처리)
+      // 짧은 deadline(0ms)으로 최대한 많은 이벤트를 빠르게 처리
+      const size_t max_drain_batch = 100;  // 한 번에 최대 100개까지 drain
+      for (size_t drain_count = 0; drain_count < max_drain_batch; ++drain_count) {
+        gpr_timespec short_deadline =
+            gpr_time_add(gpr_now(GPR_CLOCK_MONOTONIC),
+                         gpr_time_from_millis(0, GPR_TIMESPAN));  // 즉시 반환
+        
+        auto drain_status = cq_.AsyncNext(&tag, &ok, short_deadline);
+        
+        if (drain_status == grpc::CompletionQueue::NextStatus::TIMEOUT) {
+          // 큐가 비어있으면 drain 종료
+          break;
+        }
+        
+        if (drain_status == grpc::CompletionQueue::NextStatus::SHUTDOWN) {
+          if (logger_) {
+            ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu: CQ shutdown during drain", thread_id);
+          }
+          return;  // while 루프 종료
+        }
+        
+        if (drain_status == grpc::CompletionQueue::NextStatus::GOT_EVENT) {
+          ProcessEvent(tag, ok, &total_responses);
+        }
+      }
+    }
+    
+    // 남은 inflight call 정리
+    // unique_ptr이 자동으로 delete하므로 clear()만 호출
+    {
+      std::lock_guard<std::mutex> lock(inflight_mutex_);
+      // 다른 스레드가 이미 정리했을 수 있으므로 여기서는 로그만
+    }
+    
+    if (logger_) {
+      ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu exiting, total_responses=%lu", 
+                    thread_id, total_responses);
+    }
+  }
+  
+  // 이벤트 처리 헬퍼 함수 (락 보호 내부 로직)
+  void ProcessEvent(void* tag, bool ok, uint64_t* total_responses) {
+    (*total_responses)++;
+    stats_.rpc_completed.fetch_add(1, std::memory_order_relaxed);
+    
+    // tag가 nullptr인 경우 무시
+    if (tag == nullptr) {
+        if (*total_responses <= 100 || (*total_responses) % 1000 == 0) {
           if (logger_) {
             ROCKS_LOG_WARN(logger_, "[BloomCheck] ProcessCompletionQueue received null tag! ok=%d, response #%lu", 
-                          ok ? 1 : 0, total_responses);
+                          ok ? 1 : 0, *total_responses);
           }
         }
-        continue;
+        return;
       }
       
       // tag를 AsyncCall*로 캐스팅
@@ -385,12 +442,12 @@ class BloomCheckAsyncClient {
         } else {
           // 이미 제거된 call (drop된 경우 등) - 무시
           // CRITICAL: delete 하지 않음! unique_ptr이 이미 삭제했을 수 있음
-          if (total_responses <= 100 || total_responses % 1000 == 0) {
+          if (*total_responses <= 100 || (*total_responses) % 1000 == 0) {
             if (logger_) {
               ROCKS_LOG_WARN(logger_, "[BloomCheck] Dropped response (not in inflight), tag=%p", call);
             }
           }
-          continue;  // NO delete - 더블 free 방지
+          return;  // NO delete - 더블 free 방지
         }
       }
       
@@ -398,13 +455,13 @@ class BloomCheckAsyncClient {
       if (!call_owner || call_owner.get() != call) {
         // 메모리 안전성 체크 실패 - 로그만 남기고 무시
         // CRITICAL: delete 하지 않음! unique_ptr이 이미 삭제했을 수 있음
-        if (total_responses <= 100 || total_responses % 1000 == 0) {
+        if (*total_responses <= 100 || (*total_responses) % 1000 == 0) {
           if (logger_) {
             ROCKS_LOG_WARN(logger_, "[BloomCheck] Invalid call_owner: call=%p, owner=%p", 
                           call, call_owner ? call_owner.get() : nullptr);
           }
         }
-        continue;  // NO delete - 더블 free 방지
+        return;  // NO delete - 더블 free 방지
       }
       
       // cancelled 플래그 체크
@@ -436,7 +493,7 @@ class BloomCheckAsyncClient {
       if (was_cancelled) {
         stats_.rpc_cancelled.fetch_add(1, std::memory_order_relaxed);
         // call_owner가 소멸되면서 자동으로 delete됨
-        continue;
+        return;
       }
       
       // ok=false 또는 status.ok()=false 처리
@@ -444,7 +501,7 @@ class BloomCheckAsyncClient {
         stats_.rpc_failed.fetch_add(1, std::memory_order_relaxed);
         
         // 로그 출력 - 주석처리
-        // if (total_responses <= 100 || total_responses % 1000 == 0) {
+        // if (*total_responses <= 100 || (*total_responses) % 1000 == 0) {
         //   if (logger_) {
         //     ROCKS_LOG_INFO(logger_,
         //                    "[BloomCheck] RPC failed: ok=%d, status.ok()=%d, "
@@ -458,7 +515,7 @@ class BloomCheckAsyncClient {
         // }
         
         // call_owner가 소멸되면서 자동으로 delete됨
-        continue;
+        return;
       }
       
       // 성공: 응답 처리 및 캐시 저장
@@ -582,24 +639,11 @@ class BloomCheckAsyncClient {
       
       // call_owner가 소멸되면서 자동으로 delete됨
     }
-    
-    // 남은 inflight call 정리
-    // unique_ptr이 자동으로 delete하므로 clear()만 호출
-    {
-      std::lock_guard<std::mutex> lock(inflight_mutex_);
-      inflight_requests_.clear();  // unique_ptr이 알아서 delete
-    }
-    
-    if (logger_) {
-      ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread exiting, total_responses=%lu", 
-                    total_responses);
-    }
-  }
   
   std::shared_ptr<grpc::Channel> channel_;
   std::unique_ptr<bloomcheck::BloomCheck::Stub> stub_;
   grpc::CompletionQueue cq_;
-  std::thread cq_thread_;
+  std::vector<std::thread> cq_threads_;  // 여러 CQ polling threads
   std::atomic<bool> shutdown_;
   
   size_t max_inflight_;
