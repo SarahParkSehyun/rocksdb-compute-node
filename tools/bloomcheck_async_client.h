@@ -98,49 +98,63 @@ class BloomCheckAsyncClient {
         shutdown_(false),
         max_inflight_(max_inflight),
         hint_ttl_(hint_ttl),
-        logger_(logger) {
+        logger_(logger),
+        overload_cooldown_us_(200),  // 기본값 200us
+        next_fire_allowed_ts_(0),
+        tokens_(max_inflight / 2),  // 초기 토큰: max_inflight의 절반
+        last_refill_time_(0),
+        last_completed_count_(0) {
     // 채널이 READY 상태가 될 때까지 대기
     std::chrono::system_clock::time_point deadline = 
         std::chrono::system_clock::now() + std::chrono::seconds(10);
     grpc_connectivity_state state = channel_->GetState(true);
     
-    if (state == GRPC_CHANNEL_CONNECTING || state == GRPC_CHANNEL_IDLE) {
-      if (logger_) {
-        ROCKS_LOG_INFO(logger_, "[BloomCheck] Channel connecting (state=%d), waiting for READY...", state);
-      }
+    // 로그 주석처리
+    // if (state == GRPC_CHANNEL_CONNECTING || state == GRPC_CHANNEL_IDLE) {
+    //   if (logger_) {
+    //     ROCKS_LOG_INFO(logger_, "[BloomCheck] Channel connecting (state=%d), waiting for READY...", state);
+    //   }
       if (!channel_->WaitForStateChange(state, deadline)) {
-        if (logger_) {
-          ROCKS_LOG_WARN(logger_, "[BloomCheck] Channel failed to become READY within 10s");
-        }
+        // if (logger_) {
+        //   ROCKS_LOG_WARN(logger_, "[BloomCheck] Channel failed to become READY within 10s");
+        // }
       } else {
         state = channel_->GetState(false);
-        if (state == GRPC_CHANNEL_READY) {
-          if (logger_) {
-            ROCKS_LOG_INFO(logger_, "[BloomCheck] Channel is now READY");
-          }
-        }
+        // if (state == GRPC_CHANNEL_READY) {
+        //   if (logger_) {
+        //     ROCKS_LOG_INFO(logger_, "[BloomCheck] Channel is now READY");
+        //   }
+        // }
       }
-    } else if (state == GRPC_CHANNEL_READY) {
-      if (logger_) {
-        ROCKS_LOG_INFO(logger_, "[BloomCheck] Channel is already READY");
-      }
-    }
+    // } else if (state == GRPC_CHANNEL_READY) {
+    //   if (logger_) {
+    //     ROCKS_LOG_INFO(logger_, "[BloomCheck] Channel is already READY");
+    //   }
+    // }
     
     // CompletionQueue 처리 스레드 시작 (여러 개)
     // N = min(8, hardware_concurrency()/4)로 설정
     size_t num_cq_threads = std::min(static_cast<size_t>(8), 
                                       std::max(static_cast<size_t>(1), 
                                                static_cast<size_t>(std::thread::hardware_concurrency()) / 4));
-    if (logger_) {
-      ROCKS_LOG_INFO(logger_, "[BloomCheck] Starting %zu ProcessCompletionQueue threads...", num_cq_threads);
-    }
+    // 로그 주석처리
+    // if (logger_) {
+    //   ROCKS_LOG_INFO(logger_, "[BloomCheck] Starting %zu ProcessCompletionQueue threads...", num_cq_threads);
+    // }
     cq_threads_.reserve(num_cq_threads);
     for (size_t i = 0; i < num_cq_threads; ++i) {
       cq_threads_.emplace_back(&BloomCheckAsyncClient::ProcessCompletionQueue, this);
     }
-    if (logger_) {
-      ROCKS_LOG_INFO(logger_, "[BloomCheck] %zu ProcessCompletionQueue threads started", num_cq_threads);
-    }
+    // if (logger_) {
+    //   ROCKS_LOG_INFO(logger_, "[BloomCheck] %zu ProcessCompletionQueue threads started", num_cq_threads);
+    // }
+    
+    // Token refill thread 시작
+    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    last_refill_time_.store(now_ns, std::memory_order_relaxed);
+    last_completed_count_.store(0, std::memory_order_relaxed);
+    token_refill_thread_ = std::thread(&BloomCheckAsyncClient::TokenRefillLoop, this);
     
     // 스레드가 시작될 시간 제공
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -165,7 +179,12 @@ class BloomCheckAsyncClient {
     // 3. CompletionQueue 종료
     cq_.Shutdown();
     
-    // 4. CQ threads 종료 대기
+    // 4. Token refill thread 종료 대기
+    if (token_refill_thread_.joinable()) {
+      token_refill_thread_.join();
+    }
+    
+    // 5. CQ threads 종료 대기
     for (auto& thread : cq_threads_) {
       if (thread.joinable()) {
         thread.join();
@@ -205,6 +224,36 @@ class BloomCheckAsyncClient {
       return false;
     }
     
+    // 1. Overload cooldown 체크
+    auto now_time = std::chrono::steady_clock::now();
+    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now_time.time_since_epoch()).count();
+    uint64_t next_allowed = next_fire_allowed_ts_.load(std::memory_order_acquire);
+    if (static_cast<int64_t>(now_ns) < static_cast<int64_t>(next_allowed)) {
+      stats_.skipped_due_to_overload_cooldown.fetch_add(1, std::memory_order_relaxed);
+      return false;  // skip (not counted as dropped)
+    }
+    
+    // 2. Token bucket 체크
+    uint64_t tokens = tokens_.load(std::memory_order_acquire);
+    if (tokens == 0) {
+      stats_.skipped_due_to_tokens.fetch_add(1, std::memory_order_relaxed);
+      return false;  // skip (not counted as dropped)
+    }
+    
+    // 토큰 소비 시도 (compare-and-swap)
+    uint64_t expected = tokens;
+    while (!tokens_.compare_exchange_weak(expected, tokens - 1, 
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+      if (expected == 0) {
+        stats_.skipped_due_to_tokens.fetch_add(1, std::memory_order_relaxed);
+        return false;  // skip (not counted as dropped)
+      }
+      tokens = expected;
+      expected = tokens;
+    }
+    
     // 1. AsyncCall 생성 (new로 할당)
     AsyncCall* call = new AsyncCall();
     call->user_key = user_key;
@@ -223,13 +272,21 @@ class BloomCheckAsyncClient {
       // max_inflight 체크 - 포화 시 그냥 drop (cancel 없음)
       if (inflight_requests_.size() >= max_inflight_) {
         delete call;  // 아직 inflight에 등록하지 않았으므로 여기서 삭제 가능
+        stats_.drop_due_to_inflight_full.fetch_add(1, std::memory_order_relaxed);
         stats_.rpc_dropped.fetch_add(1, std::memory_order_relaxed);
-        if (fire_id < 10 || fire_id % 10000 == 0) {
-          if (logger_) {
-            ROCKS_LOG_INFO(logger_, "[BloomCheck] FireAsyncCheck #%lu: dropped (max_inflight=%zu reached)", 
-                          fire_id, max_inflight_);
-          }
-        }
+        
+        // Overload cooldown 설정 (현재 시간 + cooldown)
+        auto cooldown_ns = std::chrono::microseconds(overload_cooldown_us_).count() * 1000;
+        uint64_t new_next_allowed = now_ns + cooldown_ns;
+        next_fire_allowed_ts_.store(new_next_allowed, std::memory_order_release);
+        
+        // 로그 주석처리
+        // if (fire_id < 10 || fire_id % 10000 == 0) {
+        //   if (logger_) {
+        //     ROCKS_LOG_INFO(logger_, "[BloomCheck] FireAsyncCheck #%lu: dropped (max_inflight=%zu reached)", 
+        //                   fire_id, max_inflight_);
+        //   }
+        // }
         return false;
       }
       
@@ -243,17 +300,20 @@ class BloomCheckAsyncClient {
     call->rpc = stub_->PrepareAsyncCheck(&call->ctx, call->request, &cq_);
     
     if (!call->rpc) {
-      if (fire_id < 10) {
-        if (logger_) {
-          ROCKS_LOG_ERROR(logger_, "[BloomCheck] FireAsyncCheck #%lu: PrepareAsyncCheck returned null!", fire_id);
-        }
-      }
+      // 로그 주석처리
+      // if (fire_id < 10) {
+      //   if (logger_) {
+      //     ROCKS_LOG_ERROR(logger_, "[BloomCheck] FireAsyncCheck #%lu: PrepareAsyncCheck returned null!", fire_id);
+      //   }
+      // }
       // PrepareAsync 실패 시 inflight에서 제거 후 삭제
       {
         std::lock_guard<std::mutex> lock(inflight_mutex_);
         inflight_requests_.erase(call);
         stats_.inflight_rpc_count.store(inflight_requests_.size(), std::memory_order_relaxed);
       }
+      stats_.drop_due_to_other.fetch_add(1, std::memory_order_relaxed);
+      stats_.rpc_dropped.fetch_add(1, std::memory_order_relaxed);
       delete call;
       return false;
     }
@@ -297,7 +357,7 @@ class BloomCheckAsyncClient {
     stats_.sst_files_skipped.fetch_add(count, std::memory_order_relaxed);
   }
   
-  // 통계 조회
+    // 통계 조회
   struct Stats {
     uint64_t inflight_rpc_count;
     uint64_t cache_hits;
@@ -310,6 +370,14 @@ class BloomCheckAsyncClient {
     uint64_t rpc_dropped;
     uint64_t rpc_timed_out;
     uint64_t sst_files_skipped;
+    // Drop reason breakdown
+    uint64_t drop_due_to_inflight_full;
+    uint64_t drop_due_to_cooldown;
+    uint64_t drop_due_to_min_candidates;
+    uint64_t drop_due_to_other;
+    // Skip counters (not counted as drops)
+    uint64_t skipped_due_to_overload_cooldown;
+    uint64_t skipped_due_to_tokens;
   };
   
   Stats GetStats() const {
@@ -325,17 +393,36 @@ class BloomCheckAsyncClient {
     s.rpc_dropped = stats_.rpc_dropped.load(std::memory_order_relaxed);
     s.rpc_timed_out = stats_.rpc_timed_out.load(std::memory_order_relaxed);
     s.sst_files_skipped = stats_.sst_files_skipped.load(std::memory_order_relaxed);
+    s.drop_due_to_inflight_full = stats_.drop_due_to_inflight_full.load(std::memory_order_relaxed);
+    s.drop_due_to_cooldown = stats_.drop_due_to_cooldown.load(std::memory_order_relaxed);
+    s.drop_due_to_min_candidates = stats_.drop_due_to_min_candidates.load(std::memory_order_relaxed);
+    s.drop_due_to_other = stats_.drop_due_to_other.load(std::memory_order_relaxed);
+    s.skipped_due_to_overload_cooldown = stats_.skipped_due_to_overload_cooldown.load(std::memory_order_relaxed);
+    s.skipped_due_to_tokens = stats_.skipped_due_to_tokens.load(std::memory_order_relaxed);
     return s;
+  }
+  
+  // version_set.cc에서 rate limiting drop을 기록하기 위한 메서드
+  void RecordDropDueToCooldown() {
+    stats_.drop_due_to_cooldown.fetch_add(1, std::memory_order_relaxed);
+    stats_.rpc_dropped.fetch_add(1, std::memory_order_relaxed);
+  }
+  
+  void RecordDropDueToMinCandidates() {
+    stats_.drop_due_to_min_candidates.fetch_add(1, std::memory_order_relaxed);
+    stats_.rpc_dropped.fetch_add(1, std::memory_order_relaxed);
   }
   
  private:
   void ProcessCompletionQueue() {
-    static std::atomic<uint64_t> thread_id_counter{0};
-    uint64_t thread_id = thread_id_counter.fetch_add(1);
+    // 로그 주석처리로 thread_id 미사용
+    // static std::atomic<uint64_t> thread_id_counter{0};
+    // uint64_t thread_id = thread_id_counter.fetch_add(1);
     
-    if (logger_) {
-      ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu started", thread_id);
-    }
+    // 로그 주석처리
+    // if (logger_) {
+    //   ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu started", thread_id);
+    // }
     
     void* tag = nullptr;
     bool ok = false;
@@ -356,9 +443,10 @@ class BloomCheckAsyncClient {
       
       // SHUTDOWN: break
       if (next_status == grpc::CompletionQueue::NextStatus::SHUTDOWN) {
-        if (logger_) {
-          ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu: CQ shutdown", thread_id);
-        }
+        // 로그 주석처리
+        // if (logger_) {
+        //   ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu: CQ shutdown", thread_id);
+        // }
         break;
       }
       
@@ -386,9 +474,10 @@ class BloomCheckAsyncClient {
         }
         
         if (drain_status == grpc::CompletionQueue::NextStatus::SHUTDOWN) {
-          if (logger_) {
-            ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu: CQ shutdown during drain", thread_id);
-          }
+          // 로그 주석처리
+          // if (logger_) {
+          //   ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu: CQ shutdown during drain", thread_id);
+          // }
           return;  // while 루프 종료
         }
         
@@ -405,10 +494,11 @@ class BloomCheckAsyncClient {
       // 다른 스레드가 이미 정리했을 수 있으므로 여기서는 로그만
     }
     
-    if (logger_) {
-      ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu exiting, total_responses=%lu", 
-                    thread_id, total_responses);
-    }
+    // 로그 주석처리
+    // if (logger_) {
+    //   ROCKS_LOG_INFO(logger_, "[BloomCheck] ProcessCompletionQueue thread #%lu exiting, total_responses=%lu", 
+    //                 thread_id, total_responses);
+    // }
   }
   
   // 이벤트 처리 헬퍼 함수 (락 보호 내부 로직)
@@ -418,12 +508,13 @@ class BloomCheckAsyncClient {
     
     // tag가 nullptr인 경우 무시
     if (tag == nullptr) {
-        if (*total_responses <= 100 || (*total_responses) % 1000 == 0) {
-          if (logger_) {
-            ROCKS_LOG_WARN(logger_, "[BloomCheck] ProcessCompletionQueue received null tag! ok=%d, response #%lu", 
-                          ok ? 1 : 0, *total_responses);
-          }
-        }
+        // 로그 주석처리
+        // if (*total_responses <= 100 || (*total_responses) % 1000 == 0) {
+        //   if (logger_) {
+        //     ROCKS_LOG_WARN(logger_, "[BloomCheck] ProcessCompletionQueue received null tag! ok=%d, response #%lu", 
+        //                   ok ? 1 : 0, *total_responses);
+        //   }
+        // }
         return;
       }
       
@@ -442,11 +533,12 @@ class BloomCheckAsyncClient {
         } else {
           // 이미 제거된 call (drop된 경우 등) - 무시
           // CRITICAL: delete 하지 않음! unique_ptr이 이미 삭제했을 수 있음
-          if (*total_responses <= 100 || (*total_responses) % 1000 == 0) {
-            if (logger_) {
-              ROCKS_LOG_WARN(logger_, "[BloomCheck] Dropped response (not in inflight), tag=%p", call);
-            }
-          }
+          // 로그 주석처리
+          // if (*total_responses <= 100 || (*total_responses) % 1000 == 0) {
+          //   if (logger_) {
+          //     ROCKS_LOG_WARN(logger_, "[BloomCheck] Dropped response (not in inflight), tag=%p", call);
+          //   }
+          // }
           return;  // NO delete - 더블 free 방지
         }
       }
@@ -455,12 +547,13 @@ class BloomCheckAsyncClient {
       if (!call_owner || call_owner.get() != call) {
         // 메모리 안전성 체크 실패 - 로그만 남기고 무시
         // CRITICAL: delete 하지 않음! unique_ptr이 이미 삭제했을 수 있음
-        if (*total_responses <= 100 || (*total_responses) % 1000 == 0) {
-          if (logger_) {
-            ROCKS_LOG_WARN(logger_, "[BloomCheck] Invalid call_owner: call=%p, owner=%p", 
-                          call, call_owner ? call_owner.get() : nullptr);
-          }
-        }
+        // 로그 주석처리
+        // if (*total_responses <= 100 || (*total_responses) % 1000 == 0) {
+        //   if (logger_) {
+        //     ROCKS_LOG_WARN(logger_, "[BloomCheck] Invalid call_owner: call=%p, owner=%p", 
+        //                   call, call_owner ? call_owner.get() : nullptr);
+        //   }
+        // }
         return;  // NO delete - 더블 free 방지
       }
       
@@ -603,30 +696,30 @@ class BloomCheckAsyncClient {
             }
           }
           
-          // 디버깅: 캐시 업데이트 로깅
-          static std::atomic<uint64_t> cache_update_log_counter{0};
-          uint64_t cache_update_log_id = cache_update_log_counter.fetch_add(1, std::memory_order_relaxed);
-          if (cache_update_log_id < 100 || cache_update_log_id % 1000 == 0) {
-            size_t cache_size = file_hint_cache_.size();
-            size_t positive_count = 0;
-            size_t negative_count = 0;
-            for (const auto& pair : file_hint_cache_) {
-              if (pair.second.IsRecentPositive(std::chrono::milliseconds(100))) {
-                positive_count++;
-              }
-              if (pair.second.IsRecentNegative(std::chrono::milliseconds(100))) {
-                negative_count++;
-              }
-            }
-            if (logger_) {
-              ROCKS_LOG_INFO(logger_,
-                             "[BloomCheck] CQ cache_update: call_id=%lu "
-                             "candidate_files=%zu may_match_files=%zu "
-                             "cache_size=%zu positive_recent=%zu negative_recent=%zu",
-                             call->call_id, candidate_files.size(), may_match_files.size(),
-                             cache_size, positive_count, negative_count);
-            }
-          }
+          // 디버깅: 캐시 업데이트 로깅 - 주석처리
+          // static std::atomic<uint64_t> cache_update_log_counter{0};
+          // uint64_t cache_update_log_id = cache_update_log_counter.fetch_add(1, std::memory_order_relaxed);
+          // if (cache_update_log_id < 100 || cache_update_log_id % 1000 == 0) {
+          //   size_t cache_size = file_hint_cache_.size();
+          //   size_t positive_count = 0;
+          //   size_t negative_count = 0;
+          //   for (const auto& pair : file_hint_cache_) {
+          //     if (pair.second.IsRecentPositive(std::chrono::milliseconds(100))) {
+          //       positive_count++;
+          //     }
+          //     if (pair.second.IsRecentNegative(std::chrono::milliseconds(100))) {
+          //       negative_count++;
+          //     }
+          //   }
+          //   if (logger_) {
+          //     ROCKS_LOG_INFO(logger_,
+          //                    "[BloomCheck] CQ cache_update: call_id=%lu "
+          //                    "candidate_files=%zu may_match_files=%zu "
+          //                    "cache_size=%zu positive_recent=%zu negative_recent=%zu",
+          //                    call->call_id, candidate_files.size(), may_match_files.size(),
+          //                    cache_size, positive_count, negative_count);
+          //   }
+          // }
         }
         
         stats_.rpc_ok.fetch_add(1, std::memory_order_relaxed);
@@ -640,15 +733,68 @@ class BloomCheckAsyncClient {
       // call_owner가 소멸되면서 자동으로 delete됨
     }
   
+  // Token refill loop (10-50ms 주기로 토큰 보충)
+  void TokenRefillLoop() {
+    const uint64_t refill_interval_ms = 20;  // 20ms마다 refill
+    
+    while (!shutdown_.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(refill_interval_ms));
+      
+      if (shutdown_.load(std::memory_order_relaxed)) {
+        break;
+      }
+      
+      auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      last_refill_time_.load(std::memory_order_acquire);  // unused but kept for consistency
+      uint64_t last_completed = last_completed_count_.load(std::memory_order_acquire);
+      
+      uint64_t current_completed = stats_.rpc_completed.load(std::memory_order_relaxed);
+      uint64_t completed_delta = (current_completed > last_completed) ? 
+                                 (current_completed - last_completed) : 0;
+      
+      // completed_delta * 1.1로 토큰 보충 (10% 여유)
+      uint64_t tokens_to_add = static_cast<uint64_t>(completed_delta * 1.1);
+      
+      if (tokens_to_add > 0) {
+        uint64_t current_tokens = tokens_.load(std::memory_order_acquire);
+        uint64_t new_tokens = std::min(current_tokens + tokens_to_add, 
+                                       static_cast<uint64_t>(max_inflight_));
+        
+        // CAS로 토큰 업데이트
+        uint64_t expected = current_tokens;
+        while (!tokens_.compare_exchange_weak(expected, new_tokens,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+          new_tokens = std::min(expected + tokens_to_add, 
+                               static_cast<uint64_t>(max_inflight_));
+        }
+      }
+      
+      last_refill_time_.store(now_ns, std::memory_order_release);
+      last_completed_count_.store(current_completed, std::memory_order_release);
+    }
+  }
+  
   std::shared_ptr<grpc::Channel> channel_;
   std::unique_ptr<bloomcheck::BloomCheck::Stub> stub_;
   grpc::CompletionQueue cq_;
   std::vector<std::thread> cq_threads_;  // 여러 CQ polling threads
+  std::thread token_refill_thread_;  // Token refill thread
   std::atomic<bool> shutdown_;
   
   size_t max_inflight_;
   std::chrono::milliseconds hint_ttl_;
   Logger* logger_;
+  
+  // Overload cooldown (declaration order must match initialization order)
+  uint64_t overload_cooldown_us_;  // cooldown duration in microseconds
+  std::atomic<uint64_t> next_fire_allowed_ts_;  // nanoseconds since epoch
+  
+  // Token bucket
+  std::atomic<uint64_t> tokens_;  // current tokens
+  std::atomic<uint64_t> last_refill_time_;  // nanoseconds since epoch
+  std::atomic<uint64_t> last_completed_count_;  // last completed count at refill time
   
   // Inflight 요청 관리 (AsyncCall* -> unique_ptr<AsyncCall>)
   std::mutex inflight_mutex_;
@@ -670,6 +816,14 @@ class BloomCheckAsyncClient {
     std::atomic<uint64_t> rpc_dropped{0};
     std::atomic<uint64_t> rpc_timed_out{0};
     std::atomic<uint64_t> sst_files_skipped{0};
+    // Drop reason breakdown
+    std::atomic<uint64_t> drop_due_to_inflight_full{0};
+    std::atomic<uint64_t> drop_due_to_cooldown{0};
+    std::atomic<uint64_t> drop_due_to_min_candidates{0};
+    std::atomic<uint64_t> drop_due_to_other{0};
+    // Skip counters (not counted as drops)
+    std::atomic<uint64_t> skipped_due_to_overload_cooldown{0};
+    std::atomic<uint64_t> skipped_due_to_tokens{0};
   };
   
   mutable StatsInternal stats_;

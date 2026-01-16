@@ -2849,43 +2849,58 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       // (너무 제한적이면 힌트가 쌓이지 않음)
       should_fire = sample_match && min_candidates_ok && cooldown_ok;
       
+      // 로그 주석처리
       // 디버깅: 처음 100개는 조건별로 로그 출력
-      if (get_id < 100) {
-        ROCKS_LOG_INFO(info_log_,
-                      "[BloomCheck] Version::Get #%lu: should_fire=%d, "
-                      "candidate_files=%zu, sample_match=%d (sample_n=%zu), "
-                      "min_candidates_ok=%d (min=%zu), cooldown_ok=%d",
-                      get_id, should_fire ? 1 : 0,
-                      candidate_file_numbers.size(),
-                      sample_match ? 1 : 0, sample_n,
-                      min_candidates_ok ? 1 : 0, min_candidates,
-                      cooldown_ok ? 1 : 0);
-      }
+      // if (get_id < 100) {
+      //   ROCKS_LOG_INFO(info_log_,
+      //                 "[BloomCheck] Version::Get #%lu: should_fire=%d, "
+      //                 "candidate_files=%zu, sample_match=%d (sample_n=%zu), "
+      //                 "min_candidates_ok=%d (min=%zu), cooldown_ok=%d",
+      //                 get_id, should_fire ? 1 : 0,
+      //                 candidate_file_numbers.size(),
+      //                 sample_match ? 1 : 0, sample_n,
+      //                 min_candidates_ok ? 1 : 0, min_candidates,
+      //                 cooldown_ok ? 1 : 0);
+      // }
       
       if (should_fire) {
-        bool fired = async_client->FireAsyncCheck(user_key_str, candidate_file_numbers);
-        if (!fired) {
-          // FireAsyncCheck 실패 (drop) - 통계는 클라이언트에서 관리
-          if (get_id < 10 || get_id % 10000 == 0) {
-            ROCKS_LOG_INFO(info_log_, 
-                          "[BloomCheck] Version::Get #%lu: FireAsyncCheck returned false (dropped), "
-                          "candidate_files=%zu, sample_match=%d, min_candidates_ok=%d, cooldown_ok=%d",
-                          get_id, candidate_file_numbers.size(), 
-                          sample_match ? 1 : 0, min_candidates_ok ? 1 : 0, cooldown_ok ? 1 : 0);
-          }
-        } else if (get_id < 10 || get_id % 10000 == 0) {
-          std::string user_key_hex = BloomCheckAsyncClient::KeyToHex(user_key_str);
-          ROCKS_LOG_INFO(info_log_, 
-                        "[BloomCheck] Version::Get #%lu: FireAsyncCheck fired, "
-                        "candidate_files=%zu, user_key_hex=%s",
-                        get_id, candidate_file_numbers.size(), user_key_hex.c_str());
+        // fired 변수 미사용 - 로그 주석처리로 인해
+        // bool fired = async_client->FireAsyncCheck(user_key_str, candidate_file_numbers);
+        async_client->FireAsyncCheck(user_key_str, candidate_file_numbers);
+        // 로그 주석처리
+        // if (!fired) {
+        //   // FireAsyncCheck 실패 (drop) - 통계는 클라이언트에서 관리
+        //   if (get_id < 10 || get_id % 10000 == 0) {
+        //     ROCKS_LOG_INFO(info_log_, 
+        //                   "[BloomCheck] Version::Get #%lu: FireAsyncCheck returned false (dropped), "
+        //                   "candidate_files=%zu, sample_match=%d, min_candidates_ok=%d, cooldown_ok=%d",
+        //                   get_id, candidate_file_numbers.size(), 
+        //                   sample_match ? 1 : 0, min_candidates_ok ? 1 : 0, cooldown_ok ? 1 : 0);
+        //   }
+        // } else if (get_id < 10 || get_id % 10000 == 0) {
+        //   std::string user_key_hex = BloomCheckAsyncClient::KeyToHex(user_key_str);
+        //   ROCKS_LOG_INFO(info_log_, 
+        //                 "[BloomCheck] Version::Get #%lu: FireAsyncCheck fired, "
+        //                 "candidate_files=%zu, user_key_hex=%s",
+        //                 get_id, candidate_file_numbers.size(), user_key_hex.c_str());
+        // }
+      } else {
+        // rate limiting으로 drop된 경우 - 원인별 카운터 증가
+        // 주의: 샘플링은 drop으로 간주하지 않음 (의도된 정책)
+        if (!min_candidates_ok) {
+          async_client->RecordDropDueToMinCandidates();
         }
-      } else if (get_id < 10 || get_id % 10000 == 0) {
-        ROCKS_LOG_INFO(info_log_, 
-                      "[BloomCheck] Version::Get #%lu: FireAsyncCheck skipped (rate limit), "
-                      "candidate_files=%zu, sample_match=%d, min_candidates_ok=%d, cooldown_ok=%d",
-                      get_id, candidate_file_numbers.size(),
-                      sample_match ? 1 : 0, min_candidates_ok ? 1 : 0, cooldown_ok ? 1 : 0);
+        if (!cooldown_ok) {
+          async_client->RecordDropDueToCooldown();
+        }
+        // 로그 주석처리
+        // if (get_id < 10 || get_id % 10000 == 0) {
+        //   ROCKS_LOG_INFO(info_log_, 
+        //                 "[BloomCheck] Version::Get #%lu: FireAsyncCheck skipped (rate limit), "
+        //                 "candidate_files=%zu, sample_match=%d, min_candidates_ok=%d, cooldown_ok=%d",
+        //                 get_id, candidate_file_numbers.size(),
+        //                 sample_match ? 1 : 0, min_candidates_ok ? 1 : 0, cooldown_ok ? 1 : 0);
+        // }
       }
     }
   }
@@ -3057,12 +3072,17 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       ROCKS_LOG_INFO(info_log_,
                      "[BloomCheck Stats] inflight_rpc=%lu, cache_hit_rate=%.2f%%, "
                      "rpc_started=%lu, rpc_completed=%lu, rpc_ok=%lu, rpc_failed=%lu, "
-                     "rpc_cancelled=%lu, rpc_dropped=%lu, rpc_timed_out=%lu, "
-                     "sst_files_skipped=%lu",
+                     "rpc_cancelled=%lu, rpc_dropped=%lu (inflight_full=%lu, cooldown=%lu, min_candidates=%lu, other=%lu), "
+                     "skipped=%lu (overload_cooldown=%lu, tokens=%lu), "
+                     "rpc_timed_out=%lu, sst_files_skipped=%lu",
                      stats.inflight_rpc_count, cache_hit_rate,
                      stats.rpc_started, stats.rpc_completed, stats.rpc_ok, stats.rpc_failed,
-                     stats.rpc_cancelled, stats.rpc_dropped, stats.rpc_timed_out,
-                     stats.sst_files_skipped);
+                     stats.rpc_cancelled, stats.rpc_dropped,
+                     stats.drop_due_to_inflight_full, stats.drop_due_to_cooldown,
+                     stats.drop_due_to_min_candidates, stats.drop_due_to_other,
+                     stats.skipped_due_to_overload_cooldown + stats.skipped_due_to_tokens,
+                     stats.skipped_due_to_overload_cooldown, stats.skipped_due_to_tokens,
+                     stats.rpc_timed_out, stats.sst_files_skipped);
     }
   }
 
