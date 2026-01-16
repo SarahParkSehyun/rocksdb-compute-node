@@ -2937,6 +2937,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     }
 
     // BloomCheck fast-path: complete == true일 때만 may_match_files로 restrict
+    // incomplete / 결과 없음 → baseline 경로 (기존 RocksDB 동작)
     if (bloomcheck_result_ready && bloomcheck_result && bloomcheck_result->complete) {
       // 서버가 모든 candidate를 검사했고, 결과가 완전함
       // may_match_files에 없는 파일은 skip (fast-path)
@@ -2947,21 +2948,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         continue;
       }
       // may_match == true → 계속 처리
-    } else {
-      // BloomCheck 힌트 필터링 (fallback): file_number별 negative 힌트가 최근이면 스킵
-      // 힌트가 없으면 baseline 동작 (모든 파일 검사)
-      if (bloomcheck_enabled && read_options.bloomcheck_client != nullptr) {
-        BloomCheckAsyncClient* async_client =
-            static_cast<BloomCheckAsyncClient*>(read_options.bloomcheck_client);
-        
-        if (async_client->ShouldSkipFile(file_number)) {
-          // negative 힌트가 최근(5ms 이내) → 스킵
-          bloom_hint_skipped_files++;
-          f = fp.GetNextFile();
-          continue;
-        }
-      }
     }
+    // else: incomplete 또는 결과 없음 → baseline 경로 (기존 RocksDB 동작 유지)
 
     if (get_context.sample()) {
       sample_file_read_inc(f->file_metadata);
@@ -3072,11 +3060,6 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     BloomCheckAsyncClient* async_client =
         static_cast<BloomCheckAsyncClient*>(read_options.bloomcheck_client);
     
-    // 스킵된 파일 수를 통계에 반영
-    if (bloom_hint_skipped_files > 0) {
-      async_client->RecordSkippedFiles(bloom_hint_skipped_files);
-    }
-    
     // BloomCheck per-call state 정리 (이번 Get 요청 완료)
     if (bloomcheck_call_id != 0) {
       async_client->ReleaseCallState(bloomcheck_call_id);
@@ -3089,19 +3072,13 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     if (counter % 1000 == 0 && info_log_) {
       auto stats = async_client->GetStats();
       
-      double cache_hit_rate = 0.0;
-      if (stats.cache_hits + stats.cache_misses > 0) {
-        cache_hit_rate = 100.0 * stats.cache_hits / 
-                         (stats.cache_hits + stats.cache_misses);
-      }
-      
       ROCKS_LOG_INFO(info_log_,
-                     "[BloomCheck Stats] inflight_rpc=%lu, cache_hit_rate=%.2f%%, "
+                     "[BloomCheck Stats] inflight_rpc=%lu, "
                      "rpc_started=%lu, rpc_completed=%lu, rpc_ok=%lu, rpc_failed=%lu, "
                      "rpc_cancelled=%lu, rpc_dropped=%lu (inflight_full=%lu, cooldown=%lu, min_candidates=%lu, other=%lu), "
                      "skipped=%lu (overload_cooldown=%lu, tokens=%lu), "
                      "rpc_timed_out=%lu, sst_files_skipped=%lu",
-                     stats.inflight_rpc_count, cache_hit_rate,
+                     stats.inflight_rpc_count,
                      stats.rpc_started, stats.rpc_completed, stats.rpc_ok, stats.rpc_failed,
                      stats.rpc_cancelled, stats.rpc_dropped,
                      stats.drop_due_to_inflight_full, stats.drop_due_to_cooldown,

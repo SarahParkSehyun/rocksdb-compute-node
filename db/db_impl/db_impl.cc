@@ -287,26 +287,20 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   if (bloomcheck_server && bloomcheck_server[0] != '\0') {
     bloomcheck_server_address_ = std::string(bloomcheck_server);
     try {
-      // 비동기 클라이언트 생성 (max_inflight=2048, hint_ttl=100ms)
+      // 비동기 클라이언트 생성 (max_inflight=2048)
       size_t max_inflight = 2048;
       const char* max_inflight_env = std::getenv("BLOOMCHECK_MAX_INFLIGHT");
       if (max_inflight_env) {
         max_inflight = std::stoul(max_inflight_env);
       }
       
-      std::chrono::milliseconds hint_ttl(100);  // 기본값 100ms로 증가
-      const char* hint_ttl_env = std::getenv("BLOOMCHECK_HINT_TTL_MS");
-      if (hint_ttl_env) {
-        hint_ttl = std::chrono::milliseconds(std::stoul(hint_ttl_env));
-      }
-      
       bloomcheck_async_client_ = std::make_unique<BloomCheckAsyncClient>(
-          bloomcheck_server_address_, max_inflight, hint_ttl,
+          bloomcheck_server_address_, max_inflight,
           immutable_db_options_.info_log.get());
       bloomcheck_enabled_.store(true, std::memory_order_relaxed);
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                     "BloomCheck async service enabled: %s (max_inflight=%zu, hint_ttl=%ldms)\n",
-                     bloomcheck_server_address_.c_str(), max_inflight, hint_ttl.count());
+                     "BloomCheck async service enabled: %s (max_inflight=%zu)\n",
+                     bloomcheck_server_address_.c_str(), max_inflight);
     } catch (...) {
       // gRPC 초기화 실패 시 무시
       ROCKS_LOG_WARN(immutable_db_options_.info_log,
