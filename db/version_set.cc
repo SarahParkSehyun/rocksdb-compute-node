@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <list>
@@ -18,6 +19,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -2755,6 +2757,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
 
   // BloomCheck per-call state (이번 Get 요청에만 적용)
   uint64_t bloomcheck_call_id = 0;  // 0 = RPC 미발사 또는 실패
+  size_t candidate_file_count = 0;  // dry-run으로 수집한 후보 파일 수 (로그용)
 
   // ===== BloomCheck 비동기 힌트 시스템 =====
   // BloomCheck는 비동기적으로 발사되며, 결과는 file_number별 캐시에 저장됨
@@ -2777,10 +2780,10 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
 
     // 2. 조건부 비동기 RPC 발사 (샘플링/레이트리밋 적용)
     // 환경변수 읽기 (한 번만 읽기 위해 static 사용)
-    // 기본값을 더 관대하게 설정: 샘플링 4 (25%), min_candidates 1, cooldown 5ms
+    // 기본값을 더 관대하게 설정: 샘플링 1 (100%), min_candidates 1, cooldown 5ms
     static size_t sample_n = []() {
       const char* env = std::getenv("BLOOMCHECK_SAMPLE_N");
-      return env ? std::stoul(env) : 4;  // 기본값: 4번에 1번 (25%)
+      return env ? std::stoul(env) : 1;  // 기본값: 1번에 1번 (100%)
     }();
     
     static size_t min_candidates = []() {
@@ -2811,6 +2814,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       candidate_file_numbers.insert(file_number);
       f_probe = fp_probe.GetNextFile();
     }
+    
+    candidate_file_count = candidate_file_numbers.size();  // 로그용 저장
 
     // 조건부 발사 결정
     bool should_fire = false;
@@ -2870,6 +2875,10 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       if (should_fire) {
         bloomcheck_call_id = async_client->FireAsyncCheck(user_key_str, candidate_file_numbers);
         // call_id == 0이면 실패/스킵 (baseline 경로로 진행)
+        // get_fire_ok: call_id != 0 인 Get 수
+        if (bloomcheck_call_id != 0 && db_statistics_ != nullptr) {
+          RecordTick(db_statistics_, BLOOMCHECK_GET_FIRE_OK);
+        }
       } else {
         // rate limiting으로 drop된 경우 - 원인별 카운터 증가
         // 주의: 샘플링은 drop으로 간주하지 않음 (의도된 정책)
@@ -2910,6 +2919,15 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   
   // BloomCheck 결과 Poll (최대 1회만 체크 - 이후는 캐시된 결과 사용)
   bool bloomcheck_polled = false;
+  
+  // Counter 측정을 위한 변수
+  bool fastpath_used_this_get = false;
+  bool local_filter_skipped_this_get = false;  // 로컬 bloom filter 스킵 여부
+
+  // get_total: Version::Get 호출 횟수
+  if (db_statistics_ != nullptr) {
+    RecordTick(db_statistics_, BLOOMCHECK_GET_TOTAL);
+  }
 
   while (f != nullptr) {
     if (*max_covering_tombstone_seq > 0) {
@@ -2921,18 +2939,89 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     uint64_t file_number = f->file_metadata->fd.GetNumber();
     bloom_hint_total_files++;
 
-    // BloomCheck per-call 결과 Poll (루프 중 최초 1회만)
+    // BloomCheck per-call 결과 Poll with micro-wait (루프 중 최초 1회만)
     if (bloomcheck_enabled && read_options.bloomcheck_client != nullptr && 
         bloomcheck_call_id != 0 && !bloomcheck_polled) {
       BloomCheckAsyncClient* async_client =
           static_cast<BloomCheckAsyncClient*>(read_options.bloomcheck_client);
       
-      PerCallState* polled_state = nullptr;
-      if (async_client->TryPollResult(bloomcheck_call_id, &polled_state)) {
-        // 완전한 결과 도착 (ready && complete)
-        bloomcheck_result = polled_state;
-        bloomcheck_result_ready = true;
+      // Time budget 기반 micro-wait (최대 50~200µs)
+      // 환경 변수에서 읽기 (기본값: 100µs)
+      static uint64_t micro_wait_budget_us = []() {
+        const char* env = std::getenv("BLOOMCHECK_MICRO_WAIT_US");
+        return env ? std::stoull(env) : 100;  // 기본값: 100µs
+      }();
+      
+      auto wait_start = std::chrono::steady_clock::now();
+      auto wait_budget = std::chrono::microseconds(micro_wait_budget_us);
+      bool poll_success = false;
+      
+      // 최대 wait_budget 동안 결과를 기다려보기
+      while (std::chrono::steady_clock::now() - wait_start < wait_budget) {
+        PerCallState* polled_state = nullptr;
+        bool poll_ready = false;
+        bool poll_complete = false;
+        bool poll_state_exists = async_client->TryPollResultWithStatus(
+            bloomcheck_call_id, &polled_state, &poll_ready, &poll_complete);
+        
+        if (poll_state_exists && poll_ready && poll_complete) {
+          // 완전한 결과 도착 (ready && complete) - fast-path 사용 가능
+          bloomcheck_result = polled_state;
+          bloomcheck_result_ready = true;
+          poll_success = true;
+          // get_poll_ready_complete: poll에서 ready&&complete 얻은 Get 수
+          if (db_statistics_ != nullptr) {
+            RecordTick(db_statistics_, BLOOMCHECK_GET_POLL_READY_COMPLETE);
+          }
+          break;  // 결과를 얻었으므로 루프 종료
+        }
+        
+        // 결과가 아직 없으면 짧은 대기 후 재시도
+        // yield와 nanosleep을 섞어서 사용
+        std::this_thread::yield();
+        // nanosleep(0) 대신 짧은 spin
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now - wait_start).count();
+        if (elapsed < wait_budget.count() * 1000) {  // 아직 시간이 남았으면
+          // 짧은 spin (약 100ns)
+          volatile int spin = 0;
+          for (int i = 0; i < 10; i++) {
+            spin += i;
+          }
+          (void)spin;  // unused warning 방지
+        }
       }
+      
+      // 결과를 얻지 못한 경우
+      if (!poll_success) {
+        // 마지막으로 한 번 더 확인
+        PerCallState* polled_state = nullptr;
+        bool poll_ready = false;
+        bool poll_complete = false;
+        bool poll_state_exists = async_client->TryPollResultWithStatus(
+            bloomcheck_call_id, &polled_state, &poll_ready, &poll_complete);
+        
+        if (poll_state_exists) {
+          if (poll_ready && !poll_complete) {
+            // ready but !complete (부분 응답)
+            if (db_statistics_ != nullptr) {
+              RecordTick(db_statistics_, BLOOMCHECK_POLL_READY_INCOMPLETE);
+            }
+          } else {
+            // not ready (아직 미도착)
+            if (db_statistics_ != nullptr) {
+              RecordTick(db_statistics_, BLOOMCHECK_POLL_NOT_READY);
+            }
+          }
+        } else {
+          // 상태 없음 (이미 정리되었거나 존재하지 않음) - not ready로 카운트
+          if (db_statistics_ != nullptr) {
+            RecordTick(db_statistics_, BLOOMCHECK_POLL_NOT_READY);
+          }
+        }
+      }
+      
       bloomcheck_polled = true;  // 최초 1회만 Poll
     }
 
@@ -2944,12 +3033,42 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       if (!bloomcheck_result->IsMayMatch(file_number)) {
         // may_match == false → skip
         bloom_hint_skipped_files++;
+        fastpath_used_this_get = true;
+        // fastpath_files_skipped: fast-path로 스킵한 파일 개수
+        if (db_statistics_ != nullptr) {
+          RecordTick(db_statistics_, BLOOMCHECK_FASTPATH_FILES_SKIPPED);
+        }
         f = fp.GetNextFile();
         continue;
       }
       // may_match == true → 계속 처리
     }
     // else: incomplete 또는 결과 없음 → baseline 경로 (기존 RocksDB 동작 유지)
+
+    // 로컬 Bloom filter 스킵 결정
+    // 기존 RocksDB 로직: 레벨/위치에 따라 filter 스킵 여부 결정
+    bool skip_filters_local = IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
+                                              fp.IsHitFileLastInLevel());
+    
+    // Remote bloomcheck 결과가 complete인 경우 로컬 bloom filter 스킵
+    // 이 지점까지 온 파일은 이미 IsMayMatch(file_number) == true임
+    // (may_match==false인 파일은 위에서 continue로 스킵됨)
+    bool skip_filters_remote = false;
+    if (bloomcheck_result_ready && bloomcheck_result && bloomcheck_result->complete) {
+      // remote 결과가 complete이고, 이 파일이 may_match=true로 확인됨
+      // → 스토리지 노드에서 이미 bloom filter를 체크했으므로 로컬 체크 스킵 가능
+      // 단, kBlockCacheTier 모드는 no-IO semantics를 유지해야 하므로 스킵하지 않음
+      if (read_options.read_tier != kBlockCacheTier) {
+        skip_filters_remote = true;
+        local_filter_skipped_this_get = true;
+        // 통계: 로컬 bloom filter가 스킵된 파일 수
+        if (db_statistics_ != nullptr) {
+          RecordTick(db_statistics_, BLOOMCHECK_LOCAL_FILTER_SKIPPED_FILES);
+        }
+      }
+    }
+    
+    bool skip_filters_final = skip_filters_local || skip_filters_remote;
 
     if (get_context.sample()) {
       sample_file_read_inc(f->file_metadata);
@@ -2963,8 +3082,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         read_options, *internal_comparator(), *f->file_metadata, ikey,
         &get_context, mutable_cf_options_,
         cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
-        IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
-                        fp.IsHitFileLastInLevel()),
+        skip_filters_final,  // remote complete인 경우 로컬 bloom filter 스킵
         fp.GetHitFileLevel(), max_file_size_for_l0_meta_pin_);
     // TODO: examine the behavior for corrupted key
     if (timer_enabled) {
@@ -3053,6 +3171,23 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         return;
     }
     f = fp.GetNextFile();
+  }
+
+  // get_fastpath_used: ready&&complete였고, 실제로 restrict 로직이 발동한 Get 수
+  if (fastpath_used_this_get && db_statistics_ != nullptr) {
+    RecordTick(db_statistics_, BLOOMCHECK_GET_FASTPATH_USED);
+  }
+  
+  // local_filter_skipped_gets: remote complete 상태에서 로컬 bloom 스킵이 사용된 Get 수
+  if (local_filter_skipped_this_get && db_statistics_ != nullptr) {
+    RecordTick(db_statistics_, BLOOMCHECK_LOCAL_FILTER_SKIPPED_GETS);
+  }
+  
+  // BloomCheck 로그: dry-run 후보 파일 수와 fast-path로 스킵한 파일 수
+  if (bloomcheck_enabled && info_log_ != nullptr) {
+    ROCKS_LOG_INFO(info_log_,
+                   "[BloomCheck] Version::Get: candidate_file_count=%zu, skipped_this_get=%lu",
+                   candidate_file_count, bloom_hint_skipped_files);
   }
 
   // BloomCheck 힌트 통계 기록 및 출력

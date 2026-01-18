@@ -362,6 +362,33 @@ class BloomCheckAsyncClient {
     return false;  // 아직 없음 또는 incomplete
   }
   
+  // Get 요청에서 BloomCheck 결과를 Poll (상태 정보 포함)
+  // out_ready: ready 상태
+  // out_complete: complete 상태
+  // 반환값: true = 상태 존재, false = 상태 없음
+  bool TryPollResultWithStatus(uint64_t call_id, PerCallState** out_state,
+                                bool* out_ready, bool* out_complete) {
+    if (call_id == 0) {
+      *out_ready = false;
+      *out_complete = false;
+      return false;  // 유효하지 않은 call_id
+    }
+    
+    std::lock_guard<std::mutex> lock(per_call_state_mutex_);
+    auto it = per_call_states_.find(call_id);
+    if (it == per_call_states_.end()) {
+      *out_ready = false;
+      *out_complete = false;
+      return false;  // 상태 없음 (이미 정리되었거나 존재하지 않음)
+    }
+    
+    PerCallState& state = it->second;
+    *out_ready = state.ready;
+    *out_complete = state.complete;
+    *out_state = &state;
+    return true;  // 상태 존재
+  }
+  
   // Get 요청 완료 시 per-call state 정리 (call_id로)
   void ReleaseCallState(uint64_t call_id) {
     if (call_id == 0) {

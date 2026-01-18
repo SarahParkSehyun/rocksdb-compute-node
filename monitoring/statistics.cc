@@ -280,6 +280,15 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {NUMBER_WBWI_INGEST, "rocksdb.number.wbwi.ingest"},
     {SST_USER_DEFINED_INDEX_LOAD_FAIL_COUNT,
      "rocksdb.sst.user.defined.index.load.fail.count"},
+    {BLOOMCHECK_GET_TOTAL, "rocksdb.bloomcheck.get.total"},
+    {BLOOMCHECK_GET_FIRE_OK, "rocksdb.bloomcheck.get.fire.ok"},
+    {BLOOMCHECK_GET_POLL_READY_COMPLETE, "rocksdb.bloomcheck.get.poll.ready.complete"},
+    {BLOOMCHECK_GET_FASTPATH_USED, "rocksdb.bloomcheck.get.fastpath.used"},
+    {BLOOMCHECK_FASTPATH_FILES_SKIPPED, "rocksdb.bloomcheck.fastpath.files.skipped"},
+    {BLOOMCHECK_POLL_READY_INCOMPLETE, "rocksdb.bloomcheck.poll.ready.incomplete"},
+    {BLOOMCHECK_POLL_NOT_READY, "rocksdb.bloomcheck.poll.not.ready"},
+    {BLOOMCHECK_LOCAL_FILTER_SKIPPED_FILES, "rocksdb.bloomcheck.local.filter.skipped.files"},
+    {BLOOMCHECK_LOCAL_FILTER_SKIPPED_GETS, "rocksdb.bloomcheck.local.filter.skipped.gets"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

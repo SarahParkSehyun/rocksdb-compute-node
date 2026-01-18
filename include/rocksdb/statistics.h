@@ -552,6 +552,17 @@ enum Tickers : uint32_t {
   // Failure to load the UDI during SST table open
   SST_USER_DEFINED_INDEX_LOAD_FAIL_COUNT,
 
+  // BloomCheck async RPC statistics
+  BLOOMCHECK_GET_TOTAL,              // Version::Get 호출 횟수
+  BLOOMCHECK_GET_FIRE_OK,            // call_id != 0 인 Get 수
+  BLOOMCHECK_GET_POLL_READY_COMPLETE, // poll에서 ready&&complete 얻은 Get 수
+  BLOOMCHECK_GET_FASTPATH_USED,      // ready&&complete였고, 실제로 restrict 로직이 발동한 Get 수
+  BLOOMCHECK_FASTPATH_FILES_SKIPPED, // fast-path로 스킵한 파일 개수
+  BLOOMCHECK_POLL_READY_INCOMPLETE,  // poll 결과가 ready but !complete (부분 응답)
+  BLOOMCHECK_POLL_NOT_READY,         // poll 결과가 not ready (아직 미도착)
+  BLOOMCHECK_LOCAL_FILTER_SKIPPED_FILES, // remote complete 상태에서 로컬 bloom이 스킵된 SST 파일 수
+  BLOOMCHECK_LOCAL_FILTER_SKIPPED_GETS,  // remote complete 상태에서 로컬 bloom 스킵 fast-path가 사용된 Get 요청 수
+
   TICKER_ENUM_MAX
 };
 

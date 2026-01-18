@@ -36,6 +36,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 
@@ -2492,6 +2493,22 @@ class Stats {
             } else if (db) {
               if (db->GetProperty("rocksdb.stats", &stats)) {
                 fprintf(stderr, "%s", stats.c_str());
+              }
+              // BloomCheck 통계 출력 (--statistics 플래그가 설정된 경우)
+              if (FLAGS_statistics && dbstats) {
+                std::string all_stats = dbstats->ToString();
+                std::istringstream iss(all_stats);
+                std::string line;
+                bool found_bloomcheck = false;
+                while (std::getline(iss, line)) {
+                  if (line.find("bloomcheck") != std::string::npos) {
+                    if (!found_bloomcheck) {
+                      fprintf(stderr, "BLOOMCHECK STATISTICS:\n");
+                      found_bloomcheck = true;
+                    }
+                    fprintf(stderr, "%s\n", line.c_str());
+                  }
+                }
               }
               if (db->GetProperty("rocksdb.num-running-compactions", &stats)) {
                 fprintf(stderr, "num-running-compactions: %s\n", stats.c_str());
