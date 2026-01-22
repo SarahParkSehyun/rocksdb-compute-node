@@ -2821,7 +2821,24 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
 
       // check_ok는 RPC 통신 성공+서버 응답 수신 나타냄
       bloomcheck::BatchResponse response;
+#ifdef BLOOMCHECK_LOG_LATENCY
+      uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+#endif
       bool check_ok = client->CheckBatch(request, &response);
+#ifdef BLOOMCHECK_LOG_LATENCY
+      uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+      int resps = response.resps_size();
+      int may = 0;
+      if (check_ok && resps > 0) {
+        may = response.resps(0).may_match_sst_file_numbers_size();
+      }
+      if (info_log_) {
+        ROCKS_LOG_INFO(info_log_,
+                       "[BloomCheck] rpc_us=%llu ok=%d cand=%zu resps=%d may=%d key_len=%zu",
+                       (unsigned long long)rpc_us, check_ok ? 1 : 0,
+                       candidate_file_numbers.size(), resps, may, user_key_str.size());
+      }
+#endif
 
       // 디버깅: 응답 수신 후 로그 (요청 키 포함)
       if (info_log_) {
