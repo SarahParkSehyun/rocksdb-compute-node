@@ -2758,6 +2758,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   std::unique_ptr<std::unordered_set<uint64_t>> bloomcheck_may_match_files;
   // 아래 조건을 만족하면 bloomcheck 프리체크가 켜졌다는 플래그
   bool bloomcheck_enabled = false;
+  // RPC가 성공하고 응답이 정상적으로 수신되었는지 명확히 표현
+  bool bloomcheck_ok = false;
 
   // cache-only 모드에서는 bloomcheck 건너뛰기 (네트워크 I/O 방지)
   if (read_options.bloomcheck_client != nullptr &&
@@ -2850,6 +2852,9 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           bloomcheck_may_match_files->insert(file_number);
         }
 
+        // RPC 성공 및 응답 수신 완료
+        bloomcheck_ok = true;
+
         // 디버깅: 응답 정보 출력
         if (info_log_) {
           ROCKS_LOG_INFO(info_log_,
@@ -2871,6 +2876,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           }
         }
       } else {
+        // RPC 실패 또는 빈 응답: bloomcheck_ok = false 유지
+        // bloomcheck_may_match_files는 nullptr로 유지되어 fallback 동작
         // 디버깅: RPC 실패 또는 빈 응답
         if (info_log_) {
           ROCKS_LOG_WARN(info_log_,
@@ -2914,6 +2921,24 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       sample_file_read_inc(f->file_metadata);
     }
 
+    // skip_filters 계산: 로컬 RocksDB 규칙 + remote bloomcheck 결과
+    // 1. 로컬 RocksDB가 레벨/위치 기반으로 skip하는 경우
+    bool skip_filters_local = IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
+                                               fp.IsHitFileLastInLevel());
+    
+    // 2. remote bloomcheck가 성공했고 이 SST가 may_match=true인 경우
+    //    (이 지점까지 왔다는 건 find(file_number) != end() 이므로 may_match=true)
+    bool skip_filters_remote = false;
+    if (bloomcheck_enabled && bloomcheck_ok && bloomcheck_may_match_files != nullptr) {
+      // kBlockCacheTier 모드는 no-IO semantics가 중요하므로 remote 스킵 적용 금지
+      if (read_options.read_tier != kBlockCacheTier) {
+        skip_filters_remote = true;
+      }
+    }
+    
+    // 최종 skip_filters: 로컬 또는 remote 중 하나라도 true면 skip
+    bool skip_filters_final = skip_filters_local || skip_filters_remote;
+
     bool timer_enabled =
         GetPerfLevel() >= PerfLevel::kEnableTimeExceptForMutex &&
         get_perf_context()->per_level_perf_context_enabled;
@@ -2922,8 +2947,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         read_options, *internal_comparator(), *f->file_metadata, ikey,
         &get_context, mutable_cf_options_,
         cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
-        IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
-                        fp.IsHitFileLastInLevel()),
+        skip_filters_final,
         fp.GetHitFileLevel(), max_file_size_for_l0_meta_pin_);
     // TODO: examine the behavior for corrupted key
     if (timer_enabled) {
