@@ -2906,7 +2906,6 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                 storage_info_.num_non_empty_levels_,
                 &storage_info_.file_indexer_, user_comparator(),
                 internal_comparator());
-
   FdWithKeyRange* f = fp.GetNextFile();
   
   // BloomCheck 힌트 통계
