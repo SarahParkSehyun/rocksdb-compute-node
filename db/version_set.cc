@@ -2769,14 +2769,22 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     return env != nullptr && std::string(env) == "1";
   }();
 
-  // NOOP 로깅 설정: 환경변수로 활성화
+  // NOOP 로깅 설정: 환경변수로 활성화 (deprecated, use BLOOMCHECK_RPC_LOG)
   static bool noop_log_enabled = []() {
     const char* env = std::getenv("BLOOMCHECK_NOOP_LOG");
+    bool enabled = env != nullptr && std::string(env) == "1";
+    return enabled;
+  }();
+
+  // RPC 로깅 설정: 환경변수로 활성화 (통합 로깅)
+  static bool rpc_log_enabled = []() {
+    const char* env = std::getenv("BLOOMCHECK_RPC_LOG");
     return env != nullptr && std::string(env) == "1";
   }();
 
   // 샘플링 레이트: 기본값 1000 (1/1000)
   static std::atomic<uint64_t> noop_log_counter(0);
+  static std::atomic<uint64_t> rpc_log_counter(0);
   static uint64_t noop_log_sample_rate = []() {
     const char* env = std::getenv("BLOOMCHECK_NOOP_LOG_SAMPLE_RATE");
     if (env != nullptr) {
@@ -2784,8 +2792,22 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     }
     return static_cast<uint64_t>(1000);
   }();
+  static uint64_t rpc_log_sample_rate = []() {
+    const char* env = std::getenv("BLOOMCHECK_RPC_LOG_SAMPLE_RATE");
+    if (env != nullptr) {
+      return static_cast<uint64_t>(std::atoi(env));
+    }
+    return static_cast<uint64_t>(1000);
+  }();
 
   // cache-only 모드에서는 bloomcheck 건너뛰기 (네트워크 I/O 방지)
+  // 디버깅: bloomcheck_client 및 noop_only_mode 상태 확인
+  if (info_log_ && noop_only_mode) {
+    ROCKS_LOG_INFO(info_log_, "[NoopRPC] noop_only_mode=%d, bloomcheck_client=%p, read_tier=%d",
+                   noop_only_mode ? 1 : 0, read_options.bloomcheck_client,
+                   static_cast<int>(read_options.read_tier));
+  }
+
   if (read_options.bloomcheck_client != nullptr &&
       read_options.read_tier == kReadAllTier) {
     // 실제 구현 타입 BloomCheckServiceClient*로 캐스팅해서 사용 준비
@@ -2796,15 +2818,22 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     // NOOP_ONLY 모드: Noop RPC만 호출하고 나머지 로직은 건너뛰기
     if (noop_only_mode) {
       uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
-      bool noop_ok = client->Noop();
+      size_t channel_idx = 0;
+      bool noop_ok = client->Noop(&channel_idx);
       uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+      size_t channel_count = client->GetChannelCount();
 
       // 로깅 (샘플링 적용)
-      if (noop_log_enabled && info_log_) {
-        uint64_t counter = noop_log_counter.fetch_add(1, std::memory_order_relaxed);
-        if (counter % noop_log_sample_rate == 0) {
-          ROCKS_LOG_INFO(info_log_, "[NoopRPC] rpc_us=%llu ok=%d",
-                         (unsigned long long)rpc_us, noop_ok ? 1 : 0);
+      bool should_log = (noop_log_enabled || rpc_log_enabled) && info_log_;
+      if (should_log) {
+        uint64_t counter = rpc_log_enabled 
+            ? rpc_log_counter.fetch_add(1, std::memory_order_relaxed)
+            : noop_log_counter.fetch_add(1, std::memory_order_relaxed);
+        uint64_t sample_rate = rpc_log_enabled ? rpc_log_sample_rate : noop_log_sample_rate;
+        // 샘플링 레이트가 1이면 항상 로그, 아니면 샘플링
+        if (sample_rate == 1 || counter % sample_rate == 0) {
+          ROCKS_LOG_INFO(info_log_, "[NoopRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d",
+                         channel_count, channel_idx, (unsigned long long)rpc_us, noop_ok ? 1 : 0);
         }
       }
 
@@ -2865,12 +2894,30 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
 
       // check_ok는 RPC 통신 성공+서버 응답 수신 나타냄
       bloomcheck::BatchResponse response;
+      size_t channel_idx = 0;
+      size_t channel_count = client->GetChannelCount();
+      
+      // RPC latency 측정 (BLOOMCHECK_LOG_LATENCY 또는 BLOOMCHECK_RPC_LOG 활성화 시)
+      uint64_t rpc_start_us = 0;
+      bool measure_latency = false;
 #ifdef BLOOMCHECK_LOG_LATENCY
-      uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+      measure_latency = true;
+      rpc_start_us = storage_info_.clock_->NowMicros();
+#else
+      if (rpc_log_enabled) {
+        measure_latency = true;
+        rpc_start_us = storage_info_.clock_->NowMicros();
+      }
 #endif
-      bool check_ok = client->CheckBatch(request, &response);
+      
+      bool check_ok = client->CheckBatch(request, &response, &channel_idx);
+      
+      uint64_t rpc_us = 0;
+      if (measure_latency) {
+        rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+      }
+      
 #ifdef BLOOMCHECK_LOG_LATENCY
-      uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
       int resps = response.resps_size();
       int may = 0;
       if (check_ok && resps > 0) {
@@ -2883,6 +2930,22 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                        candidate_file_numbers.size(), resps, may, user_key_str.size());
       }
 #endif
+
+      // RPC 로깅 (샘플링 적용)
+      if (rpc_log_enabled && info_log_) {
+        uint64_t counter = rpc_log_counter.fetch_add(1, std::memory_order_relaxed);
+        if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
+          int resps = response.resps_size();
+          int may = 0;
+          if (check_ok && resps > 0) {
+            may = response.resps(0).may_match_sst_file_numbers_size();
+          }
+          ROCKS_LOG_INFO(info_log_,
+                         "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d candidates=%zu maymatch=%d",
+                         channel_count, channel_idx, (unsigned long long)rpc_us, check_ok ? 1 : 0,
+                         candidate_file_numbers.size(), may);
+        }
+      }
 
       // 디버깅: 응답 수신 후 로그 (요청 키 포함)
       if (info_log_) {

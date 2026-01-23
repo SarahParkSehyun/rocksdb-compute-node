@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdlib>
 #include <grpcpp/grpcpp.h>
 #include <string>
+#include <thread>
 #include <vector>
 #include "bloomcheck.grpc.pb.h"
 
@@ -14,8 +17,45 @@ namespace ROCKSDB_NAMESPACE {
 class BloomCheckServiceClient {
  public:
   explicit BloomCheckServiceClient(const std::string& server_address)
-      : channel_(grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials())),
-        stub_(bloomcheck::BloomCheck::NewStub(channel_)) {}
+      : channel_count_(1) {
+    // Read channel count from environment variable
+    const char* env = std::getenv("BLOOMCHECK_CHANNELS");
+    if (env != nullptr) {
+      int count = std::atoi(env);
+      if (count > 0) {
+        channel_count_ = static_cast<size_t>(count);
+      }
+    }
+
+    // Create channel pool
+    channels_.reserve(channel_count_);
+    stubs_.reserve(channel_count_);
+    for (size_t i = 0; i < channel_count_; ++i) {
+      auto channel = grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+      channels_.push_back(channel);
+      stubs_.push_back(bloomcheck::BloomCheck::NewStub(channel));
+    }
+
+    // For backward compatibility: if channel_count_ == 1, keep single channel/stub
+    if (channel_count_ == 1) {
+      channel_ = channels_[0];
+      stub_ = std::move(stubs_[0]);
+    }
+  }
+
+  // Get channel index for current thread
+  size_t GetChannelIndex() const {
+    if (channel_count_ == 1) {
+      return 0;
+    }
+    // Use thread id hash to select channel
+    std::hash<std::thread::id> hasher;
+    uint64_t tid_hash = static_cast<uint64_t>(hasher(std::this_thread::get_id()));
+    return static_cast<size_t>(tid_hash % channel_count_);
+  }
+
+  // Get channel count (for logging)
+  size_t GetChannelCount() const { return channel_count_; }
 
   // Check if a key may exist in the given SST file (by file_number)
   // Returns true if key may exist (or on error for safety), false if definitely not
@@ -26,8 +66,9 @@ class BloomCheckServiceClient {
     key_req->add_sst_file_numbers(sst_file_number);
 
     bloomcheck::BatchResponse response;
+    size_t idx = GetChannelIndex();
     grpc::ClientContext context;
-    grpc::Status status = stub_->Check(&context, request, &response);
+    grpc::Status status = stubs_[idx]->Check(&context, request, &response);
 
     // On error, return true (safe default to prevent false negatives)
     if (!status.ok()) {
@@ -45,22 +86,35 @@ class BloomCheckServiceClient {
 
   // Check multiple keys against multiple SST files
   bool CheckBatch(const bloomcheck::BatchRequest& request,
-                  bloomcheck::BatchResponse* response) {
+                  bloomcheck::BatchResponse* response, size_t* channel_idx = nullptr) {
+    size_t idx = GetChannelIndex();
+    if (channel_idx != nullptr) {
+      *channel_idx = idx;
+    }
     grpc::ClientContext context;
-    grpc::Status status = stub_->Check(&context, request, response);
+    grpc::Status status = stubs_[idx]->Check(&context, request, response);
     return status.ok();
   }
 
   // Noop RPC for latency measurement (sync unary)
-  bool Noop() {
+  bool Noop(size_t* channel_idx = nullptr) {
+    size_t idx = GetChannelIndex();
+    if (channel_idx != nullptr) {
+      *channel_idx = idx;
+    }
     bloomcheck::NoopRequest request;
     bloomcheck::NoopResponse response;
     grpc::ClientContext context;
-    grpc::Status status = stub_->Noop(&context, request, &response);
+    grpc::Status status = stubs_[idx]->Noop(&context, request, &response);
     return status.ok();
   }
 
  private:
+  size_t channel_count_;
+  std::vector<std::shared_ptr<grpc::Channel>> channels_;
+  std::vector<std::unique_ptr<bloomcheck::BloomCheck::Stub>> stubs_;
+  
+  // For backward compatibility (channel_count_ == 1)
   std::shared_ptr<grpc::Channel> channel_;
   std::unique_ptr<bloomcheck::BloomCheck::Stub> stub_;
 };
