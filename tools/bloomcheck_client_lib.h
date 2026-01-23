@@ -51,6 +51,15 @@ class BloomCheckServiceClient {
     return status.ok();
   }
 
+  // Noop RPC for latency measurement (sync unary)
+  bool Noop() {
+    bloomcheck::NoopRequest request;
+    bloomcheck::NoopResponse response;
+    grpc::ClientContext context;
+    grpc::Status status = stub_->Noop(&context, request, &response);
+    return status.ok();
+  }
+
  private:
   std::shared_ptr<grpc::Channel> channel_;
   std::unique_ptr<bloomcheck::BloomCheck::Stub> stub_;

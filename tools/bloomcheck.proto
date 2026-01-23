@@ -18,7 +18,16 @@ message BatchResponse {
   repeated KeyResponse resps = 1;
 }
 
+message NoopRequest {
+  // Empty message for no-op RPC
+}
+
+message NoopResponse {
+  // Empty message for no-op RPC
+}
+
 service BloomCheck {
   rpc Check(BatchRequest) returns (BatchResponse);
+  rpc Noop(NoopRequest) returns (NoopResponse);
 }
 

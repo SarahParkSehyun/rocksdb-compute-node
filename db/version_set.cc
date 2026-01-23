@@ -11,8 +11,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <list>
 #include <map>
 #include <set>
@@ -2761,6 +2763,28 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   // RPC가 성공하고 응답이 정상적으로 수신되었는지 명확히 표현
   bool bloomcheck_ok = false;
 
+  // NOOP_ONLY 모드: 환경변수로 활성화 (측정 전용)
+  static bool noop_only_mode = []() {
+    const char* env = std::getenv("BLOOMCHECK_NOOP_ONLY");
+    return env != nullptr && std::string(env) == "1";
+  }();
+
+  // NOOP 로깅 설정: 환경변수로 활성화
+  static bool noop_log_enabled = []() {
+    const char* env = std::getenv("BLOOMCHECK_NOOP_LOG");
+    return env != nullptr && std::string(env) == "1";
+  }();
+
+  // 샘플링 레이트: 기본값 1000 (1/1000)
+  static std::atomic<uint64_t> noop_log_counter(0);
+  static uint64_t noop_log_sample_rate = []() {
+    const char* env = std::getenv("BLOOMCHECK_NOOP_LOG_SAMPLE_RATE");
+    if (env != nullptr) {
+      return static_cast<uint64_t>(std::atoi(env));
+    }
+    return static_cast<uint64_t>(1000);
+  }();
+
   // cache-only 모드에서는 bloomcheck 건너뛰기 (네트워크 I/O 방지)
   if (read_options.bloomcheck_client != nullptr &&
       read_options.read_tier == kReadAllTier) {
@@ -2768,6 +2792,26 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     BloomCheckServiceClient* client =
         static_cast<BloomCheckServiceClient*>(read_options.bloomcheck_client);
     bloomcheck_enabled = true;
+
+    // NOOP_ONLY 모드: Noop RPC만 호출하고 나머지 로직은 건너뛰기
+    if (noop_only_mode) {
+      uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+      bool noop_ok = client->Noop();
+      uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+
+      // 로깅 (샘플링 적용)
+      if (noop_log_enabled && info_log_) {
+        uint64_t counter = noop_log_counter.fetch_add(1, std::memory_order_relaxed);
+        if (counter % noop_log_sample_rate == 0) {
+          ROCKS_LOG_INFO(info_log_, "[NoopRPC] rpc_us=%llu ok=%d",
+                         (unsigned long long)rpc_us, noop_ok ? 1 : 0);
+        }
+      }
+
+      // NOOP_ONLY 모드에서는 bloomcheck_may_match_files를 설정하지 않음
+      // (baseline RocksDB 동작으로 진행)
+      bloomcheck_enabled = false;  // 이후 로직에서 bloomcheck 사용 안 함
+    } else {
 
     // FilePicker dry-run: 실제로 순회할 파일 목록 수집
     // file_number만 수집 (경로 문자열은 사용하지 않음)
@@ -2904,6 +2948,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         }
       }
     }
+    }  // else (normal bloomcheck mode)
   }
   // ===== BloomCheck batch precheck 끝 =====
 
