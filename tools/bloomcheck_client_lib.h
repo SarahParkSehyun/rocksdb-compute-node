@@ -44,8 +44,8 @@ class BloomCheckServiceClient {
     }
     
     // Debug: Log channel pool size
-    fprintf(stderr, "[BloomCheckClient] Initialized: channels_.size()=%zu, stubs_.size()=%zu, channel_count_=%zu\n",
-            channels_.size(), stubs_.size(), channel_count_);
+    // fprintf(stderr, "[BloomCheckClient] Initialized: channels_.size()=%zu, stubs_.size()=%zu, channel_count_=%zu\n",
+    //         channels_.size(), stubs_.size(), channel_count_);
   }
 
   // Get channel index for current thread
@@ -97,12 +97,12 @@ class BloomCheckServiceClient {
       *channel_idx = idx;
     }
     // Debug: Log selected channel index (sampled)
-    static std::atomic<uint64_t> call_count(0);
-    uint64_t count = call_count.fetch_add(1, std::memory_order_relaxed);
-    if (count % 1000 == 0) {  // Log every 1000th call
-      fprintf(stderr, "[BloomCheckClient] CheckBatch: selected idx=%zu (channels_.size()=%zu, stubs_.size()=%zu, call_count=%llu)\n",
-              idx, channels_.size(), stubs_.size(), (unsigned long long)count);
-    }
+    // static std::atomic<uint64_t> call_count(0);
+    // uint64_t count = call_count.fetch_add(1, std::memory_order_relaxed);
+    // if (count % 1000 == 0) {  // Log every 1000th call
+    //   fprintf(stderr, "[BloomCheckClient] CheckBatch: selected idx=%zu (channels_.size()=%zu, stubs_.size()=%zu, call_count=%llu)\n",
+    //           idx, channels_.size(), stubs_.size(), (unsigned long long)count);
+    // }
     grpc::ClientContext context;
     grpc::Status status = stubs_[idx]->Check(&context, request, response);
     return status.ok();
@@ -115,12 +115,12 @@ class BloomCheckServiceClient {
       *channel_idx = idx;
     }
     // Debug: Log selected channel index (sampled)
-    static std::atomic<uint64_t> call_count(0);
-    uint64_t count = call_count.fetch_add(1, std::memory_order_relaxed);
-    if (count % 1000 == 0) {  // Log every 1000th call
-      fprintf(stderr, "[BloomCheckClient] Noop: selected idx=%zu (channels_.size()=%zu, stubs_.size()=%zu, call_count=%llu)\n",
-              idx, channels_.size(), stubs_.size(), (unsigned long long)count);
-    }
+    // static std::atomic<uint64_t> call_count(0);
+    // uint64_t count = call_count.fetch_add(1, std::memory_order_relaxed);
+    // if (count % 1000 == 0) {  // Log every 1000th call
+    //   fprintf(stderr, "[BloomCheckClient] Noop: selected idx=%zu (channels_.size()=%zu, stubs_.size()=%zu, call_count=%llu)\n",
+    //           idx, channels_.size(), stubs_.size(), (unsigned long long)count);
+    // }
     bloomcheck::NoopRequest request;
     bloomcheck::NoopResponse response;
     grpc::ClientContext context;
@@ -130,16 +130,16 @@ class BloomCheckServiceClient {
 
   // Warm-up: Send one RPC through each channel to establish connections
   void WarmupChannels() {
-    fprintf(stderr, "[BloomCheckClient] Warmup: Starting warm-up for %zu channels\n", channel_count_);
+    // fprintf(stderr, "[BloomCheckClient] Warmup: Starting warm-up for %zu channels\n", channel_count_);
     for (size_t i = 0; i < channel_count_; ++i) {
       bloomcheck::NoopRequest request;
       bloomcheck::NoopResponse response;
       grpc::ClientContext context;
       grpc::Status status = stubs_[i]->Noop(&context, request, &response);
-      fprintf(stderr, "[BloomCheckClient] Warmup: channel[%zu] RPC %s\n",
-              i, status.ok() ? "OK" : "FAILED");
+      // fprintf(stderr, "[BloomCheckClient] Warmup: channel[%zu] RPC %s\n",
+      //         i, status.ok() ? "OK" : "FAILED");
     }
-    fprintf(stderr, "[BloomCheckClient] Warmup: Completed warm-up for %zu channels\n", channel_count_);
+    // fprintf(stderr, "[BloomCheckClient] Warmup: Completed warm-up for %zu channels\n", channel_count_);
   }
 
  private:

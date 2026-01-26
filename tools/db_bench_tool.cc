@@ -3616,9 +3616,9 @@ class Benchmark {
                   bloomcheck_server, bloomcheck_client_->GetChannelCount());
           
           // Warm-up: Send one RPC through each channel to establish connections
-          fprintf(stdout, "BloomCheck client: Starting channel warm-up...\n");
+          // fprintf(stdout, "BloomCheck client: Starting channel warm-up...\n");
           bloomcheck_client_->WarmupChannels();
-          fprintf(stdout, "BloomCheck client: Channel warm-up completed. Check connections with: ss -tanp | grep :50051 | grep ESTAB | wc -l\n");
+          // fprintf(stdout, "BloomCheck client: Channel warm-up completed. Check connections with: ss -tanp | grep :50051 | grep ESTAB | wc -l\n");
         } catch (const std::exception& e) {
           fprintf(stderr, "Failed to initialize BloomCheck client: %s\n", e.what());
           bloomcheck_client_.reset();
