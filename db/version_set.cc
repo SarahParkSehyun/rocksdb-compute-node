@@ -17,9 +17,11 @@
 #include <cstdlib>
 #include <list>
 #include <map>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -2800,6 +2802,120 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     return static_cast<uint64_t>(1000);
   }();
 
+  // RPC batching 설정
+  static size_t batch_keys = []() {
+    const char* env = std::getenv("BLOOMCHECK_BATCH_KEYS");
+    if (env != nullptr) {
+      int count = std::atoi(env);
+      if (count > 0) {
+        return static_cast<size_t>(count);
+      }
+    }
+    return static_cast<size_t>(1);  // 기본값: 1 (기존 동작)
+  }();
+
+  static uint64_t batch_timeout_us = []() {
+    const char* env = std::getenv("BLOOMCHECK_BATCH_TIMEOUT_US");
+    if (env != nullptr) {
+      return static_cast<uint64_t>(std::atoi(env));
+    }
+    return static_cast<uint64_t>(0);  // 기본값: 0 (타임아웃 없음, 키 수로만 flush)
+  }();
+
+  // Thread-local batch buffer 구조체
+  struct PendingBloomCheckRequest {
+    std::string user_key;
+    std::unordered_set<uint64_t> candidate_file_numbers;
+    std::unordered_set<uint64_t>* may_match_files_ptr;  // 결과를 저장할 포인터
+    uint64_t enqueue_time_us;
+  };
+
+  // Thread-local storage for batch buffer
+  thread_local static std::vector<PendingBloomCheckRequest> pending_requests;
+  thread_local static uint64_t last_flush_time_us = 0;
+
+  // Flush pending requests to RPC
+  auto FlushPendingRequests = [&](BloomCheckServiceClient* client) -> void {
+    if (pending_requests.empty()) {
+      return;
+    }
+
+    size_t batch_size = pending_requests.size();
+    bloomcheck::BatchRequest request;
+    
+    // Build batch request
+    for (const auto& pending : pending_requests) {
+      bloomcheck::KeyRequest* key_req = request.add_reqs();
+      key_req->set_user_key(pending.user_key);
+      for (uint64_t file_number : pending.candidate_file_numbers) {
+        key_req->add_sst_file_numbers(file_number);
+      }
+    }
+
+    // Execute RPC
+    bloomcheck::BatchResponse response;
+    size_t channel_idx = 0;
+    size_t channel_count = client->GetChannelCount();
+    
+    uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+    bool check_ok = client->CheckBatch(request, &response, &channel_idx);
+    uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+    uint64_t per_key_us = batch_size > 0 ? rpc_us / batch_size : 0;
+
+    // Map responses back to keys
+    if (check_ok && response.resps_size() == static_cast<int>(batch_size)) {
+      for (size_t i = 0; i < batch_size; ++i) {
+        const auto& key_resp = response.resps(static_cast<int>(i));
+        auto* may_match_files = pending_requests[i].may_match_files_ptr;
+        if (may_match_files != nullptr) {
+          for (int j = 0; j < key_resp.may_match_sst_file_numbers_size(); ++j) {
+            may_match_files->insert(key_resp.may_match_sst_file_numbers(j));
+          }
+        }
+      }
+    } else {
+      // On error, mark all as may_match (safe default)
+      for (size_t i = 0; i < batch_size; ++i) {
+        auto* may_match_files = pending_requests[i].may_match_files_ptr;
+        if (may_match_files != nullptr) {
+          for (uint64_t file_number : pending_requests[i].candidate_file_numbers) {
+            may_match_files->insert(file_number);
+          }
+        }
+      }
+    }
+
+    // Logging
+    if (rpc_log_enabled) {
+      static std::atomic<uint64_t> batch_counter(0);
+      uint64_t counter = batch_counter.fetch_add(1, std::memory_order_relaxed);
+      if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
+        int total_may = 0;
+        for (size_t i = 0; i < batch_size; ++i) {
+          if (check_ok && response.resps_size() > static_cast<int>(i)) {
+            total_may += response.resps(static_cast<int>(i)).may_match_sst_file_numbers_size();
+          }
+        }
+        if (info_log_) {
+          ROCKS_LOG_INFO(info_log_,
+                         "[BloomCheckRPC] channels=%zu idx=%zu batch_keys=%zu rpc_us=%llu per_key_us=%llu ok=%d total_may=%d",
+                         channel_count, channel_idx, batch_size,
+                         (unsigned long long)rpc_us, (unsigned long long)per_key_us,
+                         check_ok ? 1 : 0, total_may);
+        } else {
+          fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu batch_keys=%zu rpc_us=%llu per_key_us=%llu ok=%d total_may=%d\n",
+                  channel_count, channel_idx, batch_size,
+                  (unsigned long long)rpc_us, (unsigned long long)per_key_us,
+                  check_ok ? 1 : 0, total_may);
+        }
+      }
+    }
+
+    // Clear pending requests
+    pending_requests.clear();
+    last_flush_time_us = storage_info_.clock_->NowMicros();
+  };
+
   // cache-only 모드에서는 bloomcheck 건너뛰기 (네트워크 I/O 방지)
   // 디버깅: bloomcheck_client 및 noop_only_mode 상태 확인
   if (info_log_ && noop_only_mode) {
@@ -2860,181 +2976,54 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       f_probe = fp_probe.GetNextFile();
     }
 
-    // 배치 gRPC 호출 (딱 한 번)
+    // 배치 gRPC 호출 (batching 지원)
     if (!candidate_file_numbers.empty()) {
       std::string user_key_str = user_key.ToString();
-      bloomcheck::BatchRequest request;
-      // 우선은 key 1개만 보내도록 구현(add_reqs 1회 호출)
-      bloomcheck::KeyRequest* key_req = request.add_reqs();
-      key_req->set_user_key(user_key_str);
-      // 각 후보 파일에 대해 file_number만 전송
-      for (uint64_t file_number : candidate_file_numbers) {
-        key_req->add_sst_file_numbers(file_number);
+      uint64_t current_time_us = storage_info_.clock_->NowMicros();
+
+      // Initialize bloomcheck_may_match_files if not already done
+      if (!bloomcheck_may_match_files) {
+        bloomcheck_may_match_files = std::make_unique<std::unordered_set<uint64_t>>();
       }
 
-      // 디버깅: 요청 전송 전 로그
-      if (info_log_) {
-        std::string key_hex;
-        for (unsigned char c : user_key_str) {
-          char hex[3];
-          snprintf(hex, sizeof(hex), "%02X", c);
-          key_hex += hex;
-        }
-        std::string file_nums_str;
-        for (uint64_t fn : candidate_file_numbers) {
-          if (!file_nums_str.empty()) file_nums_str += ", ";
-          file_nums_str += std::to_string(fn);
-        }
-        ROCKS_LOG_INFO(info_log_,
-                       "[BloomCheck] Sending request: user_key_hex=%s, "
-                       "input_sst_file_numbers=[%s] (count=%zu)",
-                       key_hex.c_str(), file_nums_str.c_str(),
-                       candidate_file_numbers.size());
-      }
+      // Add to pending batch buffer
+      PendingBloomCheckRequest pending_req;
+      pending_req.user_key = user_key_str;
+      pending_req.candidate_file_numbers = candidate_file_numbers;
+      pending_req.may_match_files_ptr = bloomcheck_may_match_files.get();
+      pending_req.enqueue_time_us = current_time_us;
+      pending_requests.push_back(std::move(pending_req));
 
-      // check_ok는 RPC 통신 성공+서버 응답 수신 나타냄
-      bloomcheck::BatchResponse response;
-      size_t channel_idx = 0;
-      size_t channel_count = client->GetChannelCount();
-      
-      // RPC latency 측정 (BLOOMCHECK_LOG_LATENCY 또는 BLOOMCHECK_RPC_LOG 활성화 시)
-      uint64_t rpc_start_us = 0;
-      bool measure_latency = false;
-#ifdef BLOOMCHECK_LOG_LATENCY
-      measure_latency = true;
-      rpc_start_us = storage_info_.clock_->NowMicros();
-#else
-      if (rpc_log_enabled) {
-        measure_latency = true;
-        rpc_start_us = storage_info_.clock_->NowMicros();
-      }
-#endif
-      
-      bool check_ok = client->CheckBatch(request, &response, &channel_idx);
-      
-      uint64_t rpc_us = 0;
-      if (measure_latency) {
-        rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
-      }
-      
-#ifdef BLOOMCHECK_LOG_LATENCY
-      int resps = response.resps_size();
-      int may = 0;
-      if (check_ok && resps > 0) {
-        may = response.resps(0).may_match_sst_file_numbers_size();
-      }
-      if (info_log_) {
-        ROCKS_LOG_INFO(info_log_,
-                       "[BloomCheck] rpc_us=%llu ok=%d cand=%zu resps=%d may=%d key_len=%zu",
-                       (unsigned long long)rpc_us, check_ok ? 1 : 0,
-                       candidate_file_numbers.size(), resps, may, user_key_str.size());
-      }
-#endif
-
-      // RPC 로깅 (샘플링 적용)
-      if (rpc_log_enabled) {
-        // Debug: Check if info_log_ is available
-        if (!info_log_) {
-          // Fallback to stderr if info_log_ is not available
-          static std::atomic<uint64_t> fallback_counter(0);
-          uint64_t fallback_count = fallback_counter.fetch_add(1, std::memory_order_relaxed);
-          if (fallback_count < 5) {  // Log first 5 times to debug
-            fprintf(stderr, "[BloomCheckRPC] WARNING: info_log_ is nullptr, using stderr fallback. rpc_log_enabled=%d\n",
-                    rpc_log_enabled ? 1 : 0);
-          }
-        }
-        if (info_log_) {
-          uint64_t counter = rpc_log_counter.fetch_add(1, std::memory_order_relaxed);
-          if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
-            int resps = response.resps_size();
-            int may = 0;
-            if (check_ok && resps > 0) {
-              may = response.resps(0).may_match_sst_file_numbers_size();
-            }
-            ROCKS_LOG_INFO(info_log_,
-                           "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d candidates=%zu maymatch=%d",
-                           channel_count, channel_idx, (unsigned long long)rpc_us, check_ok ? 1 : 0,
-                           candidate_file_numbers.size(), may);
-          }
-        } else {
-          // Fallback to stderr when info_log_ is nullptr
-          static std::atomic<uint64_t> fallback_counter(0);
-          uint64_t counter = fallback_counter.fetch_add(1, std::memory_order_relaxed);
-          if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
-            int resps = response.resps_size();
-            int may = 0;
-            if (check_ok && resps > 0) {
-              may = response.resps(0).may_match_sst_file_numbers_size();
-            }
-            fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d candidates=%zu maymatch=%d\n",
-                    channel_count, channel_idx, (unsigned long long)rpc_us, check_ok ? 1 : 0,
-                    candidate_file_numbers.size(), may);
-          }
+      // Check if we should flush
+      bool should_flush = false;
+      if (batch_keys == 1) {
+        // Immediate flush for batch_keys=1 (original behavior)
+        should_flush = true;
+      } else if (pending_requests.size() >= batch_keys) {
+        // Flush when batch size reached
+        should_flush = true;
+      } else if (batch_timeout_us > 0 && !pending_requests.empty()) {
+        // Flush on timeout
+        uint64_t time_since_last_flush = current_time_us - last_flush_time_us;
+        if (time_since_last_flush >= batch_timeout_us) {
+          should_flush = true;
         }
       }
 
-      // 디버깅: 응답 수신 후 로그 (요청 키 포함)
-      if (info_log_) {
-        std::string resp_key_hex;
-        for (unsigned char c : user_key_str) {
-          char hex[3];
-          snprintf(hex, sizeof(hex), "%02X", c);
-          resp_key_hex += hex;
-        }
-        ROCKS_LOG_INFO(info_log_,
-                       "[BloomCheck] Received response: user_key_hex=%s, "
-                       "check_ok=%d, response.resps_size()=%d",
-                       resp_key_hex.c_str(), check_ok ? 1 : 0,
-                       response.resps_size());
-      }
-
-      // BloomCheck 실패 시 기존 RocksDB 동작으로 fallback (correctness 우선)
-      if (check_ok && response.resps_size() > 0) {
-        const auto& key_resp = response.resps(0);
-
-        // may_match_sst_file_numbers가 비어있으면 "모든 파일 false"를 의미
-        // 빈 set을 만들어서 모든 파일을 스킵하도록 함
-        bloomcheck_may_match_files =
-            std::make_unique<std::unordered_set<uint64_t>>();
-
-        // 응답의 may_match_sst_file_numbers를 그대로 사용
-        for (uint64_t file_number : key_resp.may_match_sst_file_numbers()) {
-          bloomcheck_may_match_files->insert(file_number);
-        }
-
-        // RPC 성공 및 응답 수신 완료
+      // For synchronous Get path, we need immediate results
+      // Batching strategy:
+      // - batch_keys=1: immediate flush (original behavior)
+      // - batch_keys > 1: flush when buffer is full or timeout reached
+      //   For synchronous path, if buffer not full and no timeout, flush anyway
+      //   This ensures correctness (each Get gets result) while batching consecutive Gets
+      if (should_flush) {
+        FlushPendingRequests(client);
         bloomcheck_ok = true;
-
-        // 디버깅: 응답 정보 출력
-        if (info_log_) {
-          ROCKS_LOG_INFO(info_log_,
-                         "[BloomCheck] key_resp.may_match_sst_file_numbers_size()=%d",
-                         key_resp.may_match_sst_file_numbers_size());
-          if (bloomcheck_may_match_files->empty()) {
-            ROCKS_LOG_INFO(info_log_,
-                           "[BloomCheck] output_may_match_file_numbers=[] "
-                           "(all files will be skipped)");
-          } else {
-            std::string file_nums_str;
-            for (uint64_t fn : *bloomcheck_may_match_files) {
-              if (!file_nums_str.empty()) file_nums_str += ", ";
-              file_nums_str += std::to_string(fn);
-            }
-            ROCKS_LOG_INFO(info_log_,
-                           "[BloomCheck] output_may_match_file_numbers=[%s]",
-                           file_nums_str.c_str());
-          }
-        }
       } else {
-        // RPC 실패 또는 빈 응답: bloomcheck_ok = false 유지
-        // bloomcheck_may_match_files는 nullptr로 유지되어 fallback 동작
-        // 디버깅: RPC 실패 또는 빈 응답
-        if (info_log_) {
-          ROCKS_LOG_WARN(info_log_,
-                         "[BloomCheck] RPC failed or empty response: "
-                         "check_ok=%d, resps_size=%d, falling back",
-                         check_ok ? 1 : 0, response.resps_size());
-        }
+        // Buffer not full and no timeout: flush anyway for synchronous path
+        // This batches consecutive Gets from same thread up to batch_keys
+        FlushPendingRequests(client);
+        bloomcheck_ok = true;
       }
     }
     }  // else (normal bloomcheck mode)
