@@ -96,6 +96,7 @@
 #ifdef MEMKIND
 #include "memory/memkind_kmem_allocator.h"
 #endif
+#include "tools/bloomcheck_client_lib.h"
 
 #ifdef OS_WIN
 #include <io.h>  // open/close
@@ -2869,6 +2870,7 @@ class Benchmark {
   bool use_blob_db_;    // Stacked BlobDB
   bool read_operands_;  // read via GetMergeOperands()
   std::vector<std::string> keys_;
+  std::unique_ptr<BloomCheckServiceClient> bloomcheck_client_;  // BloomCheck gRPC client
 
   class ErrorHandlerListener : public EventListener {
    public:
@@ -3602,6 +3604,25 @@ class Benchmark {
       read_options_.auto_readahead_size = FLAGS_auto_readahead_size;
       read_options_.auto_refresh_iterator_with_snapshot =
           FLAGS_auto_refresh_iterator_with_snapshot;
+
+      // Initialize BloomCheck client if BLOOMCHECK_SERVER is set
+      const char* bloomcheck_server = std::getenv("BLOOMCHECK_SERVER");
+      if (bloomcheck_server != nullptr && strlen(bloomcheck_server) > 0) {
+        try {
+          bloomcheck_client_ = std::make_unique<BloomCheckServiceClient>(bloomcheck_server);
+          read_options_.bloomcheck_client = bloomcheck_client_.get();
+          read_options_.read_tier = kReadAllTier;  // Enable BloomCheck offloading
+          fprintf(stdout, "BloomCheck client initialized: server=%s, channels=%zu\n",
+                  bloomcheck_server, bloomcheck_client_->GetChannelCount());
+        } catch (const std::exception& e) {
+          fprintf(stderr, "Failed to initialize BloomCheck client: %s\n", e.what());
+          bloomcheck_client_.reset();
+          read_options_.bloomcheck_client = nullptr;
+        }
+      } else {
+        bloomcheck_client_.reset();
+        read_options_.bloomcheck_client = nullptr;
+      }
 
       void (Benchmark::*method)(ThreadState*) = nullptr;
       void (Benchmark::*post_process_method)() = nullptr;
