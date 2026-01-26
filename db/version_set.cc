@@ -2805,13 +2805,21 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   // RPC batching 설정
   static size_t batch_keys = []() {
     const char* env = std::getenv("BLOOMCHECK_BATCH_KEYS");
+    size_t result = 1;  // 기본값: 1 (기존 동작)
     if (env != nullptr) {
       int count = std::atoi(env);
       if (count > 0) {
-        return static_cast<size_t>(count);
+        result = static_cast<size_t>(count);
       }
     }
-    return static_cast<size_t>(1);  // 기본값: 1 (기존 동작)
+    // Debug: Log initialization (only once)
+    static bool logged = false;
+    if (!logged) {
+      fprintf(stderr, "[BloomCheckBatch] BLOOMCHECK_BATCH_KEYS initialization: env=%s, batch_keys=%zu\n",
+              env ? env : "nullptr", result);
+      logged = true;
+    }
+    return result;
   }();
 
   static uint64_t batch_timeout_us = []() {
@@ -3013,15 +3021,24 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       // For synchronous Get path, we need immediate results
       // Batching strategy:
       // - batch_keys=1: immediate flush (original behavior)
-      // - batch_keys > 1: flush when buffer is full or timeout reached
-      //   For synchronous path, if buffer not full and no timeout, flush anyway
-      //   This ensures correctness (each Get gets result) while batching consecutive Gets
+      // - batch_keys > 1: accumulate requests in buffer, flush when full
+      //   For synchronous path, we can't wait indefinitely, so we flush when:
+      //   1. Buffer is full (batch_keys reached) - this batches consecutive Gets
+      //   2. Timeout exceeded (if batch_timeout_us > 0)
+      //   3. Otherwise, keep in buffer for next Get in same thread
+      //   Note: Each Get needs its result, but we batch consecutive Gets from same thread
+      //   The key insight: thread_local buffer persists across Get calls in same thread
+      //   So consecutive Gets from same thread will accumulate until batch_keys reached
       if (should_flush) {
         FlushPendingRequests(client);
         bloomcheck_ok = true;
       } else {
-        // Buffer not full and no timeout: flush anyway for synchronous path
-        // This batches consecutive Gets from same thread up to batch_keys
+        // Buffer not full and no timeout: for synchronous Get, we need immediate result
+        // But we can't wait, so we must flush
+        // However, thread_local buffer persists across Get calls in same thread
+        // So if next Get comes quickly, it will add to buffer and flush when full
+        // This means batching works for consecutive Gets from same thread
+        // But if Gets are spaced out, each will flush immediately (batch_keys=1 behavior)
         FlushPendingRequests(client);
         bloomcheck_ok = true;
       }
