@@ -2932,18 +2932,44 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
 #endif
 
       // RPC 로깅 (샘플링 적용)
-      if (rpc_log_enabled && info_log_) {
-        uint64_t counter = rpc_log_counter.fetch_add(1, std::memory_order_relaxed);
-        if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
-          int resps = response.resps_size();
-          int may = 0;
-          if (check_ok && resps > 0) {
-            may = response.resps(0).may_match_sst_file_numbers_size();
+      if (rpc_log_enabled) {
+        // Debug: Check if info_log_ is available
+        if (!info_log_) {
+          // Fallback to stderr if info_log_ is not available
+          static std::atomic<uint64_t> fallback_counter(0);
+          uint64_t fallback_count = fallback_counter.fetch_add(1, std::memory_order_relaxed);
+          if (fallback_count < 5) {  // Log first 5 times to debug
+            fprintf(stderr, "[BloomCheckRPC] WARNING: info_log_ is nullptr, using stderr fallback. rpc_log_enabled=%d\n",
+                    rpc_log_enabled ? 1 : 0);
           }
-          ROCKS_LOG_INFO(info_log_,
-                         "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d candidates=%zu maymatch=%d",
-                         channel_count, channel_idx, (unsigned long long)rpc_us, check_ok ? 1 : 0,
-                         candidate_file_numbers.size(), may);
+        }
+        if (info_log_) {
+          uint64_t counter = rpc_log_counter.fetch_add(1, std::memory_order_relaxed);
+          if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
+            int resps = response.resps_size();
+            int may = 0;
+            if (check_ok && resps > 0) {
+              may = response.resps(0).may_match_sst_file_numbers_size();
+            }
+            ROCKS_LOG_INFO(info_log_,
+                           "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d candidates=%zu maymatch=%d",
+                           channel_count, channel_idx, (unsigned long long)rpc_us, check_ok ? 1 : 0,
+                           candidate_file_numbers.size(), may);
+          }
+        } else {
+          // Fallback to stderr when info_log_ is nullptr
+          static std::atomic<uint64_t> fallback_counter(0);
+          uint64_t counter = fallback_counter.fetch_add(1, std::memory_order_relaxed);
+          if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
+            int resps = response.resps_size();
+            int may = 0;
+            if (check_ok && resps > 0) {
+              may = response.resps(0).may_match_sst_file_numbers_size();
+            }
+            fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d candidates=%zu maymatch=%d\n",
+                    channel_count, channel_idx, (unsigned long long)rpc_us, check_ok ? 1 : 0,
+                    candidate_file_numbers.size(), may);
+          }
         }
       }
 
