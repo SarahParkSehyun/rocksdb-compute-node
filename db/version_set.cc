@@ -2844,87 +2844,12 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       // (baseline RocksDB 동작으로 진행)
       bloomcheck_enabled = false;  // 이후 로직에서 bloomcheck 사용 안 함
     } else {
-
-    // FilePicker dry-run: 실제로 순회할 파일 목록 수집
-    // file_number만 수집 (경로 문자열은 사용하지 않음)
-    FilePicker fp_probe(user_key, ikey, &storage_info_.level_files_brief_,
-                        storage_info_.num_non_empty_levels_,
-                        &storage_info_.file_indexer_, user_comparator(),
-                        internal_comparator());
-
-    // 후보 파일 번호만 수집 (중복 제거)
-    std::unordered_set<uint64_t> candidate_file_numbers;
-
-    // fp_probe.GetNextFile()로 Get이 방문할 다음 SST 후보를 하나 가져옴
-    FdWithKeyRange* f_probe = fp_probe.GetNextFile();
-    while (f_probe != nullptr) {
-      uint64_t file_number = f_probe->file_metadata->fd.GetNumber();
-      candidate_file_numbers.insert(file_number);
-      f_probe = fp_probe.GetNextFile();
-    }
-
-    // 단일 키 gRPC 호출
-    if (!candidate_file_numbers.empty()) {
-      std::string user_key_str = user_key.ToString();
-
+      // Baseline comparison mode: No dry-run, send RPC per SST file
       // Initialize bloomcheck_may_match_files if not already done
       if (!bloomcheck_may_match_files) {
         bloomcheck_may_match_files = std::make_unique<std::unordered_set<uint64_t>>();
       }
-
-      // Build single-key batch request
-      bloomcheck::BatchRequest request;
-      bloomcheck::KeyRequest* key_req = request.add_reqs();
-      key_req->set_user_key(user_key_str);
-      for (uint64_t file_number : candidate_file_numbers) {
-        key_req->add_sst_file_numbers(file_number);
-      }
-
-      // Execute RPC
-      bloomcheck::BatchResponse response;
-      size_t channel_idx = 0;
-      size_t channel_count = client->GetChannelCount();
-      
-      uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
-      bool check_ok = client->CheckBatch(request, &response, &channel_idx);
-      uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
-
-      // Map response back to may_match_files
-      if (check_ok && response.resps_size() == 1) {
-        const auto& key_resp = response.resps(0);
-        for (int j = 0; j < key_resp.may_match_sst_file_numbers_size(); ++j) {
-          bloomcheck_may_match_files->insert(key_resp.may_match_sst_file_numbers(j));
-        }
-      } else {
-        // On error, mark all as may_match (safe default)
-        for (uint64_t file_number : candidate_file_numbers) {
-          bloomcheck_may_match_files->insert(file_number);
-        }
-      }
-
-      // Logging
-      if (rpc_log_enabled) {
-        static std::atomic<uint64_t> rpc_counter(0);
-        uint64_t counter = rpc_counter.fetch_add(1, std::memory_order_relaxed);
-        if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
-          int total_may = check_ok && response.resps_size() > 0
-              ? response.resps(0).may_match_sst_file_numbers_size() : 0;
-          if (info_log_) {
-            ROCKS_LOG_INFO(info_log_,
-                           "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d total_may=%d",
-                           channel_count, channel_idx,
-                           (unsigned long long)rpc_us,
-                           check_ok ? 1 : 0, total_may);
-          } else {
-            fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d total_may=%d\n",
-                    channel_count, channel_idx,
-                    (unsigned long long)rpc_us,
-                    check_ok ? 1 : 0, total_may);
-          }
-        }
-      }
-
-      bloomcheck_ok = check_ok;
+      bloomcheck_ok = true;  // Will be set per-file during iteration
     }
     }  // else (normal bloomcheck mode)
   }
@@ -2946,6 +2871,71 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     }
 
     uint64_t file_number = f->file_metadata->fd.GetNumber();
+
+    // Baseline comparison mode: Send RPC per SST file (no dry-run)
+    if (bloomcheck_enabled && read_options.bloomcheck_client != nullptr &&
+        read_options.read_tier == kReadAllTier) {
+      BloomCheckServiceClient* client =
+          static_cast<BloomCheckServiceClient*>(read_options.bloomcheck_client);
+      
+      std::string user_key_str = user_key.ToString();
+      
+      // Build single-file RPC request
+      bloomcheck::BatchRequest request;
+      bloomcheck::KeyRequest* key_req = request.add_reqs();
+      key_req->set_user_key(user_key_str);
+      key_req->add_sst_file_numbers(file_number);
+
+      // Execute RPC for this single file
+      bloomcheck::BatchResponse response;
+      size_t channel_idx = 0;
+      size_t channel_count = client->GetChannelCount();
+      
+      uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+      bool check_ok = client->CheckBatch(request, &response, &channel_idx);
+      uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+
+      // Map response back to may_match_files
+      if (check_ok && response.resps_size() == 1) {
+        const auto& key_resp = response.resps(0);
+        // If this file is in may_match, add it to the set
+        for (int j = 0; j < key_resp.may_match_sst_file_numbers_size(); ++j) {
+          if (key_resp.may_match_sst_file_numbers(j) == file_number) {
+            bloomcheck_may_match_files->insert(file_number);
+            break;
+          }
+        }
+      } else {
+        // On error, mark as may_match (safe default)
+        bloomcheck_may_match_files->insert(file_number);
+      }
+
+      // Logging
+      if (rpc_log_enabled) {
+        static std::atomic<uint64_t> rpc_counter(0);
+        uint64_t counter = rpc_counter.fetch_add(1, std::memory_order_relaxed);
+        if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
+          bool file_may_match = bloomcheck_may_match_files->find(file_number) !=
+                                bloomcheck_may_match_files->end();
+          if (info_log_) {
+            ROCKS_LOG_INFO(info_log_,
+                           "[BloomCheckRPC] channels=%zu idx=%zu file=%llu rpc_us=%llu ok=%d may_match=%d",
+                           channel_count, channel_idx,
+                           (unsigned long long)file_number,
+                           (unsigned long long)rpc_us,
+                           check_ok ? 1 : 0, file_may_match ? 1 : 0);
+          } else {
+            fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu file=%llu rpc_us=%llu ok=%d may_match=%d\n",
+                    channel_count, channel_idx,
+                    (unsigned long long)file_number,
+                    (unsigned long long)rpc_us,
+                    check_ok ? 1 : 0, file_may_match ? 1 : 0);
+          }
+        }
+      }
+
+      bloomcheck_ok = check_ok;
+    }
 
     // BloomCheck 필터링: may_match=false인 파일은 스킵
     if (bloomcheck_enabled && bloomcheck_may_match_files != nullptr) {
