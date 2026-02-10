@@ -2880,13 +2880,13 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         key_req->add_sst_file_numbers(file_number);
       }
 
-      // Execute RPC
+      // Execute async RPC (blocks on condition_variable, NOT on gRPC polling)
       bloomcheck::BatchResponse response;
       size_t channel_idx = 0;
       size_t channel_count = client->GetChannelCount();
       
       uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
-      bool check_ok = client->CheckBatch(request, &response, &channel_idx);
+      bool check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
       uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
 
       // Map response back to may_match_files

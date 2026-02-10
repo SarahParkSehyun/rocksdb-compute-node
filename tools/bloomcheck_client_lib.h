@@ -10,12 +10,66 @@
 #include <grpcpp/grpcpp.h>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <string>
 #include <thread>
 #include <vector>
 #include "bloomcheck.grpc.pb.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// Simple semaphore implementation for inflight RPC limiting
+class Semaphore {
+ public:
+  explicit Semaphore(size_t max_count) : max_count_(max_count), current_count_(max_count) {}
+
+  void Acquire() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [this] { return current_count_ > 0; });
+    --current_count_;
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++current_count_;
+    cv_.notify_one();
+  }
+
+  size_t GetMaxCount() const { return max_count_; }
+  size_t GetCurrentCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return current_count_;
+  }
+
+ private:
+  size_t max_count_;
+  size_t current_count_;
+  mutable std::mutex mutex_;  // mutable to allow locking in const methods
+  std::condition_variable cv_;
+};
+
+// RAII wrapper for semaphore acquire/release
+class SemaphoreGuard {
+ public:
+  explicit SemaphoreGuard(Semaphore* semaphore) : semaphore_(semaphore) {
+    if (semaphore_) {
+      semaphore_->Acquire();
+    }
+  }
+
+  ~SemaphoreGuard() {
+    if (semaphore_) {
+      semaphore_->Release();
+    }
+  }
+
+  // Non-copyable
+  SemaphoreGuard(const SemaphoreGuard&) = delete;
+  SemaphoreGuard& operator=(const SemaphoreGuard&) = delete;
+
+ private:
+  Semaphore* semaphore_;
+};
 
 // Per-RPC state object for async BloomCheck calls
 class AsyncBloomCheckCall {
@@ -70,6 +124,21 @@ class BloomCheckServiceClient {
       if (count > 0) {
         cq_count = static_cast<size_t>(count);
       }
+    }
+
+    // Read MAX_INFLIGHT from environment variable (default: unlimited, 0 means unlimited)
+    size_t max_inflight = 0;  // 0 means unlimited
+    const char* inflight_env = std::getenv("BLOOMCHECK_MAX_INFLIGHT");
+    if (inflight_env != nullptr) {
+      int count = std::atoi(inflight_env);
+      if (count > 0) {
+        max_inflight = static_cast<size_t>(count);
+      }
+    }
+    
+    // Create semaphore if inflight limiting is enabled
+    if (max_inflight > 0) {
+      inflight_semaphore_ = std::make_unique<Semaphore>(max_inflight);
     }
 
     // Create channel pool
@@ -177,8 +246,13 @@ class BloomCheckServiceClient {
 
   // Async version: Check multiple keys against multiple SST files
   // Blocks the calling thread until RPC completes, but does NOT participate in pollset_work
+  // Respects MAX_INFLIGHT limit if set via BLOOMCHECK_MAX_INFLIGHT environment variable
   bool AsyncCheckBatch(const bloomcheck::BatchRequest& request,
                        bloomcheck::BatchResponse* response, size_t* channel_idx = nullptr) {
+    // Acquire semaphore slot if inflight limiting is enabled
+    // This will block if MAX_INFLIGHT limit is reached
+    SemaphoreGuard guard(inflight_semaphore_.get());
+
     // Select channel and CQ
     size_t stub_idx = GetChannelIndex();
     size_t cq_idx = stub_idx % cqs_.size();
@@ -205,6 +279,7 @@ class BloomCheckServiceClient {
     call->Wait();
 
     // Copy results
+    // Note: SemaphoreGuard destructor will release the semaphore slot here
     *response = call->response_;
     return call->status_.ok();
   }
@@ -246,6 +321,9 @@ class BloomCheckServiceClient {
  private:
   // CompletionQueue poller thread (runs cq->Next() to handle async RPC completions)
   void CQPollerThread(size_t cq_idx) {
+    // Set thread name for debugging/monitoring
+    pthread_setname_np(pthread_self(), "bloom_poller");
+    
     void* tag;
     bool ok;
     while (true) {
@@ -278,6 +356,7 @@ class BloomCheckServiceClient {
   std::vector<std::thread> cq_poller_threads_;
   std::mutex shutdown_mutex_;
   bool shutdown_;
+  std::unique_ptr<Semaphore> inflight_semaphore_;  // For limiting concurrent inflight RPCs
 };
 
 }  // namespace ROCKSDB_NAMESPACE
