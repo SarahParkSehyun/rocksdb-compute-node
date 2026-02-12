@@ -13,6 +13,8 @@
 #endif
 #ifndef OS_WIN
 #include <unistd.h>
+#include <pthread.h>
+#include <sched.h>
 #endif
 #include <fcntl.h>
 #include <sys/types.h>

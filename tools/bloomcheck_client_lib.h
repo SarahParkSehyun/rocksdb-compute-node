@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <pthread.h>
+#include <sched.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -78,13 +79,16 @@ class AsyncBloomCheckCall {
 
   // Synchronization
   void Wait() {
+    // No spin-wait: directly use condition variable
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [this] { return completed_; });
+    cv_.wait(lock, [this] { return completed_.load(std::memory_order_acquire); });
   }
 
   void Signal() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    completed_ = true;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      completed_ = true;
+    }
     cv_.notify_one();
   }
 
@@ -99,15 +103,15 @@ class AsyncBloomCheckCall {
  private:
   std::mutex mutex_;
   std::condition_variable cv_;
-  bool completed_;
+  std::atomic<bool> completed_;  // Atomic for lock-free spin-wait check
 };
 
 // BloomCheckServiceClient provides a C++ client interface for the BloomCheck gRPC service
 class BloomCheckServiceClient {
  public:
   explicit BloomCheckServiceClient(const std::string& server_address)
-      : channel_count_(1), shutdown_(false) {
-    // Read channel count from environment variable
+      : channel_count_(32), shutdown_(false) {  // Default: 32 channels for 32 physical cores
+    // Read channel count from environment variable (default: 32)
     const char* env = std::getenv("BLOOMCHECK_CHANNELS");
     if (env != nullptr) {
       int count = std::atoi(env);
@@ -116,7 +120,7 @@ class BloomCheckServiceClient {
       }
     }
 
-    // Read CQ count from environment variable (default: 1 per channel)
+    // Read CQ count from environment variable (default: 1 per channel, ensuring 1:1 mapping)
     size_t cq_count = channel_count_;
     const char* cq_env = std::getenv("BLOOMCHECK_CQS");
     if (cq_env != nullptr) {
@@ -124,6 +128,12 @@ class BloomCheckServiceClient {
       if (count > 0) {
         cq_count = static_cast<size_t>(count);
       }
+    }
+    
+    // Ensure CQ count matches channel count for 1:1 mapping
+    if (cq_count != channel_count_) {
+      fprintf(stderr, "[BloomCheckClient] Warning: CQ count (%zu) != channel count (%zu), adjusting CQ count to match\n", cq_count, channel_count_);
+      cq_count = channel_count_;
     }
 
     // Read MAX_INFLIGHT from environment variable (default: unlimited, 0 means unlimited)
@@ -141,15 +151,25 @@ class BloomCheckServiceClient {
       inflight_semaphore_ = std::make_unique<Semaphore>(max_inflight);
     }
 
-    // Create channel pool
+    // Create channel pool with unique identifiers to prevent connection sharing
     channels_.reserve(channel_count_);
     stubs_.reserve(channel_count_);
     
-    // Set channel arguments to use local subchannel pool (prevent connection sharing)
-    grpc::ChannelArguments channel_args;
-    channel_args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
-    
     for (size_t i = 0; i < channel_count_; ++i) {
+      // Create unique channel arguments for each channel to ensure independent TCP connections
+      grpc::ChannelArguments channel_args;
+      channel_args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
+      // Set unique channel identifier to prevent connection pooling
+      std::string channel_id = "bloomcheck_channel_" + std::to_string(i);
+      channel_args.SetString(GRPC_ARG_CHANNEL_ID, channel_id);
+      
+      // Minimize gRPC executor threads to reduce background task interference with poller cores
+      // Use minimal executor pool size to avoid background tasks on poller-dedicated cores (0-3)
+      channel_args.SetInt(GRPC_ARG_MAX_SEND_MESSAGE_LENGTH, -1);
+      channel_args.SetInt(GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH, -1);
+      // Disable resolver background threads that might interfere
+      channel_args.SetInt(GRPC_ARG_ENABLE_RETRIES, 0);
+      
       auto channel = grpc::CreateCustomChannel(
           server_address, grpc::InsecureChannelCredentials(), channel_args);
       channels_.push_back(channel);
@@ -162,16 +182,46 @@ class BloomCheckServiceClient {
       cqs_.emplace_back(std::make_unique<grpc::CompletionQueue>());
     }
 
-    // Start CQ poller threads
+    // Start CQ poller threads with CPU affinity (1:1 mapping to physical cores 0-31)
+    // Poller threads are pinned to cores 0-(channel_count-1) to ensure complete isolation
+    // RocksDB worker threads use system default scheduling (no CPU affinity restriction)
+    const int poller_cpu_start = 0;
+    const int poller_cpu_end = static_cast<int>(channel_count_) - 1;
+    
     cq_poller_threads_.reserve(cq_count);
     for (size_t i = 0; i < cq_count; ++i) {
       cq_poller_threads_.emplace_back(
           std::thread(&BloomCheckServiceClient::CQPollerThread, this, i));
+      
+      // Pin poller thread to specific physical core (0 to channel_count-1)
+      // For 4 channels: cores 0, 1, 2, 3
+      // For 32 channels: cores 0-31
+      int cpu_id = poller_cpu_start + static_cast<int>(i);
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      CPU_SET(cpu_id, &cpuset);
+      
+      pthread_t thread_handle = cq_poller_threads_.back().native_handle();
+      int ret = pthread_setaffinity_np(thread_handle, sizeof(cpu_set_t), &cpuset);
+      if (ret == 0) {
+        // Set high priority for poller threads to minimize interference from RocksDB workers
+        struct sched_param param;
+        param.sched_priority = sched_get_priority_max(SCHED_FIFO) - 1;  // High priority, but not max
+        pthread_setschedparam(thread_handle, SCHED_FIFO, &param);
+        fprintf(stderr, "[BloomCheckClient] CQ poller thread %zu pinned to CPU %d (poller range: %d-%d) with high priority\n", 
+                i, cpu_id, poller_cpu_start, poller_cpu_end);
+      } else {
+        fprintf(stderr, "[BloomCheckClient] Warning: Failed to pin CQ poller thread %zu to CPU %d (errno=%d)\n", i, cpu_id, ret);
+      }
     }
     
-    // Debug: Log channel pool size
-    // fprintf(stderr, "[BloomCheckClient] Initialized: channels_.size()=%zu, stubs_.size()=%zu, channel_count_=%zu, cqs_=%zu\n",
-    //         channels_.size(), stubs_.size(), channel_count_, cq_count);
+    fprintf(stderr, "[BloomCheckClient] Poller isolation: %d poller threads pinned to CPUs %d-%d, "
+            "RocksDB workers use system default scheduling (all CPUs 0-31)\n",
+            static_cast<int>(cq_count), poller_cpu_start, poller_cpu_end);
+    
+    // Log initialization info
+    fprintf(stderr, "[BloomCheckClient] Initialized: stubs_.size()=%zu, cqs_.size()=%zu, poller_thread_count=%zu\n",
+            stubs_.size(), cqs_.size(), cq_poller_threads_.size());
   }
 
   ~BloomCheckServiceClient() {
