@@ -2872,7 +2872,7 @@ class Benchmark {
   bool use_blob_db_;    // Stacked BlobDB
   bool read_operands_;  // read via GetMergeOperands()
   std::vector<std::string> keys_;
-  std::unique_ptr<BloomCheckServiceClient> bloomcheck_client_;  // BloomCheck gRPC client
+  // BloomCheck client is now managed by DBImpl, not by db_bench_tool
 
   class ErrorHandlerListener : public EventListener {
    public:
@@ -3607,28 +3607,13 @@ class Benchmark {
       read_options_.auto_refresh_iterator_with_snapshot =
           FLAGS_auto_refresh_iterator_with_snapshot;
 
-      // Initialize BloomCheck client if BLOOMCHECK_SERVER is set
+      // BloomCheck client is now managed by DBImpl internally.
+      // If BLOOMCHECK_SERVER is set, DBImpl will automatically inject the client
+      // into ReadOptions during Get/MultiGet/NewIterator operations.
       const char* bloomcheck_server = std::getenv("BLOOMCHECK_SERVER");
       if (bloomcheck_server != nullptr && strlen(bloomcheck_server) > 0) {
-        try {
-          bloomcheck_client_ = std::make_unique<BloomCheckServiceClient>(bloomcheck_server);
-          read_options_.bloomcheck_client = bloomcheck_client_.get();
-          read_options_.read_tier = kReadAllTier;  // Enable BloomCheck offloading
-          fprintf(stdout, "BloomCheck client initialized: server=%s, channels=%zu\n",
-                  bloomcheck_server, bloomcheck_client_->GetChannelCount());
-          
-          // Warm-up: Send one RPC through each channel to establish connections
-          // fprintf(stdout, "BloomCheck client: Starting channel warm-up...\n");
-          bloomcheck_client_->WarmupChannels();
-          // fprintf(stdout, "BloomCheck client: Channel warm-up completed. Check connections with: ss -tanp | grep :50051 | grep ESTAB | wc -l\n");
-        } catch (const std::exception& e) {
-          fprintf(stderr, "Failed to initialize BloomCheck client: %s\n", e.what());
-          bloomcheck_client_.reset();
-          read_options_.bloomcheck_client = nullptr;
-        }
-      } else {
-        bloomcheck_client_.reset();
-        read_options_.bloomcheck_client = nullptr;
+        fprintf(stdout, "BloomCheck server configured: %s (client managed by DBImpl)\n",
+                bloomcheck_server);
       }
 
       void (Benchmark::*method)(ThreadState*) = nullptr;

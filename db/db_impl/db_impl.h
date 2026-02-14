@@ -1392,6 +1392,13 @@ class DBImpl : public DB {
   std::string bloomcheck_server_address_;  // 예: "10.1.1.1:50051"
   std::atomic<bool> bloomcheck_enabled_{false};
 
+  // Helper function to automatically inject BloomCheck client into ReadOptions
+  // if enabled and not already set by the caller.
+  // Returns a copy of ReadOptions with bloomcheck_client injected if needed,
+  // otherwise returns the original ReadOptions (by value, but optimized for
+  // hot path: only copies when injection is needed).
+  ReadOptions MaybeInjectBloomCheck(const ReadOptions& options) const;
+
   // constant false canceled flag, used when the compaction is not manual
   const std::atomic<bool> kManualCompactionCanceledFalse_{false};
 

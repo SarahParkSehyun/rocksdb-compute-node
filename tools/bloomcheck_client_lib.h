@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,11 @@
 #include <sched.h>
 #include <string>
 #include <thread>
+#include <unistd.h>  // for sysconf, getpid
+#include <sys/time.h>  // for gettimeofday
+#include <sys/syscall.h>  // for SYS_gettid
+#include <execinfo.h>  // for backtrace
+#include <cxxabi.h>  // for __cxa_demangle
 #include <vector>
 #include "bloomcheck.grpc.pb.h"
 
@@ -22,11 +28,35 @@ namespace ROCKSDB_NAMESPACE {
 // Simple semaphore implementation for inflight RPC limiting
 class Semaphore {
  public:
-  explicit Semaphore(size_t max_count) : max_count_(max_count), current_count_(max_count) {}
+  explicit Semaphore(size_t max_count) 
+      : max_count_(max_count), current_count_(max_count),
+        wait_cnt_(0), wait_us_total_(0), max_wait_us_(0) {}
 
   void Acquire() {
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [this] { return current_count_ > 0; });
+    
+    // Check if we need to wait (current_count_ == 0)
+    if (current_count_ == 0) {
+      // Measure wait time
+      struct timeval start_tv, end_tv;
+      gettimeofday(&start_tv, nullptr);
+      
+      // Wait for available slot
+      cv_.wait(lock, [this] { return current_count_ > 0; });
+      
+      // Calculate wait time
+      gettimeofday(&end_tv, nullptr);
+      uint64_t wait_us = (end_tv.tv_sec - start_tv.tv_sec) * 1000000ULL + 
+                         (end_tv.tv_usec - start_tv.tv_usec);
+      
+      // Update statistics
+      wait_cnt_++;
+      wait_us_total_ += wait_us;
+      if (wait_us > max_wait_us_) {
+        max_wait_us_ = wait_us;
+      }
+    }
+    
     --current_count_;
   }
 
@@ -42,11 +72,24 @@ class Semaphore {
     return current_count_;
   }
 
+  // Get statistics (thread-safe)
+  void GetStats(uint64_t& wait_cnt, uint64_t& wait_us_total, uint64_t& max_wait_us) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    wait_cnt = wait_cnt_;
+    wait_us_total = wait_us_total_;
+    max_wait_us = max_wait_us_;
+  }
+
  private:
   size_t max_count_;
   size_t current_count_;
   mutable std::mutex mutex_;  // mutable to allow locking in const methods
   std::condition_variable cv_;
+  
+  // Statistics for monitoring inflight limiting effectiveness
+  uint64_t wait_cnt_;         // Number of times Acquire() had to wait
+  uint64_t wait_us_total_;    // Total wait time in microseconds
+  uint64_t max_wait_us_;      // Maximum single wait time in microseconds
 };
 
 // RAII wrapper for semaphore acquire/release
@@ -72,14 +115,14 @@ class SemaphoreGuard {
   Semaphore* semaphore_;
 };
 
-// Per-RPC state object for async BloomCheck calls
-class AsyncBloomCheckCall {
+// Base class for async RPC calls (allows CQ poller to handle different RPC types)
+class AsyncRPCCallBase {
  public:
-  AsyncBloomCheckCall() : ok_(false), completed_(false) {}
+  AsyncRPCCallBase() : ok_(false), completed_(false) {}
 
   // Synchronization
   void Wait() {
-    // No spin-wait: directly use condition variable
+    // Direct condition variable wait (no spin-wait)
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [this] { return completed_.load(std::memory_order_acquire); });
   }
@@ -92,25 +135,76 @@ class AsyncBloomCheckCall {
     cv_.notify_one();
   }
 
+  bool ok_;
+  grpc::Status status_;
+  size_t channel_idx_ = 0;
+
+ protected:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::atomic<bool> completed_;  // Atomic for lock-free spin-wait check
+};
+
+// Per-RPC state object for async BloomCheck calls
+class AsyncBloomCheckCall : public AsyncRPCCallBase {
+ public:
+  AsyncBloomCheckCall() : AsyncRPCCallBase() {}
+
   // RPC state
   grpc::ClientContext context_;
   bloomcheck::BatchRequest request_;
   bloomcheck::BatchResponse response_;
-  grpc::Status status_;
-  size_t channel_idx_ = 0;
-  bool ok_;
+};
 
- private:
-  std::mutex mutex_;
-  std::condition_variable cv_;
-  std::atomic<bool> completed_;  // Atomic for lock-free spin-wait check
+// Per-RPC state object for async Noop calls
+class AsyncNoopCall : public AsyncRPCCallBase {
+ public:
+  AsyncNoopCall() : AsyncRPCCallBase() {}
+
+  // RPC state
+  grpc::ClientContext context_;
+  bloomcheck::NoopRequest request_;
+  bloomcheck::NoopResponse response_;
 };
 
 // BloomCheckServiceClient provides a C++ client interface for the BloomCheck gRPC service
 class BloomCheckServiceClient {
  public:
   explicit BloomCheckServiceClient(const std::string& server_address)
-      : channel_count_(32), shutdown_(false) {  // Default: 32 channels for 32 physical cores
+      : channel_count_(32), shutdown_(false), stats_thread_started_(false) {  // Default: 32 channels for 32 physical cores
+    
+    // Log constructor invocation to track duplicate instances
+    // IMPORTANT: This log MUST be at the very beginning of constructor body
+    pid_t ctor_pid = getpid();
+    void* ctor_this_ptr = static_cast<void*>(this);
+    
+    // Print stack trace to identify caller
+    void* callstack[20];
+    int frames = backtrace(callstack, 20);
+    char** symbols = backtrace_symbols(callstack, frames);
+    fprintf(stderr, "[BloomCheckClientCtor] ENTRY pid=%d this=%p channels=%zu server_address=%s\n",
+            ctor_pid, ctor_this_ptr, channel_count_, server_address.c_str());
+    fprintf(stderr, "[BloomCheckClientCtor] Stack trace (%d frames):\n", frames);
+    for (int i = 1; i < frames && i < 8; ++i) {  // Skip frame 0 (this constructor), show top 7 frames
+      if (symbols[i]) {
+        fprintf(stderr, "  [%d] %s\n", i, symbols[i]);
+      }
+    }
+    free(symbols);
+    fflush(stderr);  // Force immediate output
+    
+    // Set gRPC polling strategy environment variable for pollset isolation
+    // Use epoll1 (simple epoll) or poll instead of epollex (multi-queue shared model)
+    // This helps ensure each channel uses independent pollset
+    const char* poll_strategy = std::getenv("GRPC_POLL_STRATEGY");
+    if (poll_strategy == nullptr) {
+      // Default to epoll1 for better isolation (if not already set)
+      setenv("GRPC_POLL_STRATEGY", "epoll1", 0);  // 0 = don't overwrite if exists
+      fprintf(stderr, "[BloomCheckClient] Set GRPC_POLL_STRATEGY=epoll1 for pollset isolation\n");
+    } else {
+      fprintf(stderr, "[BloomCheckClient] Using existing GRPC_POLL_STRATEGY=%s\n", poll_strategy);
+    }
+    
     // Read channel count from environment variable (default: 32)
     const char* env = std::getenv("BLOOMCHECK_CHANNELS");
     if (env != nullptr) {
@@ -147,8 +241,15 @@ class BloomCheckServiceClient {
     }
     
     // Create semaphore if inflight limiting is enabled
+    // NOTE: This is a GLOBAL semaphore shared across all channels
+    // All channels compete for the same inflight limit (not per-channel)
+    // This is appropriate for "total concurrent RPC limit" goal
     if (max_inflight > 0) {
       inflight_semaphore_ = std::make_unique<Semaphore>(max_inflight);
+      fprintf(stderr, "[BloomCheckClient] Inflight limiting enabled: max_inflight=%zu (GLOBAL semaphore, shared across all %zu channels)\n", 
+              max_inflight, channel_count_);
+    } else {
+      fprintf(stderr, "[BloomCheckClient] Inflight limiting disabled (unlimited)\n");
     }
 
     // Create channel pool with unique identifiers to prevent connection sharing
@@ -157,18 +258,40 @@ class BloomCheckServiceClient {
     
     for (size_t i = 0; i < channel_count_; ++i) {
       // Create unique channel arguments for each channel to ensure independent TCP connections
+      // and complete pollset isolation to eliminate epoll contention
       grpc::ChannelArguments channel_args;
+      
+      // CRITICAL: Force each channel to use independent subchannel pool
+      // This prevents connection sharing and helps pollset separation
       channel_args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
+      
       // Set unique channel identifier to prevent connection pooling
+      // Each channel gets a unique ID to ensure OS-level socket/epoll separation
       std::string channel_id = "bloomcheck_channel_" + std::to_string(i);
       channel_args.SetString(GRPC_ARG_CHANNEL_ID, channel_id);
       
+      // Optimization target: latency (minimizes batching and encourages immediate processing)
+      // This helps ensure each channel's pollset is processed independently
+      // Note: GRPC_ARG_OPTIMIZATION_TARGET may not be available in all gRPC versions
+      // If compilation fails, comment out the following line
+      // channel_args.SetInt(GRPC_ARG_OPTIMIZATION_TARGET, 0);  // 0 = latency optimization
+      
       // Minimize gRPC executor threads to reduce background task interference with poller cores
-      // Use minimal executor pool size to avoid background tasks on poller-dedicated cores (0-3)
+      // Use minimal executor pool size to avoid background tasks on poller-dedicated cores
       channel_args.SetInt(GRPC_ARG_MAX_SEND_MESSAGE_LENGTH, -1);
       channel_args.SetInt(GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH, -1);
+      
       // Disable resolver background threads that might interfere
       channel_args.SetInt(GRPC_ARG_ENABLE_RETRIES, 0);
+      
+      // Minimize HTTP/2 pings to reduce shared pollset activity
+      channel_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+      channel_args.SetInt(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 0);
+      
+      // Keepalive settings to minimize background polling activity
+      channel_args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 30000);  // 30 seconds
+      channel_args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+      channel_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 0);
       
       auto channel = grpc::CreateCustomChannel(
           server_address, grpc::InsecureChannelCredentials(), channel_args);
@@ -182,21 +305,43 @@ class BloomCheckServiceClient {
       cqs_.emplace_back(std::make_unique<grpc::CompletionQueue>());
     }
 
-    // Start CQ poller threads with CPU affinity (1:1 mapping to physical cores 0-31)
-    // Poller threads are pinned to cores 0-(channel_count-1) to ensure complete isolation
-    // RocksDB worker threads use system default scheduling (no CPU affinity restriction)
-    const int poller_cpu_start = 0;
-    const int poller_cpu_end = static_cast<int>(channel_count_) - 1;
+    // Start CQ poller threads with CPU affinity
+    // Poller threads are pinned to top cores to avoid mlx5_async hot cores (e.g., CPU24)
+    // ch=4: cores [25, 27, 29, 31]
+    // ch=8: cores [17, 19, 21, 23, 25, 27, 29, 31]
+    std::vector<int> poller_cores;
+    if (channel_count_ <= 4) {
+      // For 4 channels: use top 4 odd cores (avoid CPU24 which is mlx5_async hot)
+      poller_cores = {25, 27, 29, 31};
+    } else if (channel_count_ <= 8) {
+      // For 8 channels: use top 8 odd cores
+      poller_cores = {17, 19, 21, 23, 25, 27, 29, 31};
+    } else {
+      // For more than 8 channels: extend downward (can be adjusted based on softirq results)
+      poller_cores = {9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31};
+      // If still not enough, add more cores (but avoid CPU24)
+      while (poller_cores.size() < channel_count_) {
+        for (int cpu = 7; cpu >= 1 && poller_cores.size() < channel_count_; cpu -= 2) {
+          if (cpu != 24) {  // Avoid CPU24
+            poller_cores.push_back(cpu);
+          }
+        }
+      }
+    }
+    
+    // Ensure we don't exceed available cores
+    if (channel_count_ > poller_cores.size()) {
+      fprintf(stderr, "[BloomCheckClient] Warning: channel_count (%zu) > available poller cores (%zu), "
+              "will use round-robin mapping\n", channel_count_, poller_cores.size());
+    }
     
     cq_poller_threads_.reserve(cq_count);
     for (size_t i = 0; i < cq_count; ++i) {
       cq_poller_threads_.emplace_back(
           std::thread(&BloomCheckServiceClient::CQPollerThread, this, i));
       
-      // Pin poller thread to specific physical core (0 to channel_count-1)
-      // For 4 channels: cores 0, 1, 2, 3
-      // For 32 channels: cores 0-31
-      int cpu_id = poller_cpu_start + static_cast<int>(i);
+      // Select poller core from predefined list (top cores, avoiding CPU24)
+      int cpu_id = poller_cores[i % poller_cores.size()];
       cpu_set_t cpuset;
       CPU_ZERO(&cpuset);
       CPU_SET(cpu_id, &cpuset);
@@ -204,32 +349,128 @@ class BloomCheckServiceClient {
       pthread_t thread_handle = cq_poller_threads_.back().native_handle();
       int ret = pthread_setaffinity_np(thread_handle, sizeof(cpu_set_t), &cpuset);
       if (ret == 0) {
-        // Set high priority for poller threads to minimize interference from RocksDB workers
+        // Set SCHED_FIFO with low priority (10-20 range)
+        // This gives poller threads real-time scheduling but with low priority to avoid starvation
         struct sched_param param;
-        param.sched_priority = sched_get_priority_max(SCHED_FIFO) - 1;  // High priority, but not max
-        pthread_setschedparam(thread_handle, SCHED_FIFO, &param);
-        fprintf(stderr, "[BloomCheckClient] CQ poller thread %zu pinned to CPU %d (poller range: %d-%d) with high priority\n", 
-                i, cpu_id, poller_cpu_start, poller_cpu_end);
+        param.sched_priority = 10;  // Low priority in SCHED_FIFO (range: 1-99, typically max is 99)
+        int sched_ret = pthread_setschedparam(thread_handle, SCHED_FIFO, &param);
+        if (sched_ret == 0) {
+          fprintf(stderr, "[BloomCheckClient] CQ poller thread %zu pinned to CPU %d with SCHED_FIFO priority %d\n", 
+                  i, cpu_id, param.sched_priority);
+        } else {
+          fprintf(stderr, "[BloomCheckClient] CQ poller thread %zu pinned to CPU %d with default priority (SCHED_FIFO failed: %d)\n", 
+                  i, cpu_id, sched_ret);
+        }
       } else {
-        fprintf(stderr, "[BloomCheckClient] Warning: Failed to pin CQ poller thread %zu to CPU %d (errno=%d)\n", i, cpu_id, ret);
+        fprintf(stderr, "[BloomCheckClient] Warning: Failed to pin CQ poller thread %zu to CPU %d (errno=%d)\n", 
+                i, cpu_id, ret);
       }
     }
     
-    fprintf(stderr, "[BloomCheckClient] Poller isolation: %d poller threads pinned to CPUs %d-%d, "
-            "RocksDB workers use system default scheduling (all CPUs 0-31)\n",
-            static_cast<int>(cq_count), poller_cpu_start, poller_cpu_end);
+    // Log poller core assignment summary
+    fprintf(stderr, "[BloomCheckClient] Poller isolation: %d poller threads pinned to top cores with SCHED_FIFO priority 10, "
+            "RocksDB workers use system default scheduling\n",
+            static_cast<int>(cq_count));
     
     // Log initialization info
     fprintf(stderr, "[BloomCheckClient] Initialized: stubs_.size()=%zu, cqs_.size()=%zu, poller_thread_count=%zu\n",
             stubs_.size(), cqs_.size(), cq_poller_threads_.size());
+    
+    // Initialize inflight statistics
+    inflight_now_.store(0, std::memory_order_relaxed);
+    inflight_max_.store(0, std::memory_order_relaxed);
+    inflight_sum_.store(0, std::memory_order_relaxed);
+    inflight_samples_.store(0, std::memory_order_relaxed);
+    rpc_started_total_.store(0, std::memory_order_relaxed);
+    rpc_completed_total_.store(0, std::memory_order_relaxed);
+    
+    // Initialize per-channel inflight arrays
+    // Note: std::atomic is not copyable, so we use unique_ptr
+    inflight_per_channel_.clear();
+    inflight_per_channel_max_.clear();
+    for (size_t i = 0; i < channel_count_; ++i) {
+      inflight_per_channel_.emplace_back(std::make_unique<std::atomic<int64_t>>(0));
+      inflight_per_channel_max_.emplace_back(std::make_unique<std::atomic<int64_t>>(0));
+    }
+    
+    // Start stats thread if enabled
+    const char* stats_env = std::getenv("BLOOMCHECK_CLIENT_STATS");
+    if (stats_env != nullptr && std::atoi(stats_env) != 0) {
+      // Use atomic flag to prevent duplicate stats thread starts
+      bool expected = false;
+      if (!stats_thread_started_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        fprintf(stderr, "[BloomCheckClient] WARNING: Stats thread already started! Not starting duplicate. [this=%p]\n",
+                static_cast<void*>(this));
+      } else {
+        // Check if stats thread is already running (guard against duplicate starts)
+        if (stats_thread_.joinable()) {
+          fprintf(stderr, "[BloomCheckClient] WARNING: Stats thread already running! Not starting duplicate. [this=%p]\n",
+                  static_cast<void*>(this));
+          stats_thread_started_.store(false, std::memory_order_release);  // Reset flag
+        } else {
+          pid_t pid = getpid();
+          pid_t tid = syscall(SYS_gettid);
+          void* this_ptr = static_cast<void*>(this);
+          stats_thread_ = std::thread(&BloomCheckServiceClient::StatsThread, this);
+          fprintf(stderr, "[BloomCheckClient] Stats thread enabled (BLOOMCHECK_CLIENT_STATS=1) [pid=%d][tid=%d][this=%p]\n",
+                  pid, tid, this_ptr);
+        }
+      }
+    }
   }
 
   ~BloomCheckServiceClient() {
-    // Shutdown all CQs
+    // Shutdown stats thread
     {
       std::lock_guard<std::mutex> lock(shutdown_mutex_);
       shutdown_ = true;
     }
+    if (stats_thread_.joinable()) {
+      stats_thread_.join();
+    }
+    
+    // Print final inflight statistics before shutdown
+    int64_t final_inflight = inflight_now_.load(std::memory_order_relaxed);
+    int64_t final_max = inflight_max_.load(std::memory_order_relaxed);
+    uint64_t total_started = rpc_started_total_.load(std::memory_order_relaxed);
+    uint64_t total_completed = rpc_completed_total_.load(std::memory_order_relaxed);
+    
+    fprintf(stderr, "[BloomCheckClient] Final statistics: inflight_now=%lld inflight_max=%lld "
+            "rpc_started_total=%llu rpc_completed_total=%llu\n",
+            (long long)final_inflight, (long long)final_max,
+            (unsigned long long)total_started, (unsigned long long)total_completed);
+    
+    // Print per-channel max inflight
+    fprintf(stderr, "[BloomCheckClient] Per-channel max inflight: [");
+    for (size_t i = 0; i < std::min(channel_count_, static_cast<size_t>(10)); ++i) {
+      int64_t ch_max = inflight_per_channel_max_[i]->load(std::memory_order_relaxed);
+      if (i > 0) fprintf(stderr, ",");
+      fprintf(stderr, "%lld", (long long)ch_max);
+    }
+    if (channel_count_ > 10) {
+      fprintf(stderr, ",...(%zu total)", channel_count_);
+    }
+    fprintf(stderr, "]\n");
+    
+    // Interpretation hint if inflight_max is low relative to typical thread counts
+    if (final_max < 10) {
+      fprintf(stderr, "[BloomCheckClient] NOTE: inflight_max=%lld is low. "
+              "If RocksDB uses many worker threads (e.g., threads=128/256), "
+              "this suggests RPCs may be completing too quickly or there's a bottleneck preventing concurrent RPCs.\n",
+              (long long)final_max);
+    }
+    
+    if (inflight_semaphore_) {
+      uint64_t wait_cnt = 0, wait_us_total = 0, max_wait_us = 0;
+      inflight_semaphore_->GetStats(wait_cnt, wait_us_total, max_wait_us);
+      fprintf(stderr, "[BloomCheckClient] Inflight semaphore statistics: wait_cnt=%llu, wait_us_total=%llu, max_wait_us=%llu\n",
+              (unsigned long long)wait_cnt, (unsigned long long)wait_us_total, (unsigned long long)max_wait_us);
+      if (wait_cnt == 0) {
+        fprintf(stderr, "[BloomCheckClient] WARNING: wait_cnt=0 means inflight limiting may not be effective\n");
+      }
+    }
+    
+    // Shutdown all CQs
     for (auto& cq : cqs_) {
       cq->Shutdown();
     }
@@ -324,9 +565,24 @@ class BloomCheckServiceClient {
     void* tag = call.get();
     rpc->Finish(&call->response_, &call->status_, tag);
 
+    // Increment inflight counters AFTER rpc->Finish() (RPC is now outstanding)
+    // Use RAII guard to ensure decrement even on exception/early return
+    InflightGuard inflight_guard(
+        &inflight_now_,
+        inflight_per_channel_[stub_idx].get(),
+        &inflight_max_,
+        inflight_per_channel_max_[stub_idx].get());
+    
+    // Increment started counter
+    rpc_started_total_.fetch_add(1, std::memory_order_relaxed);
+
     // Keep rpc alive until Wait() completes (rpc destructor is safe after Finish)
     // Block on condition_variable (NOT on gRPC polling)
     call->Wait();
+
+    // RPC completed - inflight_guard destructor will decrement counters
+    // Increment completed counter
+    rpc_completed_total_.fetch_add(1, std::memory_order_relaxed);
 
     // Copy results
     // Note: SemaphoreGuard destructor will release the semaphore slot here
@@ -334,7 +590,7 @@ class BloomCheckServiceClient {
     return call->status_.ok();
   }
 
-  // Noop RPC for latency measurement (sync unary)
+  // Noop RPC for latency measurement (sync unary) - deprecated, use AsyncNoop instead
   bool Noop(size_t* channel_idx = nullptr) {
     size_t idx = GetChannelIndex();
     if (channel_idx != nullptr) {
@@ -354,6 +610,42 @@ class BloomCheckServiceClient {
     return status.ok();
   }
 
+  // Async version: Noop RPC for latency measurement
+  // Blocks the calling thread until RPC completes, but does NOT participate in pollset_work
+  // Respects MAX_INFLIGHT limit if set via BLOOMCHECK_MAX_INFLIGHT environment variable
+  bool AsyncNoop(size_t* channel_idx = nullptr) {
+    // Acquire semaphore slot if inflight limiting is enabled
+    // This will block if MAX_INFLIGHT limit is reached
+    SemaphoreGuard guard(inflight_semaphore_.get());
+
+    // Select channel and CQ
+    size_t stub_idx = GetChannelIndex();
+    size_t cq_idx = stub_idx % cqs_.size();
+    
+    if (channel_idx != nullptr) {
+      *channel_idx = stub_idx;
+    }
+
+    // Create per-RPC state object (must outlive the RPC)
+    auto call = std::make_shared<AsyncNoopCall>();
+    call->channel_idx_ = stub_idx;
+
+    // Start async RPC
+    std::unique_ptr<grpc::ClientAsyncResponseReader<bloomcheck::NoopResponse>> rpc(
+        stubs_[stub_idx]->AsyncNoop(&call->context_, call->request_, cqs_[cq_idx].get()));
+
+    // Finish is an async operation - tag must remain valid until CQ poller processes it
+    void* tag = call.get();
+    rpc->Finish(&call->response_, &call->status_, tag);
+
+    // Keep rpc alive until Wait() completes (rpc destructor is safe after Finish)
+    // Block on condition_variable (NOT on gRPC polling)
+    call->Wait();
+
+    // Note: SemaphoreGuard destructor will release the semaphore slot here
+    return call->status_.ok();
+  }
+
   // Warm-up: Send one RPC through each channel to establish connections
   void WarmupChannels() {
     // fprintf(stderr, "[BloomCheckClient] Warmup: Starting warm-up for %zu channels\n", channel_count_);
@@ -368,6 +660,160 @@ class BloomCheckServiceClient {
     // fprintf(stderr, "[BloomCheckClient] Warmup: Completed warm-up for %zu channels\n", channel_count_);
   }
 
+ private:
+  // RAII guard for inflight counting (ensures decrement even on exception/early return)
+  class InflightGuard {
+   public:
+    InflightGuard(std::atomic<int64_t>* total_inflight,
+                  std::atomic<int64_t>* channel_inflight,
+                  std::atomic<int64_t>* total_max,
+                  std::atomic<int64_t>* channel_max)
+        : total_inflight_(total_inflight),
+          channel_inflight_(channel_inflight),
+          total_max_(total_max),
+          channel_max_(channel_max),
+          active_(false) {
+      if (total_inflight_ && channel_inflight_) {
+        // Increment counters
+        int64_t new_total = total_inflight_->fetch_add(1, std::memory_order_relaxed) + 1;
+        int64_t new_channel = channel_inflight_->fetch_add(1, std::memory_order_relaxed) + 1;
+        active_ = true;
+        
+        // Update high-watermarks
+        if (total_max_) {
+          int64_t current_max = total_max_->load(std::memory_order_relaxed);
+          while (new_total > current_max &&
+                 !total_max_->compare_exchange_weak(current_max, new_total,
+                                                    std::memory_order_relaxed,
+                                                    std::memory_order_relaxed)) {
+            // Retry loop
+          }
+        }
+        
+        if (channel_max_) {
+          int64_t current_max = channel_max_->load(std::memory_order_relaxed);
+          while (new_channel > current_max &&
+                 !channel_max_->compare_exchange_weak(current_max, new_channel,
+                                                      std::memory_order_relaxed,
+                                                      std::memory_order_relaxed)) {
+            // Retry loop
+          }
+        }
+      }
+    }
+    
+    ~InflightGuard() {
+      if (active_ && total_inflight_ && channel_inflight_) {
+        total_inflight_->fetch_sub(1, std::memory_order_relaxed);
+        channel_inflight_->fetch_sub(1, std::memory_order_relaxed);
+      }
+    }
+    
+    // Non-copyable
+    InflightGuard(const InflightGuard&) = delete;
+    InflightGuard& operator=(const InflightGuard&) = delete;
+    
+   private:
+    std::atomic<int64_t>* total_inflight_;
+    std::atomic<int64_t>* channel_inflight_;
+    std::atomic<int64_t>* total_max_;
+    std::atomic<int64_t>* channel_max_;
+    bool active_;
+  };
+  
+  // Stats thread function (prints statistics every second)
+  void StatsThread() {
+    pthread_setname_np(pthread_self(), "bloom_stats");
+    
+    // Local sampling counters (avoid race conditions with reset)
+    int64_t local_inflight_sum = 0;
+    uint64_t local_sample_count = 0;
+    
+    while (true) {
+      // Check shutdown flag
+      {
+        std::lock_guard<std::mutex> lock(shutdown_mutex_);
+        if (shutdown_) {
+          break;
+        }
+      }
+      
+      // Read baseline values BEFORE sampling interval
+      uint64_t baseline_started = rpc_started_total_.load(std::memory_order_relaxed);
+      uint64_t baseline_completed = rpc_completed_total_.load(std::memory_order_relaxed);
+      
+      // Sample inflight multiple times per second for accurate average
+      // Sample every 10ms (100 samples per second)
+      const int samples_per_second = 100;
+      const auto sample_interval = std::chrono::milliseconds(10);
+      
+      // Reset local counters at start of each interval
+      local_inflight_sum = 0;
+      local_sample_count = 0;
+      
+      for (int i = 0; i < samples_per_second; ++i) {
+        // Check shutdown flag before each sample
+        {
+          std::lock_guard<std::mutex> lock(shutdown_mutex_);
+          if (shutdown_) {
+            return;
+          }
+        }
+        
+        // Sample current inflight (accumulate locally)
+        int64_t current = inflight_now_.load(std::memory_order_relaxed);
+        local_inflight_sum += current;
+        local_sample_count++;
+        
+        // Sleep for sample interval
+        std::this_thread::sleep_for(sample_interval);
+      }
+      
+      // Read current values AFTER sampling interval
+      uint64_t current_started = rpc_started_total_.load(std::memory_order_relaxed);
+      uint64_t current_completed = rpc_completed_total_.load(std::memory_order_relaxed);
+      int64_t current_inflight = inflight_now_.load(std::memory_order_relaxed);
+      int64_t current_max = inflight_max_.load(std::memory_order_relaxed);
+      
+      // Calculate deltas using baseline (from start of interval)
+      uint64_t started_per_sec = current_started - baseline_started;
+      uint64_t completed_per_sec = current_completed - baseline_completed;
+      
+      // Calculate average from local samples
+      double inflight_avg = 0.0;
+      if (local_sample_count > 0) {
+        inflight_avg = static_cast<double>(local_inflight_sum) / static_cast<double>(local_sample_count);
+      }
+      
+      // Get process ID, thread ID, and object pointer for debugging
+      pid_t pid = getpid();
+      pid_t tid = syscall(SYS_gettid);
+      void* this_ptr = static_cast<void*>(this);
+      
+      // Print statistics with [pid][tid][this] for debugging duplicate instances/threads
+      fprintf(stderr, "[ClientStats][pid=%d][tid=%d][this=%p] started/s=%llu completed/s=%llu inflight_now=%lld inflight_avg=%.2f inflight_max=%lld",
+              pid, tid, this_ptr,
+              (unsigned long long)started_per_sec,
+              (unsigned long long)completed_per_sec,
+              (long long)current_inflight,
+              inflight_avg,
+              (long long)current_max);
+      
+      // Print per-channel inflight (show top channels if many)
+      fprintf(stderr, " inflight_per_channel=[");
+      size_t channels_to_show = std::min(channel_count_, static_cast<size_t>(10));
+      for (size_t i = 0; i < channels_to_show; ++i) {
+        int64_t ch_inflight = inflight_per_channel_[i]->load(std::memory_order_relaxed);
+        if (i > 0) fprintf(stderr, ",");
+        fprintf(stderr, "%lld", (long long)ch_inflight);
+      }
+      if (channel_count_ > channels_to_show) {
+        fprintf(stderr, ",...(%zu total)", channel_count_);
+      }
+      fprintf(stderr, "]\n");
+    }
+  }
+  
  private:
   // CompletionQueue poller thread (runs cq->Next() to handle async RPC completions)
   void CQPollerThread(size_t cq_idx) {
@@ -392,8 +838,8 @@ class BloomCheckServiceClient {
         break;
       }
 
-      // Handle completed RPC
-      AsyncBloomCheckCall* call = static_cast<AsyncBloomCheckCall*>(tag);
+      // Handle completed RPC (works for both AsyncBloomCheckCall and AsyncNoopCall)
+      AsyncRPCCallBase* call = static_cast<AsyncRPCCallBase*>(tag);
       call->ok_ = ok;
       call->Signal();  // Wake up waiting Get() thread
     }
@@ -407,6 +853,28 @@ class BloomCheckServiceClient {
   std::mutex shutdown_mutex_;
   bool shutdown_;
   std::unique_ptr<Semaphore> inflight_semaphore_;  // For limiting concurrent inflight RPCs
+  
+  // Inflight RPC statistics
+  std::atomic<int64_t> inflight_now_;              // Current outstanding RPC count
+  std::atomic<int64_t> inflight_max_;              // High-watermark of inflight
+  std::atomic<int64_t> inflight_sum_;              // Sum of inflight samples (for average)
+  std::atomic<uint64_t> inflight_samples_;         // Number of inflight samples
+  std::vector<std::unique_ptr<std::atomic<int64_t>>> inflight_per_channel_;        // Per-channel outstanding RPC count
+  std::vector<std::unique_ptr<std::atomic<int64_t>>> inflight_per_channel_max_;    // Per-channel high-watermark
+  
+  // RPC throughput statistics
+  std::atomic<uint64_t> rpc_started_total_;         // Total RPCs started
+  std::atomic<uint64_t> rpc_completed_total_;       // Total RPCs completed
+  
+  // Stats thread
+  std::thread stats_thread_;                        // Statistics reporting thread
+  std::atomic<bool> stats_thread_started_;          // Flag to prevent duplicate stats thread starts
+  
+  // Disable copy and move constructors/operators to prevent duplicate instances
+  BloomCheckServiceClient(const BloomCheckServiceClient&) = delete;
+  BloomCheckServiceClient& operator=(const BloomCheckServiceClient&) = delete;
+  BloomCheckServiceClient(BloomCheckServiceClient&&) = delete;
+  BloomCheckServiceClient& operator=(BloomCheckServiceClient&&) = delete;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

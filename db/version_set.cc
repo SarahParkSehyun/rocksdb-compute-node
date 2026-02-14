@@ -2822,7 +2822,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     if (noop_only_mode) {
       uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
       size_t channel_idx = 0;
-      bool noop_ok = client->Noop(&channel_idx);
+      bool noop_ok = client->AsyncNoop(&channel_idx);  // Use async version to avoid gRPC mutex contention
       uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
       size_t channel_count = client->GetChannelCount();
 
@@ -2923,7 +2923,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           }
         }
       }
-
+      
       bloomcheck_ok = check_ok;
     }
     }  // else (normal bloomcheck mode)

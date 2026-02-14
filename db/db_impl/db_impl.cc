@@ -11,6 +11,7 @@
 #include "tools/bloomcheck_client_lib.h"
 #include <cstdint>
 #include <cstdlib>
+#include <unistd.h>  // for getpid
 #ifdef OS_SOLARIS
 #include <alloca.h>
 #endif
@@ -280,23 +281,38 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
     wbm_stall_.reset(new WBMStallInterface());
   }
 
+  // Log DBImpl constructor invocation to track duplicate instances
+  pid_t dbimpl_pid = getpid();
+  void* dbimpl_this_ptr = static_cast<void*>(this);
+  fprintf(stderr, "[DBImplCtor] pid=%d this=%p dbname=%s read_only=%d\n",
+          dbimpl_pid, dbimpl_this_ptr, dbname.c_str(), read_only ? 1 : 0);
+
   // BloomCheck 서비스 초기화 (환경 변수에서 읽기)
   // 성능을 위해 lazy initialization으로 변경 가능
   const char* bloomcheck_server = std::getenv("BLOOMCHECK_SERVER");
+  fprintf(stderr, "[DBImplCtor] BloomCheck init: bloomcheck_server=%s, bloomcheck_client_=%p\n",
+          bloomcheck_server ? bloomcheck_server : "(null)",
+          static_cast<void*>(bloomcheck_client_.get()));
   if (bloomcheck_server && bloomcheck_server[0] != '\0') {
     bloomcheck_server_address_ = std::string(bloomcheck_server);
+    fprintf(stderr, "[DBImplCtor] Creating BloomCheckServiceClient...\n");
     try {
       bloomcheck_client_ = std::make_unique<BloomCheckServiceClient>(
           bloomcheck_server_address_);
+      fprintf(stderr, "[DBImplCtor] BloomCheckServiceClient created: %p\n",
+              static_cast<void*>(bloomcheck_client_.get()));
       bloomcheck_enabled_.store(true, std::memory_order_relaxed);
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "BloomCheck service enabled: %s\n",
                      bloomcheck_server_address_.c_str());
     } catch (...) {
       // gRPC 초기화 실패 시 무시
+      fprintf(stderr, "[DBImplCtor] BloomCheckServiceClient creation FAILED\n");
       ROCKS_LOG_WARN(immutable_db_options_.info_log,
                      "BloomCheck service initialization failed\n");
     }
+  } else {
+    fprintf(stderr, "[DBImplCtor] BloomCheck server not set, skipping initialization\n");
   }
 }
 
@@ -2191,6 +2207,20 @@ Status DBImpl::GetImpl(const ReadOptions& read_options,
                  /*timestamp=*/nullptr);
 }
 
+ReadOptions DBImpl::MaybeInjectBloomCheck(const ReadOptions& options) const {
+  // Fast path: BloomCheck not enabled or already set by caller
+  if (!bloomcheck_enabled_.load(std::memory_order_relaxed) ||
+      options.bloomcheck_client != nullptr) {
+    return options;
+  }
+
+  // Slow path: Inject BloomCheck client
+  ReadOptions ro = options;
+  ro.bloomcheck_client = bloomcheck_client_.get();
+  ro.read_tier = kReadAllTier;  // Enable BloomCheck offloading
+  return ro;
+}
+
 Status DBImpl::Get(const ReadOptions& _read_options,
                    ColumnFamilyHandle* column_family, const Slice& key,
                    PinnableSlice* value, std::string* timestamp) {
@@ -2204,7 +2234,7 @@ Status DBImpl::Get(const ReadOptions& _read_options,
         "`Env::IOActivity::kUnknown` or `Env::IOActivity::kGet`");
   }
 
-  ReadOptions read_options(_read_options);
+  ReadOptions read_options = MaybeInjectBloomCheck(_read_options);
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kGet;
   }
@@ -2242,7 +2272,7 @@ Status DBImpl::GetEntity(const ReadOptions& _read_options,
         "Can only call GetEntity with `ReadOptions::io_activity` set to "
         "`Env::IOActivity::kUnknown` or `Env::IOActivity::kGetEntity`");
   }
-  ReadOptions read_options(_read_options);
+  ReadOptions read_options = MaybeInjectBloomCheck(_read_options);
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kGetEntity;
   }
@@ -2277,7 +2307,7 @@ Status DBImpl::GetEntity(const ReadOptions& _read_options, const Slice& key,
   if (num_column_families == 0) {
     return s;
   }
-  ReadOptions read_options(_read_options);
+  ReadOptions read_options = MaybeInjectBloomCheck(_read_options);
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kGetEntity;
   }
@@ -2854,7 +2884,7 @@ void DBImpl::MultiGet(const ReadOptions& _read_options, const size_t num_keys,
     }
     return;
   }
-  ReadOptions read_options(_read_options);
+  ReadOptions read_options = MaybeInjectBloomCheck(_read_options);
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kMultiGet;
   }
@@ -3391,7 +3421,7 @@ void DBImpl::MultiGetEntity(const ReadOptions& _read_options, size_t num_keys,
     return;
   }
 
-  ReadOptions read_options(_read_options);
+  ReadOptions read_options = MaybeInjectBloomCheck(_read_options);
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kMultiGetEntity;
   }
@@ -3448,7 +3478,7 @@ void DBImpl::MultiGetEntity(const ReadOptions& _read_options,
     return;
   }
 
-  ReadOptions read_options(_read_options);
+  ReadOptions read_options = MaybeInjectBloomCheck(_read_options);
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kMultiGetEntity;
   }
@@ -3489,7 +3519,7 @@ void DBImpl::MultiGetEntity(const ReadOptions& _read_options, size_t num_keys,
     return;
   }
 
-  ReadOptions read_options(_read_options);
+  ReadOptions read_options = MaybeInjectBloomCheck(_read_options);
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kMultiGetEntity;
   }
@@ -3882,7 +3912,7 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
         "Can only call NewIterator with `ReadOptions::io_activity` is "
         "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`"));
   }
-  ReadOptions read_options(_read_options);
+  ReadOptions read_options = MaybeInjectBloomCheck(_read_options);
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kDBIterator;
   }
