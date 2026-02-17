@@ -50,6 +50,9 @@
 #include "file/file_util.h"
 #include "table/compaction_merging_iterator.h"
 #include "tools/bloomcheck_client_lib.h"
+#if defined(ROCKSDB_BLOOMCHECK_ERPC)
+#include "util/bloomcheck_erpc_client.h"
+#endif
 
 #if USE_COROUTINES
 #include "folly/coro/BlockingWait.h"
@@ -103,6 +106,54 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 
 using ScanOptionsMap = std::unordered_map<size_t, MultiScanArgs>;
+
+#if defined(ROCKSDB_BLOOMCHECK_ERPC)
+ErpcBloomCheckClient* GetErpcNoopClientSingleton() {
+  static std::once_flag once;
+  static ErpcBloomCheckClient* client = nullptr;
+  static bool init_ok = false;
+
+  std::call_once(once, []() {
+    const char* local_uri = std::getenv("BLOOMCHECK_ERPC_LOCAL_URI");
+    const char* server_uri = std::getenv("BLOOMCHECK_ERPC_SERVER_URI");
+    if (local_uri == nullptr || local_uri[0] == '\0' || server_uri == nullptr ||
+        server_uri[0] == '\0') {
+      fprintf(stderr,
+              "[ErpcNoop] missing env. require BLOOMCHECK_ERPC_LOCAL_URI and "
+              "BLOOMCHECK_ERPC_SERVER_URI\n");
+      return;
+    }
+
+    auto parse_int = [](const char* name, int default_value) -> int {
+      const char* env = std::getenv(name);
+      if (env == nullptr || env[0] == '\0') {
+        return default_value;
+      }
+      return std::atoi(env);
+    };
+    auto parse_u8 = [&parse_int](const char* name, uint8_t default_value) -> uint8_t {
+      int v = parse_int(name, static_cast<int>(default_value));
+      if (v < 0) {
+        return default_value;
+      }
+      return static_cast<uint8_t>(v);
+    };
+
+    const int numa_node = parse_int("BLOOMCHECK_ERPC_NUMA_NODE", 1);
+    const uint8_t base_rpc_id = parse_u8("BLOOMCHECK_ERPC_BASE_RPC_ID", 0);
+    const uint8_t server_rpc_id = parse_u8("BLOOMCHECK_ERPC_SERVER_RPC_ID", 0);
+
+    client = new ErpcBloomCheckClient(local_uri, server_uri, numa_node, base_rpc_id,
+                                      server_rpc_id);
+    init_ok = client->Init();
+    if (!init_ok) {
+      fprintf(stderr, "[ErpcNoop] client init failed. fallback to gRPC noop\n");
+    }
+  });
+
+  return init_ok ? client : nullptr;
+}
+#endif
 
 // Find File in LevelFilesBrief data structure
 // Within an index range defined by left and right
@@ -2770,6 +2821,10 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     const char* env = std::getenv("BLOOMCHECK_NOOP_ONLY");
     return env != nullptr && std::string(env) == "1";
   }();
+  static bool use_erpc_noop = []() {
+    const char* env = std::getenv("BLOOMCHECK_USE_ERPC_NOOP");
+    return env != nullptr && std::string(env) == "1";
+  }();
 
   // NOOP 로깅 설정: 환경변수로 활성화 (deprecated, use BLOOMCHECK_RPC_LOG)
   static bool noop_log_enabled = []() {
@@ -2820,11 +2875,40 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
 
     // NOOP_ONLY 모드: Noop RPC만 호출하고 나머지 로직은 건너뛰기
     if (noop_only_mode) {
-      uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
       size_t channel_idx = 0;
-      bool noop_ok = client->AsyncNoop(&channel_idx);  // Use async version to avoid gRPC mutex contention
-      uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
       size_t channel_count = client->GetChannelCount();
+      bool noop_ok = false;
+      uint64_t rpc_us = 0;
+      uint64_t server_ts_ns = 0;
+      const char* noop_transport = "grpc";
+
+      if (use_erpc_noop) {
+#if defined(ROCKSDB_BLOOMCHECK_ERPC)
+        noop_transport = "erpc";
+        ErpcBloomCheckClient* erpc_client = GetErpcNoopClientSingleton();
+        if (erpc_client != nullptr) {
+          uint64_t rtt_ns = 0;
+          noop_ok = erpc_client->Noop(&server_ts_ns, &rtt_ns);
+          rpc_us = rtt_ns / 1000;
+        } else {
+          // Fallback to existing gRPC path if eRPC client is unavailable.
+          uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+          noop_ok = client->AsyncNoop(&channel_idx);
+          rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+          noop_transport = "grpc_fallback";
+        }
+#else
+        // eRPC was requested but not built in this binary.
+        uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+        noop_ok = client->AsyncNoop(&channel_idx);
+        rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+        noop_transport = "grpc_fallback_no_erpc_build";
+#endif
+      } else {
+        uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+        noop_ok = client->AsyncNoop(&channel_idx);  // Existing gRPC NOOP path
+        rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+      }
 
       // 로깅 (샘플링 적용)
       bool should_log = (noop_log_enabled || rpc_log_enabled) && info_log_;
@@ -2835,8 +2919,11 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         uint64_t sample_rate = rpc_log_enabled ? rpc_log_sample_rate : noop_log_sample_rate;
         // 샘플링 레이트가 1이면 항상 로그, 아니면 샘플링
         if (sample_rate == 1 || counter % sample_rate == 0) {
-          ROCKS_LOG_INFO(info_log_, "[NoopRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d",
-                         channel_count, channel_idx, (unsigned long long)rpc_us, noop_ok ? 1 : 0);
+          ROCKS_LOG_INFO(
+              info_log_,
+              "[NoopRPC] transport=%s channels=%zu idx=%zu rpc_us=%llu ok=%d server_ts_ns=%llu",
+              noop_transport, channel_count, channel_idx, (unsigned long long)rpc_us,
+              noop_ok ? 1 : 0, (unsigned long long)server_ts_ns);
         }
       }
 
@@ -2924,7 +3011,9 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         }
       }
       
-      bloomcheck_ok = check_ok;
+      //bloomcheck_ok = check_ok;
+      bool complete = check_ok && response.resps_size() == 1 && response.resps(0).complete();
+      bloomcheck_ok = complete;
     }
     }  // else (normal bloomcheck mode)
   }
