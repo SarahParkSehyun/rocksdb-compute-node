@@ -39,6 +39,9 @@ class ErpcBloomCheckClient {
   // Synchronous Noop RPC call through per-thread Rpc context.
   bool Noop(uint64_t* server_ts_ns = nullptr, uint64_t* rtt_ns = nullptr);
 
+  // Optional explicit shutdown for standalone tools.
+  void Shutdown();
+
   bool IsConnected() const;
 
  private:
