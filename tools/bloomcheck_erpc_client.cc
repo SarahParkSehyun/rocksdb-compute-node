@@ -55,7 +55,9 @@ int main(int argc, char** argv) {
               "\n"
               "Timeout envs:\n"
               "  BLOOMCHECK_ERPC_CONNECT_TIMEOUT_MS (default: 2000)\n"
-              "  BLOOMCHECK_ERPC_RPC_TIMEOUT_MS     (default: 100)\n",
+              "  BLOOMCHECK_ERPC_RPC_TIMEOUT_MS     (default: 100)\n"
+              "  BLOOMCHECK_ERPC_POOL_SIZE          (default: 0: legacy thread_local)\n"
+              "  BLOOMCHECK_ERPC_POOL_PIN_TO_CORES  (default: 0)\n",
               argv[0]);
       return 0;
     }
@@ -85,6 +87,8 @@ int main(int argc, char** argv) {
               static_cast<unsigned long long>(server_ts_ns));
     }
   }
+
+  client.Shutdown();
 
   return 0;
 }
