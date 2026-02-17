@@ -94,6 +94,7 @@ option(WITH_SNAPPY "build with SNAPPY" OFF)
 option(WITH_LZ4 "build with lz4" OFF)
 option(WITH_ZLIB "build with zlib" OFF)
 option(WITH_ZSTD "build with zstd" OFF)
+set(ERPC_ROOT "" CACHE PATH "eRPC root directory")
 option(WITH_WINDOWS_UTF8_FILENAMES "use UTF8 as characterset for opening files, regardles of the system code page" OFF)
 if (WITH_WINDOWS_UTF8_FILENAMES)
   add_definitions(-DROCKSDB_WINDOWS_UTF8_FILENAMES)
@@ -663,6 +664,36 @@ if(USE_FOLLY)
 endif()
 find_package(Threads REQUIRED)
 
+# Optional eRPC support for BloomCheck NOOP path.
+set(ROCKSDB_BLOOMCHECK_ERPC_ENABLED OFF)
+set(ROCKSDB_ERPC_LIB_PATH "")
+set(ROCKSDB_ERPC_INCLUDE_DIRS "")
+set(ROCKSDB_ERPC_LINK_LIBS "")
+if(ERPC_ROOT AND EXISTS "${ERPC_ROOT}")
+  set(ROCKSDB_ERPC_LIB_PATH "${ERPC_ROOT}/build_perf/liberpc.a")
+  if(NOT EXISTS "${ROCKSDB_ERPC_LIB_PATH}")
+    set(ROCKSDB_ERPC_LIB_PATH "${ERPC_ROOT}/build/liberpc.a")
+  endif()
+
+  if(EXISTS "${ROCKSDB_ERPC_LIB_PATH}")
+    set(ROCKSDB_BLOOMCHECK_ERPC_ENABLED ON)
+    set(ROCKSDB_ERPC_INCLUDE_DIRS
+      "${ERPC_ROOT}/include"
+      "${ERPC_ROOT}/src"
+      "${ERPC_ROOT}"
+      "${ERPC_ROOT}/third_party/asio/include")
+    set(ROCKSDB_ERPC_LINK_LIBS
+      ${ROCKSDB_ERPC_LIB_PATH}
+      pthread
+      numa
+      ibverbs
+      protobuf)
+    message(STATUS "ROCKSDB_BLOOMCHECK_ERPC enabled (static target): ERPC_ROOT=${ERPC_ROOT}")
+  else()
+    message(STATUS "ROCKSDB_BLOOMCHECK_ERPC disabled: eRPC library not found")
+  endif()
+endif()
+
 # Main library source code
 
 set(SOURCES
@@ -1187,6 +1218,21 @@ target_include_directories(${ROCKSDB_STATIC_LIB} PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
 target_link_libraries(${ROCKSDB_STATIC_LIB} PRIVATE
   ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+if(ROCKSDB_BLOOMCHECK_ERPC_ENABLED)
+  target_sources(${ROCKSDB_STATIC_LIB} PRIVATE
+    util/bloomcheck_erpc_client.cc
+    tools/bloomcheck.pb.cc)
+  # eRPC headers can trigger warnings that conflict with -Werror builds.
+  set_source_files_properties(util/bloomcheck_erpc_client.cc PROPERTIES
+    COMPILE_OPTIONS "-Wno-error=volatile;-Wno-error=unused-function")
+  target_include_directories(${ROCKSDB_STATIC_LIB} PRIVATE
+    ${ROCKSDB_ERPC_INCLUDE_DIRS})
+  target_compile_definitions(${ROCKSDB_STATIC_LIB} PRIVATE
+    ROCKSDB_BLOOMCHECK_ERPC=1
+    ERPC_INFINIBAND)
+  target_link_libraries(${ROCKSDB_STATIC_LIB} PRIVATE
+    ${ROCKSDB_ERPC_LINK_LIBS})
+endif()
 
 if(ROCKSDB_BUILD_SHARED)
   add_library(${ROCKSDB_SHARED_LIB} SHARED ${SOURCES} ${BUILD_VERSION_CC})
