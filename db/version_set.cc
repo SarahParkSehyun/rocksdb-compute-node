@@ -108,7 +108,7 @@ namespace {
 using ScanOptionsMap = std::unordered_map<size_t, MultiScanArgs>;
 
 #if defined(ROCKSDB_BLOOMCHECK_ERPC)
-ErpcBloomCheckClient* GetErpcNoopClientSingleton() {
+ErpcBloomCheckClient* GetErpcClientSingleton() {
   static std::once_flag once;
   static ErpcBloomCheckClient* client = nullptr;
   static bool init_ok = false;
@@ -119,7 +119,7 @@ ErpcBloomCheckClient* GetErpcNoopClientSingleton() {
     if (local_uri == nullptr || local_uri[0] == '\0' || server_uri == nullptr ||
         server_uri[0] == '\0') {
       fprintf(stderr,
-              "[ErpcNoop] missing env. require BLOOMCHECK_ERPC_LOCAL_URI and "
+              "[ErpcClient] missing env. require BLOOMCHECK_ERPC_LOCAL_URI and "
               "BLOOMCHECK_ERPC_SERVER_URI\n");
       return;
     }
@@ -147,7 +147,7 @@ ErpcBloomCheckClient* GetErpcNoopClientSingleton() {
                                       server_rpc_id);
     init_ok = client->Init();
     if (!init_ok) {
-      fprintf(stderr, "[ErpcNoop] client init failed. fallback to gRPC noop\n");
+      fprintf(stderr, "[ErpcClient] client init failed. fallback to gRPC\n");
     }
   });
 
@@ -2825,6 +2825,10 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     const char* env = std::getenv("BLOOMCHECK_USE_ERPC_NOOP");
     return env != nullptr && std::string(env) == "1";
   }();
+  static bool use_erpc_check = []() {
+    const char* env = std::getenv("BLOOMCHECK_USE_ERPC");
+    return env != nullptr && std::string(env) == "1";
+  }();
 
   // NOOP 로깅 설정: 환경변수로 활성화 (deprecated, use BLOOMCHECK_RPC_LOG)
   static bool noop_log_enabled = []() {
@@ -2885,7 +2889,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       if (use_erpc_noop) {
 #if defined(ROCKSDB_BLOOMCHECK_ERPC)
         noop_transport = "erpc";
-        ErpcBloomCheckClient* erpc_client = GetErpcNoopClientSingleton();
+        ErpcBloomCheckClient* erpc_client = GetErpcClientSingleton();
         if (erpc_client != nullptr) {
           uint64_t rtt_ns = 0;
           noop_ok = erpc_client->Noop(&server_ts_ns, &rtt_ns);
@@ -2967,14 +2971,38 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         key_req->add_sst_file_numbers(file_number);
       }
 
-      // Execute async RPC (blocks on condition_variable, NOT on gRPC polling)
+      // Execute async RPC
       bloomcheck::BatchResponse response;
       size_t channel_idx = 0;
       size_t channel_count = client->GetChannelCount();
-      
+      const char* check_transport = "grpc";
       uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
-      bool check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
-      uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+      uint64_t rpc_us = 0;
+      bool check_ok = false;
+
+      if (use_erpc_check) {
+#if defined(ROCKSDB_BLOOMCHECK_ERPC)
+        ErpcBloomCheckClient* erpc_client = GetErpcClientSingleton();
+        if (erpc_client != nullptr) {
+          uint64_t rtt_ns = 0;
+          check_ok = erpc_client->CheckBatch(request, &response, &rtt_ns, &channel_idx);
+          rpc_us = rtt_ns / 1000;
+          check_transport = "erpc";
+          channel_count = erpc_client->PoolSize();
+        } else {
+          check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
+          rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+          check_transport = "grpc_fallback";
+        }
+#else
+        check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
+        rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+        check_transport = "grpc_fallback_no_erpc_build";
+#endif
+      } else {
+        check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
+        rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+      }
 
       // Map response back to may_match_files
       if (check_ok && response.resps_size() == 1) {
@@ -2998,13 +3026,13 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
               ? response.resps(0).may_match_sst_file_numbers_size() : 0;
           if (info_log_) {
             ROCKS_LOG_INFO(info_log_,
-                           "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d total_may=%d",
-                           channel_count, channel_idx,
+                           "[BloomCheckRPC] transport=%s channels=%zu idx=%zu rpc_us=%llu ok=%d total_may=%d",
+                           check_transport, channel_count, channel_idx,
                            (unsigned long long)rpc_us,
                            check_ok ? 1 : 0, total_may);
           } else {
-            fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d total_may=%d\n",
-                    channel_count, channel_idx,
+            fprintf(stderr, "[BloomCheckRPC] transport=%s channels=%zu idx=%zu rpc_us=%llu ok=%d total_may=%d\n",
+                    check_transport, channel_count, channel_idx,
                     (unsigned long long)rpc_us,
                     check_ok ? 1 : 0, total_may);
           }

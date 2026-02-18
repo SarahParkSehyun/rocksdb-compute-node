@@ -6,6 +6,8 @@
 #include "util/bloomcheck_erpc_client.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +16,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <time.h>
@@ -23,8 +26,6 @@
 
 #include <pthread.h>
 #include <sched.h>
-
-#include "tools/bloomcheck.pb.h"
 
 // eRPC includes
 #if __has_include("erpc/transport_impl/infiniband/ib_transport.h")
@@ -75,31 +76,6 @@ int ParseEnvInt(const char* name, int default_value, int min_v, int max_v) {
     return default_value;
   }
   return static_cast<int>(parsed);
-}
-
-struct SmConnectState {
-  std::atomic<int> session_num{-1};
-  std::atomic<int> state{0};  // 0: pending, 1: connected, 2: failed
-  std::atomic<int> err_type{0};
-};
-
-void sm_handler(int session_num, erpc::SmEventType event, erpc::SmErrType err_type,
-                void* context) {
-  auto* st = static_cast<SmConnectState*>(context);
-  if (st == nullptr) {
-    return;
-  }
-  if (st->session_num.load(std::memory_order_acquire) != session_num) {
-    return;
-  }
-  if (event == erpc::SmEventType::kConnected) {
-    st->state.store(1, std::memory_order_release);
-    st->err_type.store(static_cast<int>(erpc::SmErrType::kNoError),
-                       std::memory_order_release);
-  } else if (event == erpc::SmEventType::kConnectFailed) {
-    st->state.store(2, std::memory_order_release);
-    st->err_type.store(static_cast<int>(err_type), std::memory_order_release);
-  }
 }
 
 bool ReadFileToString(const std::string& path, std::string* out) {
@@ -175,29 +151,123 @@ bool PinCurrentThreadToCpu(int cpu) {
   return pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0;
 }
 
+class Semaphore {
+ public:
+  explicit Semaphore(int permits) : permits_(permits), available_(permits) {}
+
+  bool AcquireFor(std::chrono::milliseconds timeout) {
+    if (permits_ <= 0) {
+      return true;
+    }
+    std::unique_lock<std::mutex> lock(mu_);
+    bool ok = cv_.wait_for(lock, timeout, [&] { return available_ > 0; });
+    if (!ok) {
+      return false;
+    }
+    --available_;
+    return true;
+  }
+
+  void Release() {
+    if (permits_ <= 0) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (available_ < permits_) {
+        ++available_;
+      }
+    }
+    cv_.notify_one();
+  }
+
+ private:
+  int permits_ = 0;
+  int available_ = 0;
+  std::mutex mu_;
+  std::condition_variable cv_;
+};
+
+class SemaphoreGuard {
+ public:
+  explicit SemaphoreGuard(Semaphore* sem) : sem_(sem) {}
+  ~SemaphoreGuard() {
+    if (held_ && sem_ != nullptr) {
+      sem_->Release();
+    }
+  }
+  bool AcquireFor(std::chrono::milliseconds timeout) {
+    if (sem_ == nullptr) {
+      held_ = true;
+      return true;
+    }
+    held_ = sem_->AcquireFor(timeout);
+    return held_;
+  }
+
+ private:
+  Semaphore* sem_ = nullptr;
+  bool held_ = false;
+};
+
+struct SmConnectState {
+  std::atomic<int> session_num{-1};
+  std::atomic<int> state{0};  // 0: pending, 1: connected, 2: failed
+  std::atomic<int> err_type{0};
+};
+
+void sm_handler(int session_num, erpc::SmEventType event, erpc::SmErrType err_type,
+                void* context) {
+  auto* st = static_cast<SmConnectState*>(context);
+  if (st == nullptr) {
+    return;
+  }
+  if (st->session_num.load(std::memory_order_acquire) != session_num) {
+    return;
+  }
+  if (event == erpc::SmEventType::kConnected) {
+    st->state.store(1, std::memory_order_release);
+    st->err_type.store(static_cast<int>(erpc::SmErrType::kNoError),
+                       std::memory_order_release);
+  } else if (event == erpc::SmEventType::kConnectFailed) {
+    st->state.store(2, std::memory_order_release);
+    st->err_type.store(static_cast<int>(err_type), std::memory_order_release);
+  }
+}
+
 struct ProcessContext;
 class Worker;
 struct ThreadContext;
 
-struct InflightNoopCall {
+enum class TaskKind : uint8_t {
+  kNoop = 1,
+  kCheck = 2,
+};
+
+struct InflightCall {
   erpc::MsgBuffer req_msgbuf;
   erpc::MsgBuffer resp_msgbuf;
   uint64_t send_ns = 0;
   uint64_t rtt_ns = 0;
   uint64_t server_ts_ns = 0;
   bool parse_ok = false;
+  bloomcheck::BatchResponse check_response;
   std::atomic<bool> done{false};
 };
 
-struct NoopResult {
+struct RpcCallResult {
   bool ok = false;
   uint64_t server_ts_ns = 0;
   uint64_t rtt_ns = 0;
+  bloomcheck::BatchResponse check_response;
 };
 
-struct NoopTask {
+struct CallTask {
+  TaskKind kind = TaskKind::kNoop;
+  std::string req_payload;
+  size_t resp_capacity = 256;
   uint64_t deadline_ns = 0;
-  std::promise<NoopResult> promise;
+  std::promise<RpcCallResult> promise;
 };
 
 struct ProcessContext {
@@ -213,6 +283,8 @@ struct ProcessContext {
   int rpc_timeout_ms = 100;
   int pool_size = 0;
   bool pool_pin_to_cores = false;
+  int max_inflight = 0;
+  std::unique_ptr<Semaphore> inflight_sem;
   std::vector<std::unique_ptr<Worker>> workers;
   std::atomic<bool> pool_ready{false};
   bool initialized = false;
@@ -228,13 +300,13 @@ struct ThreadContext {
   int session_num = -1;
   bool connected = false;
   SmConnectState sm_state;
-  std::vector<InflightNoopCall*> timed_out_calls;
+  std::vector<InflightCall*> timed_out_calls;
 
   ~ThreadContext() { ReapTimedOutCalls(); }
 
   void ReapTimedOutCalls() {
     for (size_t i = 0; i < timed_out_calls.size();) {
-      InflightNoopCall* call = timed_out_calls[i];
+      InflightCall* call = timed_out_calls[i];
       if (call->done.load(std::memory_order_acquire)) {
         rpc->free_msg_buffer(call->req_msgbuf);
         rpc->free_msg_buffer(call->resp_msgbuf);
@@ -311,24 +383,12 @@ thread_local std::unordered_map<uint64_t, std::unique_ptr<ThreadContext>>
     tls_thread_ctx_map;
 std::atomic<uint64_t> g_client_id_seq{1};
 
-void noop_cont_func(void* context, void* tag) {
+void cont_func_common(void* context, void* tag) {
   (void)context;
-  auto* call = static_cast<InflightNoopCall*>(tag);
+  auto* call = static_cast<InflightCall*>(tag);
 
   const uint64_t recv_ns = NowNs();
   call->rtt_ns = (recv_ns > call->send_ns) ? (recv_ns - call->send_ns) : 0;
-
-  if (call->resp_msgbuf.get_data_size() > 0) {
-    bloomcheck::NoopResponse resp;
-    call->parse_ok = resp.ParseFromArray(
-        call->resp_msgbuf.buf_, static_cast<int>(call->resp_msgbuf.get_data_size()));
-    if (call->parse_ok && resp.has_server_ts_ns()) {
-      call->server_ts_ns = resp.server_ts_ns();
-    }
-  } else {
-    call->parse_ok = false;
-  }
-
   call->done.store(true, std::memory_order_release);
 }
 
@@ -362,21 +422,17 @@ class Worker {
     started_ = false;
   }
 
-  bool EnqueueNoop(uint64_t deadline_ns, std::future<NoopResult>* out_future) {
-    if (out_future == nullptr || !started_) {
+  bool EnqueueTask(std::unique_ptr<CallTask> task, std::future<RpcCallResult>* out_future) {
+    if (out_future == nullptr || !started_ || task == nullptr) {
       return false;
     }
-
-    auto task = std::make_unique<NoopTask>();
-    task->deadline_ns = deadline_ns;
     *out_future = task->promise.get_future();
-
     {
       std::lock_guard<std::mutex> lock(mu_);
       if (shutdown_) {
         return false;
       }
-      queue_.push_back(std::move(task));
+      queue_.push(std::move(task));
     }
     cv_.notify_one();
     return true;
@@ -390,7 +446,7 @@ class Worker {
       return;
     }
     for (size_t i = 0; i < timed_out_calls_.size();) {
-      InflightNoopCall* call = timed_out_calls_[i];
+      InflightCall* call = timed_out_calls_[i];
       if (call->done.load(std::memory_order_acquire)) {
         rpc_->free_msg_buffer(call->req_msgbuf);
         rpc_->free_msg_buffer(call->resp_msgbuf);
@@ -401,15 +457,6 @@ class Worker {
         ++i;
       }
     }
-  }
-
-  void FailTask(std::unique_ptr<NoopTask>* task) {
-    if (task == nullptr || task->get() == nullptr) {
-      return;
-    }
-    NoopResult result;
-    (*task)->promise.set_value(result);
-    task->reset();
   }
 
   void TryPinToNumaCore(const ProcessContext& pc) {
@@ -428,10 +475,6 @@ class Worker {
       fprintf(stderr,
               "[ErpcBloomCheckClient] Worker %zu pinned to CPU %d (node%d)\n", index_,
               cpu, pc.numa_node);
-    } else {
-      fprintf(stderr,
-              "[ErpcBloomCheckClient] Worker %zu pin failed for CPU %d (node%d)\n",
-              index_, cpu, pc.numa_node);
     }
   }
 
@@ -457,6 +500,7 @@ class Worker {
     sm_state_.session_num.store(session_num_, std::memory_order_release);
     sm_state_.state.store(0, std::memory_order_release);
     sm_state_.err_type.store(0, std::memory_order_release);
+
     const uint64_t deadline_ns =
         NowNs() + static_cast<uint64_t>(pc.connect_timeout_ms) * 1000000ULL;
     while (true) {
@@ -484,37 +528,34 @@ class Worker {
     return true;
   }
 
-  NoopResult ExecuteNoop(const ProcessContext& pc, uint64_t deadline_ns) {
-    NoopResult result;
+  RpcCallResult ExecuteTask(const ProcessContext& pc, const CallTask& task) {
+    RpcCallResult result;
     ReapTimedOutCalls();
 
-    bloomcheck::NoopRequest req;
-    std::string payload;
-    req.SerializeToString(&payload);
+    auto* call = new InflightCall();
+    call->req_msgbuf = rpc_->alloc_msg_buffer_or_die(task.req_payload.empty()
+                                                          ? 1
+                                                          : task.req_payload.size());
+    call->resp_msgbuf = rpc_->alloc_msg_buffer_or_die(task.resp_capacity);
 
-    auto* call = new InflightNoopCall();
-    call->req_msgbuf = rpc_->alloc_msg_buffer_or_die(256);
-    call->resp_msgbuf = rpc_->alloc_msg_buffer_or_die(256);
-
-    if (!payload.empty()) {
-      rpc_->resize_msg_buffer(&call->req_msgbuf, payload.size());
-      memcpy(call->req_msgbuf.buf_, payload.data(), payload.size());
+    if (!task.req_payload.empty()) {
+      rpc_->resize_msg_buffer(&call->req_msgbuf, task.req_payload.size());
+      memcpy(call->req_msgbuf.buf_, task.req_payload.data(), task.req_payload.size());
     } else {
       rpc_->resize_msg_buffer(&call->req_msgbuf, 0);
     }
 
     call->send_ns = NowNs();
-    rpc_->enqueue_request(session_num_, ErpcBloomCheckClient::kReqTypeNoop,
-                          &call->req_msgbuf, &call->resp_msgbuf, noop_cont_func, call);
+    const uint8_t req_type =
+        task.kind == TaskKind::kNoop ? ErpcBloomCheckClient::kReqTypeNoop
+                                     : ErpcBloomCheckClient::kReqTypeCheck;
+    rpc_->enqueue_request(session_num_, req_type, &call->req_msgbuf, &call->resp_msgbuf,
+                          cont_func_common, call);
 
     bool timed_out = false;
     while (!call->done.load(std::memory_order_acquire)) {
       rpc_->run_event_loop_once();
-      if (NowNs() > deadline_ns) {
-        timed_out = true;
-        break;
-      }
-      if (shutdown_) {
+      if (NowNs() > task.deadline_ns || shutdown_) {
         timed_out = true;
         break;
       }
@@ -523,14 +564,35 @@ class Worker {
     if (timed_out) {
       timed_out_calls_.push_back(call);
       fprintf(stderr,
-              "[ErpcBloomCheckClient] Worker %zu Noop timeout (%d ms, rpc_id=%u)\n",
-              index_, pc.rpc_timeout_ms, static_cast<unsigned>(rpc_id_));
+              "[ErpcBloomCheckClient] Worker %zu rpc timeout (%d ms, rpc_id=%u, type=%u)\n",
+              index_, pc.rpc_timeout_ms, static_cast<unsigned>(rpc_id_),
+              static_cast<unsigned>(req_type));
       return result;
     }
 
-    result.ok = call->parse_ok;
-    result.server_ts_ns = call->server_ts_ns;
     result.rtt_ns = call->rtt_ns;
+
+    if (task.kind == TaskKind::kNoop) {
+      if (call->resp_msgbuf.get_data_size() > 0) {
+        bloomcheck::NoopResponse resp;
+        call->parse_ok = resp.ParseFromArray(
+            call->resp_msgbuf.buf_, static_cast<int>(call->resp_msgbuf.get_data_size()));
+        if (call->parse_ok && resp.has_server_ts_ns()) {
+          result.server_ts_ns = resp.server_ts_ns();
+        }
+      }
+      result.ok = call->parse_ok;
+    } else {
+      if (call->resp_msgbuf.get_data_size() > 0) {
+        bloomcheck::BatchResponse resp;
+        call->parse_ok = resp.ParseFromArray(
+            call->resp_msgbuf.buf_, static_cast<int>(call->resp_msgbuf.get_data_size()));
+        if (call->parse_ok) {
+          result.check_response = std::move(resp);
+        }
+      }
+      result.ok = call->parse_ok;
+    }
 
     rpc_->free_msg_buffer(call->req_msgbuf);
     rpc_->free_msg_buffer(call->resp_msgbuf);
@@ -553,7 +615,7 @@ class Worker {
     }
 
     while (true) {
-      std::unique_ptr<NoopTask> task;
+      std::unique_ptr<CallTask> task;
       {
         std::unique_lock<std::mutex> lock(mu_);
         cv_.wait_for(lock, std::chrono::milliseconds(1),
@@ -563,7 +625,7 @@ class Worker {
         }
         if (!queue_.empty()) {
           task = std::move(queue_.front());
-          queue_.pop_front();
+          queue_.pop();
         }
       }
 
@@ -576,12 +638,12 @@ class Worker {
       }
 
       if (disabled_ || !rpc_) {
-        FailTask(&task);
+        task->promise.set_value(RpcCallResult{});
         continue;
       }
 
-      NoopResult result = ExecuteNoop(*pc, task->deadline_ns);
-      task->promise.set_value(result);
+      RpcCallResult result = ExecuteTask(*pc, *task);
+      task->promise.set_value(std::move(result));
     }
 
     if (rpc_) {
@@ -592,7 +654,7 @@ class Worker {
     }
 
     while (!timed_out_calls_.empty()) {
-      InflightNoopCall* call = timed_out_calls_.back();
+      InflightCall* call = timed_out_calls_.back();
       timed_out_calls_.pop_back();
       if (rpc_) {
         rpc_->free_msg_buffer(call->req_msgbuf);
@@ -613,12 +675,12 @@ class Worker {
 
   std::mutex mu_;
   std::condition_variable cv_;
-  std::deque<std::unique_ptr<NoopTask>> queue_;
+  std::queue<std::unique_ptr<CallTask>> queue_;
   bool shutdown_ = false;
   bool started_ = false;
   bool disabled_ = false;
   std::atomic<bool> connected_{false};
-  std::vector<InflightNoopCall*> timed_out_calls_;
+  std::vector<InflightCall*> timed_out_calls_;
 };
 
 }  // namespace
@@ -639,6 +701,11 @@ struct ErpcBloomCheckClientImpl {
     pc->pool_size = ParseEnvInt("BLOOMCHECK_ERPC_POOL_SIZE", 0, 0, 1024);
     pc->pool_pin_to_cores =
         ParseEnvInt("BLOOMCHECK_ERPC_POOL_PIN_TO_CORES", 0, 0, 1) == 1;
+    pc->max_inflight =
+        ParseEnvInt("BLOOMCHECK_ERPC_MAX_INFLIGHT", 0, 0, 1000000);
+    if (pc->max_inflight > 0) {
+      pc->inflight_sem = std::make_unique<Semaphore>(pc->max_inflight);
+    }
   }
 
   bool StartWorkerPoolLocked() {
@@ -690,11 +757,12 @@ struct ErpcBloomCheckClientImpl {
       fprintf(stderr,
               "[ErpcBloomCheckClient] ProcessContext initialized: local=%s server=%s "
               "base_rpc_id=%u server_rpc_id=%u connect_timeout_ms=%d rpc_timeout_ms=%d "
-              "pool_size=%d pool_pin_to_cores=%d\n",
+              "pool_size=%d pool_pin_to_cores=%d max_inflight=%d\n",
               pc->local_uri.c_str(), pc->server_uri.c_str(),
               static_cast<unsigned>(pc->base_rpc_id),
               static_cast<unsigned>(pc->server_rpc_id), pc->connect_timeout_ms,
-              pc->rpc_timeout_ms, pc->pool_size, pc->pool_pin_to_cores ? 1 : 0);
+              pc->rpc_timeout_ms, pc->pool_size, pc->pool_pin_to_cores ? 1 : 0,
+              pc->max_inflight);
       return StartWorkerPoolLocked();
     } catch (const std::exception& e) {
       fprintf(stderr, "[ErpcBloomCheckClient] Nexus init failed: %s\n", e.what());
@@ -724,7 +792,11 @@ struct ErpcBloomCheckClientImpl {
     return tc_ptr;
   }
 
-  bool NoopViaThreadLocal(uint64_t* server_ts_ns, uint64_t* rtt_ns) {
+  bool RunThreadLocalTask(TaskKind kind, const std::string& req_payload,
+                          size_t resp_capacity, RpcCallResult* out_result) {
+    if (out_result == nullptr) {
+      return false;
+    }
     ThreadContext* tc = GetOrCreateThreadContext();
     if (tc == nullptr || !tc->InitThread()) {
       return false;
@@ -732,25 +804,24 @@ struct ErpcBloomCheckClientImpl {
 
     tc->ReapTimedOutCalls();
 
-    bloomcheck::NoopRequest req;
-    std::string payload;
-    req.SerializeToString(&payload);
+    auto* call = new InflightCall();
+    call->req_msgbuf = tc->rpc->alloc_msg_buffer_or_die(req_payload.empty() ? 1
+                                                                              : req_payload.size());
+    call->resp_msgbuf = tc->rpc->alloc_msg_buffer_or_die(resp_capacity);
 
-    auto* call = new InflightNoopCall();
-    call->req_msgbuf = tc->rpc->alloc_msg_buffer_or_die(256);
-    call->resp_msgbuf = tc->rpc->alloc_msg_buffer_or_die(256);
-
-    if (!payload.empty()) {
-      tc->rpc->resize_msg_buffer(&call->req_msgbuf, payload.size());
-      memcpy(call->req_msgbuf.buf_, payload.data(), payload.size());
+    if (!req_payload.empty()) {
+      tc->rpc->resize_msg_buffer(&call->req_msgbuf, req_payload.size());
+      memcpy(call->req_msgbuf.buf_, req_payload.data(), req_payload.size());
     } else {
       tc->rpc->resize_msg_buffer(&call->req_msgbuf, 0);
     }
 
     call->send_ns = NowNs();
-    tc->rpc->enqueue_request(tc->session_num, ErpcBloomCheckClient::kReqTypeNoop,
-                             &call->req_msgbuf, &call->resp_msgbuf, noop_cont_func,
-                             call);
+    const uint8_t req_type =
+        kind == TaskKind::kNoop ? ErpcBloomCheckClient::kReqTypeNoop
+                                : ErpcBloomCheckClient::kReqTypeCheck;
+    tc->rpc->enqueue_request(tc->session_num, req_type, &call->req_msgbuf,
+                             &call->resp_msgbuf, cont_func_common, call);
 
     const uint64_t deadline_ns =
         call->send_ns + static_cast<uint64_t>(pc->rpc_timeout_ms) * 1000000ULL;
@@ -765,41 +836,66 @@ struct ErpcBloomCheckClientImpl {
 
     if (timed_out) {
       tc->timed_out_calls.push_back(call);
-      fprintf(stderr, "[ErpcBloomCheckClient] Noop timeout (%d ms, rpc_id=%u)\n",
-              pc->rpc_timeout_ms, static_cast<unsigned>(tc->rpc_id));
+      fprintf(stderr,
+              "[ErpcBloomCheckClient] rpc timeout (%d ms, rpc_id=%u, type=%u)\n",
+              pc->rpc_timeout_ms, static_cast<unsigned>(tc->rpc_id),
+              static_cast<unsigned>(req_type));
       return false;
     }
 
-    if (server_ts_ns != nullptr) {
-      *server_ts_ns = call->server_ts_ns;
-    }
-    if (rtt_ns != nullptr) {
-      *rtt_ns = call->rtt_ns;
+    out_result->rtt_ns = call->rtt_ns;
+    if (kind == TaskKind::kNoop) {
+      bloomcheck::NoopResponse resp;
+      call->parse_ok = resp.ParseFromArray(
+          call->resp_msgbuf.buf_, static_cast<int>(call->resp_msgbuf.get_data_size()));
+      if (call->parse_ok && resp.has_server_ts_ns()) {
+        out_result->server_ts_ns = resp.server_ts_ns();
+      }
+      out_result->ok = call->parse_ok;
+    } else {
+      bloomcheck::BatchResponse resp;
+      call->parse_ok = resp.ParseFromArray(
+          call->resp_msgbuf.buf_, static_cast<int>(call->resp_msgbuf.get_data_size()));
+      if (call->parse_ok) {
+        out_result->check_response = std::move(resp);
+      }
+      out_result->ok = call->parse_ok;
     }
 
     tc->rpc->free_msg_buffer(call->req_msgbuf);
     tc->rpc->free_msg_buffer(call->resp_msgbuf);
-    const bool ok = call->parse_ok;
     delete call;
-    return ok;
+    return out_result->ok;
   }
 
-  bool NoopViaWorkerPool(uint64_t* server_ts_ns, uint64_t* rtt_ns) {
+  bool RunPoolTask(TaskKind kind, const std::string& req_payload, size_t resp_capacity,
+                   RpcCallResult* out_result, size_t* slot_idx) {
+    if (out_result == nullptr) {
+      return false;
+    }
     if (!pc->pool_ready.load(std::memory_order_acquire) || pc->workers.empty()) {
       return false;
     }
 
     const size_t worker_idx =
         std::hash<std::thread::id>{}(std::this_thread::get_id()) % pc->workers.size();
+    if (slot_idx != nullptr) {
+      *slot_idx = worker_idx;
+    }
     Worker* worker = pc->workers[worker_idx].get();
     if (worker == nullptr) {
       return false;
     }
 
-    std::future<NoopResult> fut;
-    const uint64_t deadline_ns =
+    auto task = std::make_unique<CallTask>();
+    task->kind = kind;
+    task->req_payload = req_payload;
+    task->resp_capacity = resp_capacity;
+    task->deadline_ns =
         NowNs() + static_cast<uint64_t>(pc->rpc_timeout_ms) * 1000000ULL;
-    if (!worker->EnqueueNoop(deadline_ns, &fut)) {
+
+    std::future<RpcCallResult> fut;
+    if (!worker->EnqueueTask(std::move(task), &fut)) {
       return false;
     }
 
@@ -808,14 +904,29 @@ struct ErpcBloomCheckClientImpl {
       return false;
     }
 
-    NoopResult result = fut.get();
-    if (server_ts_ns != nullptr) {
-      *server_ts_ns = result.server_ts_ns;
+    *out_result = fut.get();
+    return out_result->ok;
+  }
+
+  bool Invoke(TaskKind kind, const std::string& req_payload, size_t resp_capacity,
+              RpcCallResult* out_result, size_t* slot_idx) {
+    if (!Init()) {
+      return false;
     }
-    if (rtt_ns != nullptr) {
-      *rtt_ns = result.rtt_ns;
+
+    SemaphoreGuard inflight_guard(pc->inflight_sem.get());
+    if (!inflight_guard.AcquireFor(std::chrono::milliseconds(pc->rpc_timeout_ms))) {
+      return false;
     }
-    return result.ok;
+
+    if (pc->pool_size > 0) {
+      return RunPoolTask(kind, req_payload, resp_capacity, out_result, slot_idx);
+    }
+    return RunThreadLocalTask(kind, req_payload, resp_capacity, out_result);
+  }
+
+  size_t PoolSize() const {
+    return pc->pool_size > 0 ? static_cast<size_t>(pc->pool_size) : 0;
   }
 
   bool IsConnected() const {
@@ -865,15 +976,47 @@ void ErpcBloomCheckClient::Shutdown() {
 
 bool ErpcBloomCheckClient::IsConnected() const { return impl_->IsConnected(); }
 
-bool ErpcBloomCheckClient::Noop(uint64_t* server_ts_ns, uint64_t* rtt_ns) {
-  if (!impl_->Init()) {
+size_t ErpcBloomCheckClient::PoolSize() const {
+  return impl_ != nullptr ? impl_->PoolSize() : 0;
+}
+
+bool ErpcBloomCheckClient::Noop(uint64_t* server_ts_ns, uint64_t* rtt_ns,
+                                size_t* slot_idx) {
+  RpcCallResult result;
+  bloomcheck::NoopRequest req;
+  std::string payload;
+  req.SerializeToString(&payload);
+
+  bool ok = impl_->Invoke(TaskKind::kNoop, payload, 256, &result, slot_idx);
+  if (server_ts_ns != nullptr) {
+    *server_ts_ns = result.server_ts_ns;
+  }
+  if (rtt_ns != nullptr) {
+    *rtt_ns = result.rtt_ns;
+  }
+  return ok;
+}
+
+bool ErpcBloomCheckClient::CheckBatch(const bloomcheck::BatchRequest& request,
+                                      bloomcheck::BatchResponse* response,
+                                      uint64_t* rtt_ns, size_t* slot_idx) {
+  if (response == nullptr) {
+    return false;
+  }
+  RpcCallResult result;
+  std::string payload;
+  if (!request.SerializeToString(&payload)) {
     return false;
   }
 
-  if (impl_->pc->pool_size > 0) {
-    return impl_->NoopViaWorkerPool(server_ts_ns, rtt_ns);
+  bool ok = impl_->Invoke(TaskKind::kCheck, payload, 65536, &result, slot_idx);
+  if (rtt_ns != nullptr) {
+    *rtt_ns = result.rtt_ns;
   }
-  return impl_->NoopViaThreadLocal(server_ts_ns, rtt_ns);
+  if (ok) {
+    *response = std::move(result.check_response);
+  }
+  return ok;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

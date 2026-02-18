@@ -8,10 +8,12 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 
+#include "tools/bloomcheck.pb.h"
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -37,12 +39,19 @@ class ErpcBloomCheckClient {
   bool Init();
 
   // Synchronous Noop RPC call through per-thread Rpc context.
-  bool Noop(uint64_t* server_ts_ns = nullptr, uint64_t* rtt_ns = nullptr);
+  bool Noop(uint64_t* server_ts_ns = nullptr, uint64_t* rtt_ns = nullptr,
+            size_t* slot_idx = nullptr);
+
+  // Synchronous Check RPC (BatchRequest -> BatchResponse).
+  bool CheckBatch(const bloomcheck::BatchRequest& request,
+                  bloomcheck::BatchResponse* response,
+                  uint64_t* rtt_ns = nullptr, size_t* slot_idx = nullptr);
 
   // Optional explicit shutdown for standalone tools.
   void Shutdown();
 
   bool IsConnected() const;
+  size_t PoolSize() const;
 
  private:
   std::unique_ptr<ErpcBloomCheckClientImpl> impl_;
