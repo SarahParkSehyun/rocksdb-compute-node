@@ -77,8 +77,29 @@ int ParseEnvInt(const char* name, int default_value, int min_v, int max_v) {
   return static_cast<int>(parsed);
 }
 
-void sm_handler(int, erpc::SmEventType, erpc::SmErrType, void*) {
-  // Client-side Noop path does not need session event hooks.
+struct SmConnectState {
+  std::atomic<int> session_num{-1};
+  std::atomic<int> state{0};  // 0: pending, 1: connected, 2: failed
+  std::atomic<int> err_type{0};
+};
+
+void sm_handler(int session_num, erpc::SmEventType event, erpc::SmErrType err_type,
+                void* context) {
+  auto* st = static_cast<SmConnectState*>(context);
+  if (st == nullptr) {
+    return;
+  }
+  if (st->session_num.load(std::memory_order_acquire) != session_num) {
+    return;
+  }
+  if (event == erpc::SmEventType::kConnected) {
+    st->state.store(1, std::memory_order_release);
+    st->err_type.store(static_cast<int>(erpc::SmErrType::kNoError),
+                       std::memory_order_release);
+  } else if (event == erpc::SmEventType::kConnectFailed) {
+    st->state.store(2, std::memory_order_release);
+    st->err_type.store(static_cast<int>(err_type), std::memory_order_release);
+  }
 }
 
 bool ReadFileToString(const std::string& path, std::string* out) {
@@ -206,6 +227,7 @@ struct ThreadContext {
   std::unique_ptr<erpc::Rpc<erpc::CTransport>> rpc;
   int session_num = -1;
   bool connected = false;
+  SmConnectState sm_state;
   std::vector<InflightNoopCall*> timed_out_calls;
 
   ~ThreadContext() { ReapTimedOutCalls(); }
@@ -237,8 +259,11 @@ struct ThreadContext {
                               rpc_id_range);
     rpc_id = static_cast<uint8_t>(assigned);
 
-    rpc = std::make_unique<erpc::Rpc<erpc::CTransport>>(pc->nexus.get(), this, rpc_id,
-                                                         sm_handler);
+    sm_state.session_num.store(-1, std::memory_order_release);
+    sm_state.state.store(0, std::memory_order_release);
+    sm_state.err_type.store(0, std::memory_order_release);
+    rpc = std::make_unique<erpc::Rpc<erpc::CTransport>>(pc->nexus.get(), &sm_state,
+                                                         rpc_id, sm_handler);
     if (!rpc) {
       fprintf(stderr, "[ErpcBloomCheckClient] Failed to create per-thread Rpc\n");
       return false;
@@ -251,10 +276,24 @@ struct ThreadContext {
       return false;
     }
 
+    sm_state.session_num.store(session_num, std::memory_order_release);
+    sm_state.state.store(0, std::memory_order_release);
+    sm_state.err_type.store(0, std::memory_order_release);
     const uint64_t deadline_ns =
         NowNs() + static_cast<uint64_t>(pc->connect_timeout_ms) * 1000000ULL;
-    while (!rpc->is_connected(session_num)) {
+    while (true) {
       rpc->run_event_loop_once();
+      const int state = sm_state.state.load(std::memory_order_acquire);
+      if (state == 1) {
+        break;
+      }
+      if (state == 2) {
+        fprintf(stderr,
+                "[ErpcBloomCheckClient] Session connect failed (%d ms, rpc_id=%u, err=%d)\n",
+                pc->connect_timeout_ms, static_cast<unsigned>(rpc_id),
+                sm_state.err_type.load(std::memory_order_acquire));
+        return false;
+      }
       if (NowNs() > deadline_ns) {
         fprintf(stderr,
                 "[ErpcBloomCheckClient] Session connect timeout (%d ms, rpc_id=%u)\n",
@@ -397,8 +436,11 @@ class Worker {
   }
 
   bool InitRpcAndSession(const ProcessContext& pc) {
-    rpc_ = std::make_unique<erpc::Rpc<erpc::CTransport>>(pc.nexus.get(), this, rpc_id_,
-                                                          sm_handler);
+    sm_state_.session_num.store(-1, std::memory_order_release);
+    sm_state_.state.store(0, std::memory_order_release);
+    sm_state_.err_type.store(0, std::memory_order_release);
+    rpc_ = std::make_unique<erpc::Rpc<erpc::CTransport>>(pc.nexus.get(), &sm_state_,
+                                                          rpc_id_, sm_handler);
     if (!rpc_) {
       fprintf(stderr, "[ErpcBloomCheckClient] Worker %zu failed to create Rpc\n", index_);
       return false;
@@ -412,10 +454,24 @@ class Worker {
       return false;
     }
 
+    sm_state_.session_num.store(session_num_, std::memory_order_release);
+    sm_state_.state.store(0, std::memory_order_release);
+    sm_state_.err_type.store(0, std::memory_order_release);
     const uint64_t deadline_ns =
         NowNs() + static_cast<uint64_t>(pc.connect_timeout_ms) * 1000000ULL;
-    while (!rpc_->is_connected(session_num_)) {
+    while (true) {
       rpc_->run_event_loop_once();
+      const int state = sm_state_.state.load(std::memory_order_acquire);
+      if (state == 1) {
+        break;
+      }
+      if (state == 2) {
+        fprintf(stderr,
+                "[ErpcBloomCheckClient] Worker %zu connect failed (%d ms, rpc_id=%u, err=%d)\n",
+                index_, pc.connect_timeout_ms, static_cast<unsigned>(rpc_id_),
+                sm_state_.err_type.load(std::memory_order_acquire));
+        return false;
+      }
       if (NowNs() > deadline_ns) {
         fprintf(stderr,
                 "[ErpcBloomCheckClient] Worker %zu connect timeout (%d ms, rpc_id=%u)\n",
@@ -549,6 +605,7 @@ class Worker {
   std::weak_ptr<ProcessContext> pc_;
   size_t index_ = 0;
   uint8_t rpc_id_ = 0;
+  SmConnectState sm_state_;
 
   std::thread th_;
   std::unique_ptr<erpc::Rpc<erpc::CTransport>> rpc_;
