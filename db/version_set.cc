@@ -2905,9 +2905,10 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         noop_transport = "erpc";
         ErpcBloomCheckClient* erpc_client = GetErpcClientSingleton();
         if (erpc_client != nullptr) {
-          uint64_t rtt_ns = 0;
-          noop_ok = erpc_client->Noop(&server_ts_ns, &rtt_ns);
-          rpc_us = rtt_ns / 1000;
+          uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+          noop_ok = erpc_client->Noop(&server_ts_ns, nullptr, &channel_idx);
+          rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+          channel_count = erpc_client->PoolSize();
         } else if (client != nullptr) {
           // Fallback to existing gRPC path if eRPC client is unavailable.
           uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
@@ -3005,6 +3006,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
       uint64_t rpc_us = 0;
       bool check_ok = false;
+      size_t rpc_chunk_count = 1;
 
       if (use_erpc_check) {
 #if defined(ROCKSDB_BLOOMCHECK_ERPC)
@@ -3018,8 +3020,10 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           check_ok = true;
           check_transport = "erpc";
           channel_count = erpc_client->PoolSize();
+          rpc_chunk_count = 0;
 
           for (size_t off = 0; off < candidate_list.size(); off += chunk_sz) {
+            rpc_chunk_count++;
             size_t end = std::min(candidate_list.size(), off + chunk_sz);
             bloomcheck::BatchRequest request;
             bloomcheck::KeyRequest* key_req = request.add_reqs();
@@ -3069,6 +3073,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
             rpc_us = storage_info_.clock_->NowMicros() - grpc_start_us;
             check_transport = "grpc_fallback_after_erpc_fail";
             channel_count = client->GetChannelCount();
+            rpc_chunk_count = 1;
           } else if (!check_ok && client == nullptr) {
             check_transport = "erpc_fail_no_grpc_client";
           }
@@ -3082,6 +3087,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
           rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
           check_transport = "grpc_fallback";
+          rpc_chunk_count = 1;
         } else {
           check_ok = false;
           rpc_us = 0;
@@ -3098,6 +3104,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
           rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
           check_transport = "grpc_fallback_no_erpc_build";
+          rpc_chunk_count = 1;
         } else {
           check_ok = false;
           rpc_us = 0;
@@ -3114,6 +3121,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           }
           check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
           rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+          rpc_chunk_count = 1;
         } else {
           check_ok = false;
           rpc_us = 0;
@@ -3143,13 +3151,15 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
               ? response.resps(0).may_match_sst_file_numbers_size() : 0;
           if (info_log_) {
             ROCKS_LOG_INFO(info_log_,
-                           "[BloomCheckRPC] transport=%s channels=%zu idx=%zu rpc_us=%llu ok=%d total_may=%d",
+                           "[BloomCheckRPC] transport=%s channels=%zu idx=%zu chunks=%zu rpc_us=%llu ok=%d total_may=%d",
                            check_transport, channel_count, channel_idx,
+                           rpc_chunk_count,
                            (unsigned long long)rpc_us,
                            check_ok ? 1 : 0, total_may);
           } else {
-            fprintf(stderr, "[BloomCheckRPC] transport=%s channels=%zu idx=%zu rpc_us=%llu ok=%d total_may=%d\n",
+            fprintf(stderr, "[BloomCheckRPC] transport=%s channels=%zu idx=%zu chunks=%zu rpc_us=%llu ok=%d total_may=%d\n",
                     check_transport, channel_count, channel_idx,
+                    rpc_chunk_count,
                     (unsigned long long)rpc_us,
                     check_ok ? 1 : 0, total_may);
           }
