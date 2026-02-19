@@ -2829,6 +2829,16 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     const char* env = std::getenv("BLOOMCHECK_USE_ERPC");
     return env != nullptr && std::string(env) == "1";
   }();
+  static size_t erpc_check_chunk_size = []() {
+    const char* env = std::getenv("BLOOMCHECK_ERPC_CHECK_CHUNK_SIZE");
+    if (env != nullptr) {
+      int v = std::atoi(env);
+      if (v > 0) {
+        return static_cast<size_t>(v);
+      }
+    }
+    return static_cast<size_t>(64);
+  }();
 
   // NOOP 로깅 설정: 환경변수로 활성화 (deprecated, use BLOOMCHECK_RPC_LOG)
   static bool noop_log_enabled = []() {
@@ -2870,17 +2880,21 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                    static_cast<int>(read_options.read_tier));
   }
 
-  if (read_options.bloomcheck_client != nullptr &&
+  bool erpc_path_enabled = (noop_only_mode && use_erpc_noop) ||
+                           (!noop_only_mode && use_erpc_check);
+  if ((read_options.bloomcheck_client != nullptr || erpc_path_enabled) &&
       read_options.read_tier == kReadAllTier) {
     // 실제 구현 타입 BloomCheckServiceClient*로 캐스팅해서 사용 준비
     BloomCheckServiceClient* client =
-        static_cast<BloomCheckServiceClient*>(read_options.bloomcheck_client);
+        read_options.bloomcheck_client != nullptr
+            ? static_cast<BloomCheckServiceClient*>(read_options.bloomcheck_client)
+            : nullptr;
     bloomcheck_enabled = true;
 
     // NOOP_ONLY 모드: Noop RPC만 호출하고 나머지 로직은 건너뛰기
     if (noop_only_mode) {
       size_t channel_idx = 0;
-      size_t channel_count = client->GetChannelCount();
+      size_t channel_count = client != nullptr ? client->GetChannelCount() : 0;
       bool noop_ok = false;
       uint64_t rpc_us = 0;
       uint64_t server_ts_ns = 0;
@@ -2894,24 +2908,40 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           uint64_t rtt_ns = 0;
           noop_ok = erpc_client->Noop(&server_ts_ns, &rtt_ns);
           rpc_us = rtt_ns / 1000;
-        } else {
+        } else if (client != nullptr) {
           // Fallback to existing gRPC path if eRPC client is unavailable.
           uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
           noop_ok = client->AsyncNoop(&channel_idx);
           rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
           noop_transport = "grpc_fallback";
+        } else {
+          noop_ok = false;
+          rpc_us = 0;
+          noop_transport = "erpc_unavailable_no_grpc_client";
         }
 #else
-        // eRPC was requested but not built in this binary.
-        uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
-        noop_ok = client->AsyncNoop(&channel_idx);
-        rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
-        noop_transport = "grpc_fallback_no_erpc_build";
+        if (client != nullptr) {
+          // eRPC was requested but not built in this binary.
+          uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+          noop_ok = client->AsyncNoop(&channel_idx);
+          rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+          noop_transport = "grpc_fallback_no_erpc_build";
+        } else {
+          noop_ok = false;
+          rpc_us = 0;
+          noop_transport = "erpc_not_built_no_grpc_client";
+        }
 #endif
       } else {
-        uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
-        noop_ok = client->AsyncNoop(&channel_idx);  // Existing gRPC NOOP path
-        rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+        if (client != nullptr) {
+          uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+          noop_ok = client->AsyncNoop(&channel_idx);  // Existing gRPC NOOP path
+          rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+        } else {
+          noop_ok = false;
+          rpc_us = 0;
+          noop_transport = "grpc_client_unavailable";
+        }
       }
 
       // 로깅 (샘플링 적용)
@@ -2963,18 +2993,14 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         bloomcheck_may_match_files = std::make_unique<std::unordered_set<uint64_t>>();
       }
 
-      // Build single-key batch request
-      bloomcheck::BatchRequest request;
-      bloomcheck::KeyRequest* key_req = request.add_reqs();
-      key_req->set_user_key(user_key_str);
-      for (uint64_t file_number : candidate_file_numbers) {
-        key_req->add_sst_file_numbers(file_number);
-      }
+      // Build single-key request payload inputs
+      std::vector<uint64_t> candidate_list(candidate_file_numbers.begin(),
+                                           candidate_file_numbers.end());
 
       // Execute async RPC
       bloomcheck::BatchResponse response;
       size_t channel_idx = 0;
-      size_t channel_count = client->GetChannelCount();
+      size_t channel_count = client != nullptr ? client->GetChannelCount() : 0;
       const char* check_transport = "grpc";
       uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
       uint64_t rpc_us = 0;
@@ -2984,24 +3010,115 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
 #if defined(ROCKSDB_BLOOMCHECK_ERPC)
         ErpcBloomCheckClient* erpc_client = GetErpcClientSingleton();
         if (erpc_client != nullptr) {
-          uint64_t rtt_ns = 0;
-          check_ok = erpc_client->CheckBatch(request, &response, &rtt_ns, &channel_idx);
-          rpc_us = rtt_ns / 1000;
+          // eRPC check: chunk candidates to avoid long tail timeouts on very large sets.
+          const size_t chunk_sz =
+              std::max(static_cast<size_t>(1), erpc_check_chunk_size);
+          uint64_t checked_total = 0;
+          std::unordered_set<uint64_t> may_match_union;
+          check_ok = true;
           check_transport = "erpc";
           channel_count = erpc_client->PoolSize();
-        } else {
+
+          for (size_t off = 0; off < candidate_list.size(); off += chunk_sz) {
+            size_t end = std::min(candidate_list.size(), off + chunk_sz);
+            bloomcheck::BatchRequest request;
+            bloomcheck::KeyRequest* key_req = request.add_reqs();
+            key_req->set_user_key(user_key_str);
+            for (size_t i = off; i < end; ++i) {
+              key_req->add_sst_file_numbers(candidate_list[i]);
+            }
+
+            bloomcheck::BatchResponse chunk_resp;
+            uint64_t rtt_ns = 0;
+            bool chunk_ok =
+                erpc_client->CheckBatch(request, &chunk_resp, &rtt_ns, &channel_idx);
+            if (!(chunk_ok && chunk_resp.resps_size() == 1 &&
+                  chunk_resp.resps(0).complete())) {
+              check_ok = false;
+              break;
+            }
+            const auto& kr = chunk_resp.resps(0);
+            checked_total += kr.checked_count();
+            for (int j = 0; j < kr.may_match_sst_file_numbers_size(); ++j) {
+              may_match_union.insert(kr.may_match_sst_file_numbers(j));
+            }
+          }
+
+          if (check_ok) {
+            response.Clear();
+            auto* merged = response.add_resps();
+            for (uint64_t fnum : may_match_union) {
+              merged->add_may_match_sst_file_numbers(fnum);
+            }
+            merged->set_complete(true);
+            merged->set_checked_count(checked_total);
+            merged->set_total_candidates(static_cast<uint64_t>(candidate_list.size()));
+          }
+          // gRPC 경로와 동일하게 Version::Get 내부 호출 구간 wall-clock으로 측정
+          rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+          if (!check_ok && client != nullptr) {
+            // eRPC check 실패 시 기존 gRPC 경로로 즉시 fallback
+            uint64_t grpc_start_us = storage_info_.clock_->NowMicros();
+            bloomcheck::BatchRequest request;
+            bloomcheck::KeyRequest* key_req = request.add_reqs();
+            key_req->set_user_key(user_key_str);
+            for (uint64_t file_number : candidate_file_numbers) {
+              key_req->add_sst_file_numbers(file_number);
+            }
+            check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
+            rpc_us = storage_info_.clock_->NowMicros() - grpc_start_us;
+            check_transport = "grpc_fallback_after_erpc_fail";
+            channel_count = client->GetChannelCount();
+          } else if (!check_ok && client == nullptr) {
+            check_transport = "erpc_fail_no_grpc_client";
+          }
+        } else if (client != nullptr) {
+          bloomcheck::BatchRequest request;
+          bloomcheck::KeyRequest* key_req = request.add_reqs();
+          key_req->set_user_key(user_key_str);
+          for (uint64_t file_number : candidate_file_numbers) {
+            key_req->add_sst_file_numbers(file_number);
+          }
           check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
           rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
           check_transport = "grpc_fallback";
+        } else {
+          check_ok = false;
+          rpc_us = 0;
+          check_transport = "erpc_unavailable_no_grpc_client";
         }
 #else
-        check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
-        rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
-        check_transport = "grpc_fallback_no_erpc_build";
+        if (client != nullptr) {
+          bloomcheck::BatchRequest request;
+          bloomcheck::KeyRequest* key_req = request.add_reqs();
+          key_req->set_user_key(user_key_str);
+          for (uint64_t file_number : candidate_file_numbers) {
+            key_req->add_sst_file_numbers(file_number);
+          }
+          check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
+          rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+          check_transport = "grpc_fallback_no_erpc_build";
+        } else {
+          check_ok = false;
+          rpc_us = 0;
+          check_transport = "erpc_not_built_no_grpc_client";
+        }
 #endif
       } else {
-        check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
-        rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+        if (client != nullptr) {
+          bloomcheck::BatchRequest request;
+          bloomcheck::KeyRequest* key_req = request.add_reqs();
+          key_req->set_user_key(user_key_str);
+          for (uint64_t file_number : candidate_file_numbers) {
+            key_req->add_sst_file_numbers(file_number);
+          }
+          check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
+          rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+        } else {
+          check_ok = false;
+          rpc_us = 0;
+          check_transport = "grpc_client_unavailable";
+        }
       }
 
       // Map response back to may_match_files

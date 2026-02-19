@@ -5,6 +5,7 @@
 
 #include "util/bloomcheck_erpc_client.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -24,8 +25,12 @@
 #include <utility>
 #include <vector>
 
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 // eRPC includes
 #if __has_include("erpc/transport_impl/infiniband/ib_transport.h")
@@ -151,6 +156,48 @@ bool PinCurrentThreadToCpu(int cpu) {
   return pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0;
 }
 
+std::vector<int> GetCurrentThreadAllowedCpus() {
+  std::vector<int> cpus;
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  if (sched_getaffinity(0, sizeof(mask), &mask) != 0) {
+    return cpus;
+  }
+  for (int c = 0; c < CPU_SETSIZE; ++c) {
+    if (CPU_ISSET(c, &mask)) {
+      cpus.push_back(c);
+    }
+  }
+  return cpus;
+}
+
+std::vector<int> BuildDefaultOddWorkerCpuOrder() {
+  // Default preference keeps workers on odd cores and starts at 17 descending:
+  // 17, 15, 13, 11, ...
+  static const int kPreferred[] = {17, 15, 13, 11, 9, 7, 5, 3, 1,
+                                   31, 29, 27, 25, 23, 21, 19};
+  return std::vector<int>(kPreferred, kPreferred + sizeof(kPreferred) / sizeof(int));
+}
+
+void SetCurrentThreadName(size_t index) {
+  char name[16];
+  std::snprintf(name, sizeof(name), "erpc_w%02zu", index);
+  pthread_setname_np(pthread_self(), name);
+}
+
+void LowerCurrentThreadPriority() {
+#ifdef SCHED_BATCH
+  struct sched_param sp;
+  std::memset(&sp, 0, sizeof(sp));
+  if (pthread_setschedparam(pthread_self(), SCHED_BATCH, &sp) == 0) {
+    return;
+  }
+#endif
+  // Fallback: lower worker priority with nice(+10).
+  const pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+  (void)setpriority(PRIO_PROCESS, static_cast<id_t>(tid), 10);
+}
+
 class Semaphore {
  public:
   explicit Semaphore(int permits) : permits_(permits), available_(permits) {}
@@ -266,7 +313,7 @@ struct CallTask {
   TaskKind kind = TaskKind::kNoop;
   std::string req_payload;
   size_t resp_capacity = 256;
-  uint64_t deadline_ns = 0;
+  uint64_t enqueue_ns = 0;
   std::promise<RpcCallResult> promise;
 };
 
@@ -279,11 +326,15 @@ struct ProcessContext {
   uint8_t server_rpc_id = 0;
   uint8_t base_rpc_id = 0;
   std::atomic<uint16_t> next_rpc_id{0};
+  std::atomic<uint64_t> next_worker_rr{0};
   int connect_timeout_ms = 2000;
   int rpc_timeout_ms = 100;
   int pool_size = 0;
   bool pool_pin_to_cores = false;
+  std::vector<int> worker_cpus;
   int max_inflight = 0;
+  bool debug_queue_delay = false;
+  int worker_max_outstanding = 32;
   std::unique_ptr<Semaphore> inflight_sem;
   std::vector<std::unique_ptr<Worker>> workers;
   std::atomic<bool> pool_ready{false};
@@ -441,6 +492,14 @@ class Worker {
   bool IsConnected() const { return connected_.load(std::memory_order_acquire); }
 
  private:
+  struct PendingRpc {
+    std::unique_ptr<CallTask> task;
+    InflightCall* call = nullptr;
+    uint64_t deadline_ns = 0;
+    uint64_t queue_delay_us = 0;
+    uint8_t req_type = 0;
+  };
+
   void ReapTimedOutCalls() {
     if (!rpc_) {
       return;
@@ -459,22 +518,48 @@ class Worker {
     }
   }
 
-  void TryPinToNumaCore(const ProcessContext& pc) {
+  void ConfigureWorkerThread(const ProcessContext& pc) {
+    SetCurrentThreadName(index_);
+    LowerCurrentThreadPriority();
+
     if (!pc.pool_pin_to_cores) {
       return;
     }
-    std::vector<int> cpus = GetNumaNodeCpus(pc.numa_node);
+
+    std::vector<int> cpus;
+    if (!pc.worker_cpus.empty()) {
+      cpus = pc.worker_cpus;
+    } else {
+      // Build default odd-core policy and keep only currently allowed CPUs.
+      const std::vector<int> preferred = BuildDefaultOddWorkerCpuOrder();
+      const std::vector<int> allowed = GetCurrentThreadAllowedCpus();
+      for (int cpu : preferred) {
+        if (std::find(allowed.begin(), allowed.end(), cpu) != allowed.end()) {
+          cpus.push_back(cpu);
+        }
+      }
+      if (cpus.empty()) {
+        // Fallback to odd CPUs on target NUMA node in descending order.
+        std::vector<int> node_cpus = GetNumaNodeCpus(pc.numa_node);
+        for (auto it = node_cpus.rbegin(); it != node_cpus.rend(); ++it) {
+          if ((*it & 1) == 1) {
+            cpus.push_back(*it);
+          }
+        }
+      }
+    }
+
     if (cpus.empty()) {
       fprintf(stderr,
-              "[ErpcBloomCheckClient] Worker %zu pin skipped: node%d cpulist unavailable\n",
-              index_, pc.numa_node);
+              "[ErpcBloomCheckClient] Worker %zu pin skipped: no eligible CPU set\n",
+              index_);
       return;
     }
     int cpu = cpus[index_ % cpus.size()];
     if (PinCurrentThreadToCpu(cpu)) {
       fprintf(stderr,
-              "[ErpcBloomCheckClient] Worker %zu pinned to CPU %d (node%d)\n", index_,
-              cpu, pc.numa_node);
+              "[ErpcBloomCheckClient] Worker %zu pinned to CPU %d (odd-core policy)\n",
+              index_, cpu);
     }
   }
 
@@ -528,51 +613,62 @@ class Worker {
     return true;
   }
 
-  RpcCallResult ExecuteTask(const ProcessContext& pc, const CallTask& task) {
-    RpcCallResult result;
-    ReapTimedOutCalls();
+  bool EnqueuePendingTask(const ProcessContext& pc, std::unique_ptr<CallTask> task) {
+    if (!task) {
+      return false;
+    }
+    const uint64_t worker_start_ns = NowNs();
+    const uint64_t queue_delay_us =
+        worker_start_ns > task->enqueue_ns
+            ? (worker_start_ns - task->enqueue_ns) / 1000ULL
+            : 0ULL;
+    if (pc.debug_queue_delay && queue_delay_us > 0) {
+      fprintf(stderr,
+              "[ErpcBloomCheckClient][DBG] worker=%zu type=%u queue_delay_us=%llu\n",
+              index_, static_cast<unsigned>(task->kind),
+              static_cast<unsigned long long>(queue_delay_us));
+    }
 
     auto* call = new InflightCall();
-    call->req_msgbuf = rpc_->alloc_msg_buffer_or_die(task.req_payload.empty()
+    call->req_msgbuf = rpc_->alloc_msg_buffer_or_die(task->req_payload.empty()
                                                           ? 1
-                                                          : task.req_payload.size());
-    call->resp_msgbuf = rpc_->alloc_msg_buffer_or_die(task.resp_capacity);
+                                                          : task->req_payload.size());
+    call->resp_msgbuf = rpc_->alloc_msg_buffer_or_die(task->resp_capacity);
 
-    if (!task.req_payload.empty()) {
-      rpc_->resize_msg_buffer(&call->req_msgbuf, task.req_payload.size());
-      memcpy(call->req_msgbuf.buf_, task.req_payload.data(), task.req_payload.size());
+    if (!task->req_payload.empty()) {
+      rpc_->resize_msg_buffer(&call->req_msgbuf, task->req_payload.size());
+      memcpy(call->req_msgbuf.buf_, task->req_payload.data(), task->req_payload.size());
     } else {
       rpc_->resize_msg_buffer(&call->req_msgbuf, 0);
     }
 
     call->send_ns = NowNs();
+    const uint64_t deadline_ns =
+        call->send_ns + static_cast<uint64_t>(pc.rpc_timeout_ms) * 1000000ULL;
     const uint8_t req_type =
-        task.kind == TaskKind::kNoop ? ErpcBloomCheckClient::kReqTypeNoop
-                                     : ErpcBloomCheckClient::kReqTypeCheck;
+        task->kind == TaskKind::kNoop ? ErpcBloomCheckClient::kReqTypeNoop
+                                      : ErpcBloomCheckClient::kReqTypeCheck;
     rpc_->enqueue_request(session_num_, req_type, &call->req_msgbuf, &call->resp_msgbuf,
                           cont_func_common, call);
 
-    bool timed_out = false;
-    while (!call->done.load(std::memory_order_acquire)) {
-      rpc_->run_event_loop_once();
-      if (NowNs() > task.deadline_ns || shutdown_) {
-        timed_out = true;
-        break;
-      }
-    }
+    PendingRpc pending;
+    pending.task = std::move(task);
+    pending.call = call;
+    pending.deadline_ns = deadline_ns;
+    pending.queue_delay_us = queue_delay_us;
+    pending.req_type = req_type;
+    pending_calls_.emplace_back(std::move(pending));
+    return true;
+  }
 
-    if (timed_out) {
-      timed_out_calls_.push_back(call);
-      fprintf(stderr,
-              "[ErpcBloomCheckClient] Worker %zu rpc timeout (%d ms, rpc_id=%u, type=%u)\n",
-              index_, pc.rpc_timeout_ms, static_cast<unsigned>(rpc_id_),
-              static_cast<unsigned>(req_type));
+  RpcCallResult BuildResultFromCall(TaskKind kind, InflightCall* call) {
+    RpcCallResult result;
+    if (call == nullptr) {
       return result;
     }
-
     result.rtt_ns = call->rtt_ns;
 
-    if (task.kind == TaskKind::kNoop) {
+    if (kind == TaskKind::kNoop) {
       if (call->resp_msgbuf.get_data_size() > 0) {
         bloomcheck::NoopResponse resp;
         call->parse_ok = resp.ParseFromArray(
@@ -593,11 +689,66 @@ class Worker {
       }
       result.ok = call->parse_ok;
     }
-
-    rpc_->free_msg_buffer(call->req_msgbuf);
-    rpc_->free_msg_buffer(call->resp_msgbuf);
-    delete call;
     return result;
+  }
+
+  void FinalizePendingAt(size_t idx, bool timed_out, const ProcessContext& pc) {
+    PendingRpc pending = std::move(pending_calls_[idx]);
+    pending_calls_[idx] = std::move(pending_calls_.back());
+    pending_calls_.pop_back();
+
+    if (!pending.task) {
+      return;
+    }
+
+    RpcCallResult result;
+    if (timed_out) {
+      timed_out_calls_.push_back(pending.call);
+      fprintf(stderr,
+              "[ErpcBloomCheckClient] Worker %zu rpc timeout (%d ms, rpc_id=%u, type=%u, queue_delay_us=%llu)\n",
+              index_, pc.rpc_timeout_ms, static_cast<unsigned>(rpc_id_),
+              static_cast<unsigned>(pending.req_type),
+              static_cast<unsigned long long>(pending.queue_delay_us));
+      pending.task->promise.set_value(std::move(result));
+      return;
+    }
+
+    result = BuildResultFromCall(pending.task->kind, pending.call);
+    rpc_->free_msg_buffer(pending.call->req_msgbuf);
+    rpc_->free_msg_buffer(pending.call->resp_msgbuf);
+    delete pending.call;
+    pending.task->promise.set_value(std::move(result));
+  }
+
+  void PollAndHarvest(const ProcessContext& pc) {
+    if (!rpc_) {
+      return;
+    }
+    rpc_->run_event_loop_once();
+    const uint64_t now_ns = NowNs();
+    for (size_t i = 0; i < pending_calls_.size();) {
+      const bool done = pending_calls_[i].call->done.load(std::memory_order_acquire);
+      const bool timed_out = !done && (shutdown_ || now_ns > pending_calls_[i].deadline_ns);
+      if (!done && !timed_out) {
+        ++i;
+        continue;
+      }
+      FinalizePendingAt(i, timed_out, pc);
+    }
+    ReapTimedOutCalls();
+  }
+
+  bool PopOneTask(std::unique_ptr<CallTask>* out_task) {
+    if (out_task == nullptr) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (queue_.empty()) {
+      return false;
+    }
+    *out_task = std::move(queue_.front());
+    queue_.pop();
+    return true;
   }
 
   void ThreadMain() {
@@ -606,7 +757,7 @@ class Worker {
       return;
     }
 
-    TryPinToNumaCore(*pc);
+    ConfigureWorkerThread(*pc);
 
     bool init_ok = InitRpcAndSession(*pc);
     if (!init_ok) {
@@ -614,41 +765,56 @@ class Worker {
       connected_.store(false, std::memory_order_release);
     }
 
+    const size_t max_outstanding =
+        static_cast<size_t>(pc->worker_max_outstanding > 0
+                                ? pc->worker_max_outstanding
+                                : 1);
+
     while (true) {
-      std::unique_ptr<CallTask> task;
-      {
+      while (!disabled_ && rpc_ && pending_calls_.size() < max_outstanding) {
+        std::unique_ptr<CallTask> task;
+        if (!PopOneTask(&task)) {
+          break;
+        }
+        if (!EnqueuePendingTask(*pc, std::move(task))) {
+          break;
+        }
+      }
+
+      if (disabled_ || !rpc_) {
+        std::unique_ptr<CallTask> task;
+        if (PopOneTask(&task) && task) {
+          task->promise.set_value(RpcCallResult{});
+          continue;
+        }
         std::unique_lock<std::mutex> lock(mu_);
         cv_.wait_for(lock, std::chrono::milliseconds(1),
                      [&] { return shutdown_ || !queue_.empty(); });
         if (shutdown_ && queue_.empty()) {
           break;
         }
-        if (!queue_.empty()) {
-          task = std::move(queue_.front());
-          queue_.pop();
-        }
-      }
-
-      if (!task) {
-        if (rpc_) {
-          rpc_->run_event_loop_once();
-          ReapTimedOutCalls();
-        }
         continue;
       }
 
-      if (disabled_ || !rpc_) {
-        task->promise.set_value(RpcCallResult{});
+      if (!pending_calls_.empty()) {
+        PollAndHarvest(*pc);
         continue;
       }
 
-      RpcCallResult result = ExecuteTask(*pc, *task);
-      task->promise.set_value(std::move(result));
+      std::unique_lock<std::mutex> lock(mu_);
+      cv_.wait_for(lock, std::chrono::milliseconds(1),
+                   [&] { return shutdown_ || !queue_.empty(); });
+      if (shutdown_ && queue_.empty() && pending_calls_.empty()) {
+        break;
+      }
     }
 
     if (rpc_) {
       for (int i = 0; i < 8; ++i) {
         rpc_->run_event_loop_once();
+      }
+      while (!pending_calls_.empty()) {
+        FinalizePendingAt(0, true, *pc);
       }
       ReapTimedOutCalls();
     }
@@ -681,6 +847,7 @@ class Worker {
   bool disabled_ = false;
   std::atomic<bool> connected_{false};
   std::vector<InflightCall*> timed_out_calls_;
+  std::vector<PendingRpc> pending_calls_;
 };
 
 }  // namespace
@@ -700,9 +867,21 @@ struct ErpcBloomCheckClientImpl {
     pc->rpc_timeout_ms = ParseEnvMs("BLOOMCHECK_ERPC_RPC_TIMEOUT_MS", 100);
     pc->pool_size = ParseEnvInt("BLOOMCHECK_ERPC_POOL_SIZE", 0, 0, 1024);
     pc->pool_pin_to_cores =
-        ParseEnvInt("BLOOMCHECK_ERPC_POOL_PIN_TO_CORES", 0, 0, 1) == 1;
+        ParseEnvInt("BLOOMCHECK_ERPC_POOL_PIN_TO_CORES", 1, 0, 1) == 1;
+    const char* worker_cpus_env = std::getenv("BLOOMCHECK_ERPC_WORKER_CPUS");
+    if (worker_cpus_env != nullptr && worker_cpus_env[0] != '\0') {
+      pc->worker_cpus = ParseCpuList(worker_cpus_env);
+    } else if (pc->pool_size == 16) {
+      // Default fixed mapping for 16-worker pool: odd CPUs 1..31
+      pc->worker_cpus = {1, 3, 5, 7, 9, 11, 13, 15,
+                         17, 19, 21, 23, 25, 27, 29, 31};
+    }
     pc->max_inflight =
         ParseEnvInt("BLOOMCHECK_ERPC_MAX_INFLIGHT", 0, 0, 1000000);
+    pc->debug_queue_delay =
+        ParseEnvInt("BLOOMCHECK_ERPC_DEBUG_QUEUE_DELAY", 0, 0, 1) == 1;
+    pc->worker_max_outstanding = ParseEnvInt(
+        "BLOOMCHECK_ERPC_WORKER_MAX_OUTSTANDING", 32, 1, 4096);
     if (pc->max_inflight > 0) {
       pc->inflight_sem = std::make_unique<Semaphore>(pc->max_inflight);
     }
@@ -757,12 +936,14 @@ struct ErpcBloomCheckClientImpl {
       fprintf(stderr,
               "[ErpcBloomCheckClient] ProcessContext initialized: local=%s server=%s "
               "base_rpc_id=%u server_rpc_id=%u connect_timeout_ms=%d rpc_timeout_ms=%d "
-              "pool_size=%d pool_pin_to_cores=%d max_inflight=%d\n",
+              "pool_size=%d pool_pin_to_cores=%d max_inflight=%d debug_queue_delay=%d "
+              "worker_max_outstanding=%d\n",
               pc->local_uri.c_str(), pc->server_uri.c_str(),
               static_cast<unsigned>(pc->base_rpc_id),
               static_cast<unsigned>(pc->server_rpc_id), pc->connect_timeout_ms,
               pc->rpc_timeout_ms, pc->pool_size, pc->pool_pin_to_cores ? 1 : 0,
-              pc->max_inflight);
+              pc->max_inflight, pc->debug_queue_delay ? 1 : 0,
+              pc->worker_max_outstanding);
       return StartWorkerPoolLocked();
     } catch (const std::exception& e) {
       fprintf(stderr, "[ErpcBloomCheckClient] Nexus init failed: %s\n", e.what());
@@ -877,8 +1058,9 @@ struct ErpcBloomCheckClientImpl {
       return false;
     }
 
-    const size_t worker_idx =
-        std::hash<std::thread::id>{}(std::this_thread::get_id()) % pc->workers.size();
+    const size_t worker_idx = static_cast<size_t>(
+        pc->next_worker_rr.fetch_add(1, std::memory_order_relaxed) %
+        static_cast<uint64_t>(pc->workers.size()));
     if (slot_idx != nullptr) {
       *slot_idx = worker_idx;
     }
@@ -891,8 +1073,7 @@ struct ErpcBloomCheckClientImpl {
     task->kind = kind;
     task->req_payload = req_payload;
     task->resp_capacity = resp_capacity;
-    task->deadline_ns =
-        NowNs() + static_cast<uint64_t>(pc->rpc_timeout_ms) * 1000000ULL;
+    task->enqueue_ns = NowNs();
 
     std::future<RpcCallResult> fut;
     if (!worker->EnqueueTask(std::move(task), &fut)) {

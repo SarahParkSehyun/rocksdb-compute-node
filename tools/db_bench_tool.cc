@@ -3611,9 +3611,14 @@ class Benchmark {
       // If BLOOMCHECK_SERVER is set, DBImpl will automatically inject the client
       // into ReadOptions during Get/MultiGet/NewIterator operations.
       const char* bloomcheck_server = std::getenv("BLOOMCHECK_SERVER");
-      if (bloomcheck_server != nullptr && strlen(bloomcheck_server) > 0) {
+      const char* use_erpc = std::getenv("BLOOMCHECK_USE_ERPC");
+      bool erpc_mode = use_erpc != nullptr && std::string(use_erpc) == "1";
+      if (!erpc_mode && bloomcheck_server != nullptr &&
+          strlen(bloomcheck_server) > 0) {
         fprintf(stdout, "BloomCheck server configured: %s (client managed by DBImpl)\n",
                 bloomcheck_server);
+      } else if (erpc_mode) {
+        fprintf(stdout, "BloomCheck eRPC mode enabled: gRPC client initialization skipped\n");
       }
 
       void (Benchmark::*method)(ThreadState*) = nullptr;
@@ -4086,10 +4091,54 @@ class Benchmark {
     void (Benchmark::*method)(ThreadState*);
   };
 
+  static void PinDbBenchThreadToEvenCpu(int thread_tid) {
+#if defined(__linux__) && !defined(OS_WIN)
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+      return;
+    }
+
+    int even_count = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+      if (CPU_ISSET(cpu, &allowed) && ((cpu & 1) == 0)) {
+        ++even_count;
+      }
+    }
+    if (even_count <= 0) {
+      return;
+    }
+
+    const int pick = thread_tid % even_count;
+    int target_cpu = -1;
+    int seen = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+      if (CPU_ISSET(cpu, &allowed) && ((cpu & 1) == 0)) {
+        if (seen == pick) {
+          target_cpu = cpu;
+          break;
+        }
+        ++seen;
+      }
+    }
+    if (target_cpu < 0) {
+      return;
+    }
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(target_cpu, &cpuset);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+#else
+    (void)thread_tid;
+#endif
+  }
+
   static void ThreadBody(void* v) {
     ThreadArg* arg = static_cast<ThreadArg*>(v);
     SharedState* shared = arg->shared;
     ThreadState* thread = arg->thread;
+    PinDbBenchThreadToEvenCpu(thread->tid);
     {
       MutexLock l(&shared->mu);
       shared->num_initialized++;
