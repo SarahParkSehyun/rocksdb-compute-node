@@ -2783,6 +2783,10 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     const char* env = std::getenv("BLOOMCHECK_RPC_LOG");
     return env != nullptr && std::string(env) == "1";
   }();
+  static bool bloomcheck_use_streaming = []() {
+    const char* env = std::getenv("BLOOMCHECK_USE_STREAMING");
+    return env != nullptr && std::string(env) == "1";
+  }();
 
   // 샘플링 레이트: 기본값 1000 (1/1000)
   static std::atomic<uint64_t> noop_log_counter(0);
@@ -2922,8 +2926,9 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
               ? response.resps(0).may_match_sst_file_numbers_size() : 0;
           if (info_log_) {
             ROCKS_LOG_INFO(info_log_,
-                           "[BloomCheckRPC] channels=%zu idx=%zu req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d",
+                           "[BloomCheckRPC] channels=%zu idx=%zu streaming=%d req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d",
                            channel_count, channel_idx,
+                           bloomcheck_use_streaming ? 1 : 0,
                            request_bytes,
                            (unsigned long long)rpc_us,
                            (unsigned long long)rpc_timing.acquire_wait_us,
@@ -2933,8 +2938,9 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                            (unsigned long long)rpc_timing.response_parse_us,
                            check_ok ? 1 : 0, total_may);
           } else {
-            fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d\n",
+            fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu streaming=%d req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d\n",
                     channel_count, channel_idx,
+                    bloomcheck_use_streaming ? 1 : 0,
                     request_bytes,
                     (unsigned long long)rpc_us,
                     (unsigned long long)rpc_timing.acquire_wait_us,
