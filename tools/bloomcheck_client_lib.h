@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <grpcpp/grpcpp.h>
 #include <memory>
 #include <mutex>
@@ -15,6 +16,7 @@
 #include <sched.h>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unistd.h>  // for sysconf, getpid
 #include <sys/time.h>  // for gettimeofday
 #include <sys/syscall.h>  // for SYS_gettid
@@ -123,7 +125,13 @@ class SemaphoreGuard {
 };
 
 // Base class for async RPC calls (allows CQ poller to handle different RPC types)
-class AsyncRPCCallBase {
+class CqTagBase {
+ public:
+  virtual ~CqTagBase() = default;
+  virtual void Proceed(bool ok) = 0;
+};
+
+class AsyncRPCCallBase : public CqTagBase {
  public:
   AsyncRPCCallBase() : ok_(false), completed_(false) {}
 
@@ -147,6 +155,10 @@ class AsyncRPCCallBase {
   grpc::Status status_;
   size_t channel_idx_ = 0;
   std::atomic<uint64_t> signal_us_{0};
+  void Proceed(bool ok) override {
+    ok_ = ok;
+    Signal();
+  }
 
  protected:
   std::mutex mutex_;
@@ -267,6 +279,28 @@ class BloomCheckServiceClient {
               max_inflight, channel_count_);
     } else {
       fprintf(stderr, "[BloomCheckClient] Inflight limiting disabled (unlimited)\n");
+    }
+
+    use_streaming_ = false;
+    streams_per_channel_ = 4;
+    stream_max_pending_ = 4096;
+    const char* streaming_env = std::getenv("BLOOMCHECK_USE_STREAMING");
+    if (streaming_env != nullptr && std::atoi(streaming_env) == 1) {
+      use_streaming_ = true;
+    }
+    const char* streams_env = std::getenv("BLOOMCHECK_STREAMS_PER_CHANNEL");
+    if (streams_env != nullptr) {
+      int stream_count = std::atoi(streams_env);
+      if (stream_count > 0) {
+        streams_per_channel_ = static_cast<size_t>(stream_count);
+      }
+    }
+    const char* stream_pending_env = std::getenv("BLOOMCHECK_STREAM_MAX_PENDING");
+    if (stream_pending_env != nullptr) {
+      int pending_count = std::atoi(stream_pending_env);
+      if (pending_count > 0) {
+        stream_max_pending_ = static_cast<size_t>(pending_count);
+      }
     }
 
     // Create channel pool with unique identifiers to prevent connection sharing
@@ -416,6 +450,24 @@ class BloomCheckServiceClient {
     // Log initialization info
     fprintf(stderr, "[BloomCheckClient] Initialized: stubs_.size()=%zu, cqs_.size()=%zu, poller_thread_count=%zu\n",
             stubs_.size(), cqs_.size(), cq_poller_threads_.size());
+
+    if (use_streaming_) {
+      stream_sessions_.resize(channel_count_);
+      for (size_t ch = 0; ch < channel_count_; ++ch) {
+        auto& per_channel = stream_sessions_[ch];
+        per_channel.reserve(streams_per_channel_);
+        for (size_t s = 0; s < streams_per_channel_; ++s) {
+          size_t cq_idx = ch % cqs_.size();
+          per_channel.emplace_back(std::make_unique<StreamSession>(
+              this, ch, s, cq_idx, stream_max_pending_));
+        }
+      }
+      fprintf(stderr,
+              "[BloomCheckClient] Streaming enabled: channels=%zu streams_per_channel=%zu stream_max_pending=%zu\n",
+              channel_count_, streams_per_channel_, stream_max_pending_);
+    } else {
+      fprintf(stderr, "[BloomCheckClient] Streaming disabled: using unary RPC path\n");
+    }
     
     // Initialize inflight statistics
     inflight_now_.store(0, std::memory_order_relaxed);
@@ -510,6 +562,16 @@ class BloomCheckServiceClient {
         fprintf(stderr, "[BloomCheckClient] WARNING: wait_cnt=0 means inflight limiting may not be effective\n");
       }
     }
+
+    if (use_streaming_) {
+      for (auto& per_channel : stream_sessions_) {
+        for (auto& session : per_channel) {
+          if (session) {
+            session->Shutdown();
+          }
+        }
+      }
+    }
     
     // Shutdown all CQs
     for (auto& cq : cqs_) {
@@ -523,14 +585,18 @@ class BloomCheckServiceClient {
     }
   }
 
+  uint64_t GetThreadHash() const {
+    std::hash<std::thread::id> hasher;
+    return static_cast<uint64_t>(hasher(std::this_thread::get_id()));
+  }
+
   // Get channel index for current thread
   size_t GetChannelIndex() const {
     if (channel_count_ == 1) {
       return 0;
     }
     // Use thread id hash to select channel
-    std::hash<std::thread::id> hasher;
-    uint64_t tid_hash = static_cast<uint64_t>(hasher(std::this_thread::get_id()));
+    uint64_t tid_hash = GetThreadHash();
     return static_cast<size_t>(tid_hash % channel_count_);
   }
 
@@ -587,6 +653,22 @@ class BloomCheckServiceClient {
     // This will block if MAX_INFLIGHT limit is reached
     SemaphoreGuard guard(inflight_semaphore_.get());
     const uint64_t t_after_acquire = BloomNowMicros();
+
+    if (use_streaming_ && request.reqs_size() == 1) {
+      return AsyncCheckBatchStreaming(request, response, channel_idx, timing,
+                                      t_acquire_begin, t_after_acquire);
+    }
+
+    return AsyncCheckBatchUnary(request, response, channel_idx, timing,
+                                t_acquire_begin, t_after_acquire);
+  }
+
+ private:
+  bool AsyncCheckBatchUnary(const bloomcheck::BatchRequest& request,
+                            bloomcheck::BatchResponse* response,
+                            size_t* channel_idx, RpcTimingBreakdown* timing,
+                            uint64_t t_acquire_begin,
+                            uint64_t t_after_acquire) {
 
     // Select channel and CQ
     size_t stub_idx = GetChannelIndex();
@@ -661,6 +743,95 @@ class BloomCheckServiceClient {
     }
     return call->status_.ok();
   }
+
+  bool AsyncCheckBatchStreaming(const bloomcheck::BatchRequest& request,
+                                bloomcheck::BatchResponse* response,
+                                size_t* channel_idx, RpcTimingBreakdown* timing,
+                                uint64_t t_acquire_begin,
+                                uint64_t t_after_acquire) {
+    if (stream_sessions_.empty()) {
+      return AsyncCheckBatchUnary(request, response, channel_idx, timing,
+                                  t_acquire_begin, t_after_acquire);
+    }
+
+    const uint64_t tid_hash = GetThreadHash();
+    const size_t stub_idx = static_cast<size_t>(tid_hash % channel_count_);
+    const size_t stream_idx =
+        static_cast<size_t>(tid_hash % streams_per_channel_);
+    if (channel_idx != nullptr) {
+      *channel_idx = stub_idx;
+    }
+
+    auto& per_channel = stream_sessions_[stub_idx];
+    if (stream_idx >= per_channel.size() || per_channel[stream_idx] == nullptr) {
+      return AsyncCheckBatchUnary(request, response, channel_idx, timing,
+                                  t_acquire_begin, t_after_acquire);
+    }
+
+    const auto& key_req = request.reqs(0);
+    bloomcheck::StreamRequest stream_req;
+    const uint64_t request_id =
+        next_stream_request_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+    stream_req.set_request_id(request_id);
+    stream_req.set_user_key(key_req.user_key());
+    for (int i = 0; i < key_req.sst_file_numbers_size(); ++i) {
+      stream_req.add_sst_file_numbers(key_req.sst_file_numbers(i));
+    }
+
+    auto pending = std::make_shared<PendingStreamCall>();
+    bool enqueued = per_channel[stream_idx]->EnqueueRequest(stream_req, pending);
+    const uint64_t t_after_finish = BloomNowMicros();
+    if (!enqueued) {
+      return false;
+    }
+
+    InflightGuard inflight_guard(
+        &inflight_now_, inflight_per_channel_[stub_idx].get(), &inflight_max_,
+        inflight_per_channel_max_[stub_idx].get());
+    rpc_started_total_.fetch_add(1, std::memory_order_relaxed);
+
+    const uint64_t t_wait_begin = BloomNowMicros();
+    bool ok = pending->Wait();
+    const uint64_t t_wait_end = BloomNowMicros();
+    rpc_completed_total_.fetch_add(1, std::memory_order_relaxed);
+
+    if (ok) {
+      response->Clear();
+      auto* out = response->add_resps();
+      out->set_complete(pending->resp.complete());
+      out->set_checked_count(pending->resp.checked_count());
+      out->set_total_candidates(pending->resp.total_candidates());
+      for (int i = 0; i < pending->resp.may_match_sst_file_numbers_size(); ++i) {
+        out->add_may_match_sst_file_numbers(
+            pending->resp.may_match_sst_file_numbers(i));
+      }
+    }
+    const uint64_t t_parse_end = BloomNowMicros();
+
+    if (timing != nullptr) {
+      timing->acquire_wait_us = t_after_acquire - t_acquire_begin;
+      timing->submit_prep_us = t_after_finish - t_after_acquire;
+      const uint64_t signal_us =
+          pending->signal_us.load(std::memory_order_acquire);
+      if (signal_us > 0) {
+        if (signal_us > t_wait_begin) {
+          timing->wait_completion_us = signal_us - t_wait_begin;
+          timing->wake_up_us = (t_wait_end > signal_us) ? (t_wait_end - signal_us) : 0;
+        } else {
+          timing->wait_completion_us = 0;
+          timing->wake_up_us =
+              (t_wait_end > t_wait_begin) ? (t_wait_end - t_wait_begin) : 0;
+        }
+      } else {
+        timing->wait_completion_us = t_wait_end - t_wait_begin;
+        timing->wake_up_us = 0;
+      }
+      timing->response_parse_us = t_parse_end - t_wait_end;
+    }
+    return ok;
+  }
+
+ public:
 
   // Noop RPC for latency measurement (sync unary) - deprecated, use AsyncNoop instead
   bool Noop(size_t* channel_idx = nullptr) {
@@ -761,6 +932,262 @@ class BloomCheckServiceClient {
   }
 
  private:
+  struct PendingStreamCall {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    bool ok = false;
+    bloomcheck::StreamResponse resp;
+    std::atomic<uint64_t> signal_us{0};
+
+    void CompleteSuccess(const bloomcheck::StreamResponse& response) {
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        resp = response;
+        ok = true;
+        done = true;
+        signal_us.store(BloomNowMicros(), std::memory_order_release);
+      }
+      cv.notify_one();
+    }
+
+    void CompleteFailure() {
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        ok = false;
+        done = true;
+        signal_us.store(BloomNowMicros(), std::memory_order_release);
+      }
+      cv.notify_one();
+    }
+
+    bool Wait() {
+      std::unique_lock<std::mutex> lock(mu);
+      cv.wait(lock, [this] { return done; });
+      return ok;
+    }
+  };
+
+  bool IsShutdownRequested() {
+    std::lock_guard<std::mutex> lock(shutdown_mutex_);
+    return shutdown_;
+  }
+
+  class StreamSession {
+   public:
+    StreamSession(BloomCheckServiceClient* owner, size_t channel_idx,
+                  size_t stream_idx, size_t cq_idx, size_t max_pending)
+        : owner_(owner),
+          channel_idx_(channel_idx),
+          stream_idx_(stream_idx),
+          cq_idx_(cq_idx),
+          max_pending_(max_pending),
+          start_tag_(this, TagType::kStart),
+          read_tag_(this, TagType::kRead),
+          write_tag_(this, TagType::kWrite) {}
+
+    bool EnqueueRequest(const bloomcheck::StreamRequest& req,
+                        const std::shared_ptr<PendingStreamCall>& call) {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (state_ == State::kClosed) {
+        return false;
+      }
+      if (pending_.size() >= max_pending_) {
+        return false;
+      }
+      pending_[req.request_id()] = call;
+      write_queue_.push_back(req);
+      if (state_ == State::kInit || state_ == State::kBroken) {
+        StartLocked();
+      }
+      if (state_ == State::kReady && !write_in_flight_) {
+        StartNextWriteLocked();
+      }
+      return true;
+    }
+
+    void Shutdown() {
+      std::vector<std::shared_ptr<PendingStreamCall>> to_fail;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        state_ = State::kClosed;
+        CollectAndClearPendingLocked(&to_fail);
+        write_queue_.clear();
+        write_in_flight_ = false;
+        read_in_flight_ = false;
+        if (ctx_) {
+          ctx_->TryCancel();
+        }
+        stream_.reset();
+        ctx_.reset();
+      }
+      for (const auto& call : to_fail) {
+        call->CompleteFailure();
+      }
+    }
+
+   private:
+    enum class State { kInit, kStarting, kReady, kBroken, kClosed };
+    enum class TagType { kStart, kRead, kWrite };
+
+    struct StreamTag : public CqTagBase {
+      StreamSession* session;
+      TagType type;
+      StreamTag(StreamSession* s, TagType t) : session(s), type(t) {}
+      void Proceed(bool ok) override { session->OnTag(type, ok); }
+    };
+
+    void OnTag(TagType type, bool ok) {
+      if (type == TagType::kStart) {
+        OnStartComplete(ok);
+      } else if (type == TagType::kRead) {
+        OnReadComplete(ok);
+      } else {
+        OnWriteComplete(ok);
+      }
+    }
+
+    void StartLocked() {
+      if (state_ == State::kClosed || state_ == State::kStarting) {
+        return;
+      }
+      ctx_ = std::make_unique<grpc::ClientContext>();
+      stream_ = owner_->stubs_[channel_idx_]->AsyncCheckBatchStream(
+          ctx_.get(), owner_->cqs_[cq_idx_].get(), &start_tag_);
+      state_ = State::kStarting;
+    }
+
+    void StartNextWriteLocked() {
+      if (state_ != State::kReady || write_in_flight_ || write_queue_.empty() ||
+          !stream_) {
+        return;
+      }
+      write_req_ = std::move(write_queue_.front());
+      write_queue_.pop_front();
+      write_in_flight_ = true;
+      stream_->Write(write_req_, &write_tag_);
+    }
+
+    void CollectAndClearPendingLocked(
+        std::vector<std::shared_ptr<PendingStreamCall>>* to_fail) {
+      to_fail->reserve(to_fail->size() + pending_.size());
+      for (auto& it : pending_) {
+        to_fail->push_back(it.second);
+      }
+      pending_.clear();
+    }
+
+    void BreakAndReconnectLocked(
+        std::vector<std::shared_ptr<PendingStreamCall>>* to_fail) {
+      if (state_ == State::kClosed) {
+        return;
+      }
+      state_ = State::kBroken;
+      CollectAndClearPendingLocked(to_fail);
+      write_queue_.clear();
+      write_in_flight_ = false;
+      read_in_flight_ = false;
+      if (ctx_) {
+        ctx_->TryCancel();
+      }
+      stream_.reset();
+      ctx_.reset();
+      if (!owner_->IsShutdownRequested()) {
+        StartLocked();
+      }
+    }
+
+    void OnStartComplete(bool ok) {
+      std::vector<std::shared_ptr<PendingStreamCall>> to_fail;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ok || !stream_) {
+          BreakAndReconnectLocked(&to_fail);
+        } else {
+          state_ = State::kReady;
+          if (!read_in_flight_) {
+            read_in_flight_ = true;
+            stream_->Read(&read_resp_, &read_tag_);
+          }
+          StartNextWriteLocked();
+        }
+      }
+      for (const auto& call : to_fail) {
+        call->CompleteFailure();
+      }
+    }
+
+    void OnWriteComplete(bool ok) {
+      std::vector<std::shared_ptr<PendingStreamCall>> to_fail;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        write_in_flight_ = false;
+        if (!ok) {
+          BreakAndReconnectLocked(&to_fail);
+        } else {
+          StartNextWriteLocked();
+        }
+      }
+      for (const auto& call : to_fail) {
+        call->CompleteFailure();
+      }
+    }
+
+    void OnReadComplete(bool ok) {
+      std::shared_ptr<PendingStreamCall> done_call;
+      bloomcheck::StreamResponse resp_copy;
+      std::vector<std::shared_ptr<PendingStreamCall>> to_fail;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        read_in_flight_ = false;
+        if (!ok) {
+          BreakAndReconnectLocked(&to_fail);
+        } else {
+          resp_copy = read_resp_;
+          auto it = pending_.find(resp_copy.request_id());
+          if (it != pending_.end()) {
+            done_call = it->second;
+            pending_.erase(it);
+          }
+          if (state_ == State::kReady && stream_) {
+            read_in_flight_ = true;
+            stream_->Read(&read_resp_, &read_tag_);
+          }
+        }
+      }
+
+      if (done_call) {
+        done_call->CompleteSuccess(resp_copy);
+      }
+      for (const auto& call : to_fail) {
+        call->CompleteFailure();
+      }
+    }
+
+    BloomCheckServiceClient* owner_;
+    const size_t channel_idx_;
+    const size_t stream_idx_;
+    const size_t cq_idx_;
+    const size_t max_pending_;
+
+    std::mutex mu_;
+    State state_ = State::kInit;
+    std::unique_ptr<grpc::ClientContext> ctx_;
+    std::unique_ptr<grpc::ClientAsyncReaderWriter<bloomcheck::StreamRequest,
+                                                  bloomcheck::StreamResponse>>
+        stream_;
+    std::deque<bloomcheck::StreamRequest> write_queue_;
+    std::unordered_map<uint64_t, std::shared_ptr<PendingStreamCall>> pending_;
+    bloomcheck::StreamRequest write_req_;
+    bloomcheck::StreamResponse read_resp_;
+    bool write_in_flight_ = false;
+    bool read_in_flight_ = false;
+
+    StreamTag start_tag_;
+    StreamTag read_tag_;
+    StreamTag write_tag_;
+  };
+
   // RAII guard for inflight counting (ensures decrement even on exception/early return)
   class InflightGuard {
    public:
@@ -938,10 +1365,8 @@ class BloomCheckServiceClient {
         break;
       }
 
-      // Handle completed RPC (works for both AsyncBloomCheckCall and AsyncNoopCall)
-      AsyncRPCCallBase* call = static_cast<AsyncRPCCallBase*>(tag);
-      call->ok_ = ok;
-      call->Signal();  // Wake up waiting Get() thread
+      CqTagBase* cq_tag = static_cast<CqTagBase*>(tag);
+      cq_tag->Proceed(ok);
     }
   }
 
@@ -953,6 +1378,11 @@ class BloomCheckServiceClient {
   std::mutex shutdown_mutex_;
   bool shutdown_;
   std::unique_ptr<Semaphore> inflight_semaphore_;  // For limiting concurrent inflight RPCs
+  bool use_streaming_ = false;
+  size_t streams_per_channel_ = 4;
+  size_t stream_max_pending_ = 4096;
+  std::atomic<uint64_t> next_stream_request_id_{0};
+  std::vector<std::vector<std::unique_ptr<StreamSession>>> stream_sessions_;
   
   // Inflight RPC statistics
   std::atomic<int64_t> inflight_now_;              // Current outstanding RPC count
