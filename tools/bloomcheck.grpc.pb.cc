@@ -24,6 +24,7 @@ namespace bloomcheck {
 static const char* BloomCheck_method_names[] = {
   "/bloomcheck.BloomCheck/Check",
   "/bloomcheck.BloomCheck/Noop",
+  "/bloomcheck.BloomCheck/CheckBatchStream",
 };
 
 std::unique_ptr< BloomCheck::Stub> BloomCheck::NewStub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options) {
@@ -35,6 +36,7 @@ std::unique_ptr< BloomCheck::Stub> BloomCheck::NewStub(const std::shared_ptr< ::
 BloomCheck::Stub::Stub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options)
   : channel_(channel), rpcmethod_Check_(BloomCheck_method_names[0], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
   , rpcmethod_Noop_(BloomCheck_method_names[1], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
+  , rpcmethod_CheckBatchStream_(BloomCheck_method_names[2], options.suffix_for_stats(),::grpc::internal::RpcMethod::BIDI_STREAMING, channel)
   {}
 
 ::grpc::Status BloomCheck::Stub::Check(::grpc::ClientContext* context, const ::bloomcheck::BatchRequest& request, ::bloomcheck::BatchResponse* response) {
@@ -83,6 +85,22 @@ void BloomCheck::Stub::async::Noop(::grpc::ClientContext* context, const ::bloom
   return result;
 }
 
+::grpc::ClientReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>* BloomCheck::Stub::CheckBatchStreamRaw(::grpc::ClientContext* context) {
+  return ::grpc::internal::ClientReaderWriterFactory< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>::Create(channel_.get(), rpcmethod_CheckBatchStream_, context);
+}
+
+void BloomCheck::Stub::async::CheckBatchStream(::grpc::ClientContext* context, ::grpc::ClientBidiReactor< ::bloomcheck::StreamRequest,::bloomcheck::StreamResponse>* reactor) {
+  ::grpc::internal::ClientCallbackReaderWriterFactory< ::bloomcheck::StreamRequest,::bloomcheck::StreamResponse>::Create(stub_->channel_.get(), stub_->rpcmethod_CheckBatchStream_, context, reactor);
+}
+
+::grpc::ClientAsyncReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>* BloomCheck::Stub::AsyncCheckBatchStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq, void* tag) {
+  return ::grpc::internal::ClientAsyncReaderWriterFactory< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>::Create(channel_.get(), cq, rpcmethod_CheckBatchStream_, context, true, tag);
+}
+
+::grpc::ClientAsyncReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>* BloomCheck::Stub::PrepareAsyncCheckBatchStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq) {
+  return ::grpc::internal::ClientAsyncReaderWriterFactory< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>::Create(channel_.get(), cq, rpcmethod_CheckBatchStream_, context, false, nullptr);
+}
+
 BloomCheck::Service::Service() {
   AddMethod(new ::grpc::internal::RpcServiceMethod(
       BloomCheck_method_names[0],
@@ -104,6 +122,16 @@ BloomCheck::Service::Service() {
              ::bloomcheck::NoopResponse* resp) {
                return service->Noop(ctx, req, resp);
              }, this)));
+  AddMethod(new ::grpc::internal::RpcServiceMethod(
+      BloomCheck_method_names[2],
+      ::grpc::internal::RpcMethod::BIDI_STREAMING,
+      new ::grpc::internal::BidiStreamingHandler< BloomCheck::Service, ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>(
+          [](BloomCheck::Service* service,
+             ::grpc::ServerContext* ctx,
+             ::grpc::ServerReaderWriter<::bloomcheck::StreamResponse,
+             ::bloomcheck::StreamRequest>* stream) {
+               return service->CheckBatchStream(ctx, stream);
+             }, this)));
 }
 
 BloomCheck::Service::~Service() {
@@ -120,6 +148,12 @@ BloomCheck::Service::~Service() {
   (void) context;
   (void) request;
   (void) response;
+  return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+}
+
+::grpc::Status BloomCheck::Service::CheckBatchStream(::grpc::ServerContext* context, ::grpc::ServerReaderWriter< ::bloomcheck::StreamResponse, ::bloomcheck::StreamRequest>* stream) {
+  (void) context;
+  (void) stream;
   return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
 }
 

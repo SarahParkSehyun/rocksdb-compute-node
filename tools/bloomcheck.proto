@@ -28,8 +28,23 @@ message NoopResponse {
   optional uint64 server_ts_ns = 1;
 }
 
+message StreamRequest {
+  uint64 request_id = 1;
+  bytes user_key = 2;
+  repeated uint64 sst_file_numbers = 3;
+}
+
+message StreamResponse {
+  uint64 request_id = 1;
+  repeated uint64 may_match_sst_file_numbers = 2;
+  bool complete = 3;
+  uint64 checked_count = 4;
+  uint64 total_candidates = 5;
+}
+
 service BloomCheck {
   rpc Check(BatchRequest) returns (BatchResponse);
   rpc Noop(NoopRequest) returns (NoopResponse);
+  rpc CheckBatchStream(stream StreamRequest) returns (stream StreamResponse);
 }
 

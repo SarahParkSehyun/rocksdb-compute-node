@@ -64,6 +64,12 @@ extern NoopRequestDefaultTypeInternal _NoopRequest_default_instance_;
 class NoopResponse;
 struct NoopResponseDefaultTypeInternal;
 extern NoopResponseDefaultTypeInternal _NoopResponse_default_instance_;
+class StreamRequest;
+struct StreamRequestDefaultTypeInternal;
+extern StreamRequestDefaultTypeInternal _StreamRequest_default_instance_;
+class StreamResponse;
+struct StreamResponseDefaultTypeInternal;
+extern StreamResponseDefaultTypeInternal _StreamResponse_default_instance_;
 }  // namespace bloomcheck
 PROTOBUF_NAMESPACE_OPEN
 template<> ::bloomcheck::BatchRequest* Arena::CreateMaybeMessage<::bloomcheck::BatchRequest>(Arena*);
@@ -72,6 +78,8 @@ template<> ::bloomcheck::KeyRequest* Arena::CreateMaybeMessage<::bloomcheck::Key
 template<> ::bloomcheck::KeyResponse* Arena::CreateMaybeMessage<::bloomcheck::KeyResponse>(Arena*);
 template<> ::bloomcheck::NoopRequest* Arena::CreateMaybeMessage<::bloomcheck::NoopRequest>(Arena*);
 template<> ::bloomcheck::NoopResponse* Arena::CreateMaybeMessage<::bloomcheck::NoopResponse>(Arena*);
+template<> ::bloomcheck::StreamRequest* Arena::CreateMaybeMessage<::bloomcheck::StreamRequest>(Arena*);
+template<> ::bloomcheck::StreamResponse* Arena::CreateMaybeMessage<::bloomcheck::StreamResponse>(Arena*);
 PROTOBUF_NAMESPACE_CLOSE
 namespace bloomcheck {
 
@@ -1033,6 +1041,401 @@ class NoopResponse final :
   union { Impl_ _impl_; };
   friend struct ::TableStruct_tools_2fbloomcheck_2eproto;
 };
+// -------------------------------------------------------------------
+
+class StreamRequest final :
+    public ::PROTOBUF_NAMESPACE_ID::Message /* @@protoc_insertion_point(class_definition:bloomcheck.StreamRequest) */ {
+ public:
+  inline StreamRequest() : StreamRequest(nullptr) {}
+  ~StreamRequest() override;
+  explicit PROTOBUF_CONSTEXPR StreamRequest(::PROTOBUF_NAMESPACE_ID::internal::ConstantInitialized);
+
+  StreamRequest(const StreamRequest& from);
+  StreamRequest(StreamRequest&& from) noexcept
+    : StreamRequest() {
+    *this = ::std::move(from);
+  }
+
+  inline StreamRequest& operator=(const StreamRequest& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline StreamRequest& operator=(StreamRequest&& from) noexcept {
+    if (this == &from) return *this;
+    if (GetOwningArena() == from.GetOwningArena()
+  #ifdef PROTOBUF_FORCE_COPY_IN_MOVE
+        && GetOwningArena() != nullptr
+  #endif  // !PROTOBUF_FORCE_COPY_IN_MOVE
+    ) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  static const ::PROTOBUF_NAMESPACE_ID::Descriptor* descriptor() {
+    return GetDescriptor();
+  }
+  static const ::PROTOBUF_NAMESPACE_ID::Descriptor* GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  static const ::PROTOBUF_NAMESPACE_ID::Reflection* GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  static const StreamRequest& default_instance() {
+    return *internal_default_instance();
+  }
+  static inline const StreamRequest* internal_default_instance() {
+    return reinterpret_cast<const StreamRequest*>(
+               &_StreamRequest_default_instance_);
+  }
+  static constexpr int kIndexInFileMessages =
+    6;
+
+  friend void swap(StreamRequest& a, StreamRequest& b) {
+    a.Swap(&b);
+  }
+  inline void Swap(StreamRequest* other) {
+    if (other == this) return;
+  #ifdef PROTOBUF_FORCE_COPY_IN_SWAP
+    if (GetOwningArena() != nullptr &&
+        GetOwningArena() == other->GetOwningArena()) {
+   #else  // PROTOBUF_FORCE_COPY_IN_SWAP
+    if (GetOwningArena() == other->GetOwningArena()) {
+  #endif  // !PROTOBUF_FORCE_COPY_IN_SWAP
+      InternalSwap(other);
+    } else {
+      ::PROTOBUF_NAMESPACE_ID::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(StreamRequest* other) {
+    if (other == this) return;
+    GOOGLE_DCHECK(GetOwningArena() == other->GetOwningArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  StreamRequest* New(::PROTOBUF_NAMESPACE_ID::Arena* arena = nullptr) const final {
+    return CreateMaybeMessage<StreamRequest>(arena);
+  }
+  using ::PROTOBUF_NAMESPACE_ID::Message::CopyFrom;
+  void CopyFrom(const StreamRequest& from);
+  using ::PROTOBUF_NAMESPACE_ID::Message::MergeFrom;
+  void MergeFrom( const StreamRequest& from) {
+    StreamRequest::MergeImpl(*this, from);
+  }
+  private:
+  static void MergeImpl(::PROTOBUF_NAMESPACE_ID::Message& to_msg, const ::PROTOBUF_NAMESPACE_ID::Message& from_msg);
+  public:
+  PROTOBUF_ATTRIBUTE_REINITIALIZES void Clear() final;
+  bool IsInitialized() const final;
+
+  size_t ByteSizeLong() const final;
+  const char* _InternalParse(const char* ptr, ::PROTOBUF_NAMESPACE_ID::internal::ParseContext* ctx) final;
+  uint8_t* _InternalSerialize(
+      uint8_t* target, ::PROTOBUF_NAMESPACE_ID::io::EpsCopyOutputStream* stream) const final;
+  int GetCachedSize() const final { return _impl_._cached_size_.Get(); }
+
+  private:
+  void SharedCtor(::PROTOBUF_NAMESPACE_ID::Arena* arena, bool is_message_owned);
+  void SharedDtor();
+  void SetCachedSize(int size) const final;
+  void InternalSwap(StreamRequest* other);
+
+  private:
+  friend class ::PROTOBUF_NAMESPACE_ID::internal::AnyMetadata;
+  static ::PROTOBUF_NAMESPACE_ID::StringPiece FullMessageName() {
+    return "bloomcheck.StreamRequest";
+  }
+  protected:
+  explicit StreamRequest(::PROTOBUF_NAMESPACE_ID::Arena* arena,
+                       bool is_message_owned = false);
+  public:
+
+  static const ClassData _class_data_;
+  const ::PROTOBUF_NAMESPACE_ID::Message::ClassData*GetClassData() const final;
+
+  ::PROTOBUF_NAMESPACE_ID::Metadata GetMetadata() const final;
+
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+
+  enum : int {
+    kSstFileNumbersFieldNumber = 3,
+    kUserKeyFieldNumber = 2,
+    kRequestIdFieldNumber = 1,
+  };
+  // repeated uint64 sst_file_numbers = 3;
+  int sst_file_numbers_size() const;
+  private:
+  int _internal_sst_file_numbers_size() const;
+  public:
+  void clear_sst_file_numbers();
+  private:
+  uint64_t _internal_sst_file_numbers(int index) const;
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      _internal_sst_file_numbers() const;
+  void _internal_add_sst_file_numbers(uint64_t value);
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      _internal_mutable_sst_file_numbers();
+  public:
+  uint64_t sst_file_numbers(int index) const;
+  void set_sst_file_numbers(int index, uint64_t value);
+  void add_sst_file_numbers(uint64_t value);
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      sst_file_numbers() const;
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      mutable_sst_file_numbers();
+
+  // bytes user_key = 2;
+  void clear_user_key();
+  const std::string& user_key() const;
+  template <typename ArgT0 = const std::string&, typename... ArgT>
+  void set_user_key(ArgT0&& arg0, ArgT... args);
+  std::string* mutable_user_key();
+  PROTOBUF_NODISCARD std::string* release_user_key();
+  void set_allocated_user_key(std::string* user_key);
+  private:
+  const std::string& _internal_user_key() const;
+  inline PROTOBUF_ALWAYS_INLINE void _internal_set_user_key(const std::string& value);
+  std::string* _internal_mutable_user_key();
+  public:
+
+  // uint64 request_id = 1;
+  void clear_request_id();
+  uint64_t request_id() const;
+  void set_request_id(uint64_t value);
+  private:
+  uint64_t _internal_request_id() const;
+  void _internal_set_request_id(uint64_t value);
+  public:
+
+  // @@protoc_insertion_point(class_scope:bloomcheck.StreamRequest)
+ private:
+  class _Internal;
+
+  template <typename T> friend class ::PROTOBUF_NAMESPACE_ID::Arena::InternalHelper;
+  typedef void InternalArenaConstructable_;
+  typedef void DestructorSkippable_;
+  struct Impl_ {
+    ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t > sst_file_numbers_;
+    mutable std::atomic<int> _sst_file_numbers_cached_byte_size_;
+    ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr user_key_;
+    uint64_t request_id_;
+    mutable ::PROTOBUF_NAMESPACE_ID::internal::CachedSize _cached_size_;
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_tools_2fbloomcheck_2eproto;
+};
+// -------------------------------------------------------------------
+
+class StreamResponse final :
+    public ::PROTOBUF_NAMESPACE_ID::Message /* @@protoc_insertion_point(class_definition:bloomcheck.StreamResponse) */ {
+ public:
+  inline StreamResponse() : StreamResponse(nullptr) {}
+  ~StreamResponse() override;
+  explicit PROTOBUF_CONSTEXPR StreamResponse(::PROTOBUF_NAMESPACE_ID::internal::ConstantInitialized);
+
+  StreamResponse(const StreamResponse& from);
+  StreamResponse(StreamResponse&& from) noexcept
+    : StreamResponse() {
+    *this = ::std::move(from);
+  }
+
+  inline StreamResponse& operator=(const StreamResponse& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline StreamResponse& operator=(StreamResponse&& from) noexcept {
+    if (this == &from) return *this;
+    if (GetOwningArena() == from.GetOwningArena()
+  #ifdef PROTOBUF_FORCE_COPY_IN_MOVE
+        && GetOwningArena() != nullptr
+  #endif  // !PROTOBUF_FORCE_COPY_IN_MOVE
+    ) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  static const ::PROTOBUF_NAMESPACE_ID::Descriptor* descriptor() {
+    return GetDescriptor();
+  }
+  static const ::PROTOBUF_NAMESPACE_ID::Descriptor* GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  static const ::PROTOBUF_NAMESPACE_ID::Reflection* GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  static const StreamResponse& default_instance() {
+    return *internal_default_instance();
+  }
+  static inline const StreamResponse* internal_default_instance() {
+    return reinterpret_cast<const StreamResponse*>(
+               &_StreamResponse_default_instance_);
+  }
+  static constexpr int kIndexInFileMessages =
+    7;
+
+  friend void swap(StreamResponse& a, StreamResponse& b) {
+    a.Swap(&b);
+  }
+  inline void Swap(StreamResponse* other) {
+    if (other == this) return;
+  #ifdef PROTOBUF_FORCE_COPY_IN_SWAP
+    if (GetOwningArena() != nullptr &&
+        GetOwningArena() == other->GetOwningArena()) {
+   #else  // PROTOBUF_FORCE_COPY_IN_SWAP
+    if (GetOwningArena() == other->GetOwningArena()) {
+  #endif  // !PROTOBUF_FORCE_COPY_IN_SWAP
+      InternalSwap(other);
+    } else {
+      ::PROTOBUF_NAMESPACE_ID::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(StreamResponse* other) {
+    if (other == this) return;
+    GOOGLE_DCHECK(GetOwningArena() == other->GetOwningArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  StreamResponse* New(::PROTOBUF_NAMESPACE_ID::Arena* arena = nullptr) const final {
+    return CreateMaybeMessage<StreamResponse>(arena);
+  }
+  using ::PROTOBUF_NAMESPACE_ID::Message::CopyFrom;
+  void CopyFrom(const StreamResponse& from);
+  using ::PROTOBUF_NAMESPACE_ID::Message::MergeFrom;
+  void MergeFrom( const StreamResponse& from) {
+    StreamResponse::MergeImpl(*this, from);
+  }
+  private:
+  static void MergeImpl(::PROTOBUF_NAMESPACE_ID::Message& to_msg, const ::PROTOBUF_NAMESPACE_ID::Message& from_msg);
+  public:
+  PROTOBUF_ATTRIBUTE_REINITIALIZES void Clear() final;
+  bool IsInitialized() const final;
+
+  size_t ByteSizeLong() const final;
+  const char* _InternalParse(const char* ptr, ::PROTOBUF_NAMESPACE_ID::internal::ParseContext* ctx) final;
+  uint8_t* _InternalSerialize(
+      uint8_t* target, ::PROTOBUF_NAMESPACE_ID::io::EpsCopyOutputStream* stream) const final;
+  int GetCachedSize() const final { return _impl_._cached_size_.Get(); }
+
+  private:
+  void SharedCtor(::PROTOBUF_NAMESPACE_ID::Arena* arena, bool is_message_owned);
+  void SharedDtor();
+  void SetCachedSize(int size) const final;
+  void InternalSwap(StreamResponse* other);
+
+  private:
+  friend class ::PROTOBUF_NAMESPACE_ID::internal::AnyMetadata;
+  static ::PROTOBUF_NAMESPACE_ID::StringPiece FullMessageName() {
+    return "bloomcheck.StreamResponse";
+  }
+  protected:
+  explicit StreamResponse(::PROTOBUF_NAMESPACE_ID::Arena* arena,
+                       bool is_message_owned = false);
+  public:
+
+  static const ClassData _class_data_;
+  const ::PROTOBUF_NAMESPACE_ID::Message::ClassData*GetClassData() const final;
+
+  ::PROTOBUF_NAMESPACE_ID::Metadata GetMetadata() const final;
+
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+
+  enum : int {
+    kMayMatchSstFileNumbersFieldNumber = 2,
+    kRequestIdFieldNumber = 1,
+    kCheckedCountFieldNumber = 4,
+    kTotalCandidatesFieldNumber = 5,
+    kCompleteFieldNumber = 3,
+  };
+  // repeated uint64 may_match_sst_file_numbers = 2;
+  int may_match_sst_file_numbers_size() const;
+  private:
+  int _internal_may_match_sst_file_numbers_size() const;
+  public:
+  void clear_may_match_sst_file_numbers();
+  private:
+  uint64_t _internal_may_match_sst_file_numbers(int index) const;
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      _internal_may_match_sst_file_numbers() const;
+  void _internal_add_may_match_sst_file_numbers(uint64_t value);
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      _internal_mutable_may_match_sst_file_numbers();
+  public:
+  uint64_t may_match_sst_file_numbers(int index) const;
+  void set_may_match_sst_file_numbers(int index, uint64_t value);
+  void add_may_match_sst_file_numbers(uint64_t value);
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      may_match_sst_file_numbers() const;
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      mutable_may_match_sst_file_numbers();
+
+  // uint64 request_id = 1;
+  void clear_request_id();
+  uint64_t request_id() const;
+  void set_request_id(uint64_t value);
+  private:
+  uint64_t _internal_request_id() const;
+  void _internal_set_request_id(uint64_t value);
+  public:
+
+  // uint64 checked_count = 4;
+  void clear_checked_count();
+  uint64_t checked_count() const;
+  void set_checked_count(uint64_t value);
+  private:
+  uint64_t _internal_checked_count() const;
+  void _internal_set_checked_count(uint64_t value);
+  public:
+
+  // uint64 total_candidates = 5;
+  void clear_total_candidates();
+  uint64_t total_candidates() const;
+  void set_total_candidates(uint64_t value);
+  private:
+  uint64_t _internal_total_candidates() const;
+  void _internal_set_total_candidates(uint64_t value);
+  public:
+
+  // bool complete = 3;
+  void clear_complete();
+  bool complete() const;
+  void set_complete(bool value);
+  private:
+  bool _internal_complete() const;
+  void _internal_set_complete(bool value);
+  public:
+
+  // @@protoc_insertion_point(class_scope:bloomcheck.StreamResponse)
+ private:
+  class _Internal;
+
+  template <typename T> friend class ::PROTOBUF_NAMESPACE_ID::Arena::InternalHelper;
+  typedef void InternalArenaConstructable_;
+  typedef void DestructorSkippable_;
+  struct Impl_ {
+    ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t > may_match_sst_file_numbers_;
+    mutable std::atomic<int> _may_match_sst_file_numbers_cached_byte_size_;
+    uint64_t request_id_;
+    uint64_t checked_count_;
+    uint64_t total_candidates_;
+    bool complete_;
+    mutable ::PROTOBUF_NAMESPACE_ID::internal::CachedSize _cached_size_;
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_tools_2fbloomcheck_2eproto;
+};
 // ===================================================================
 
 
@@ -1376,9 +1779,265 @@ inline void NoopResponse::set_server_ts_ns(uint64_t value) {
   // @@protoc_insertion_point(field_set:bloomcheck.NoopResponse.server_ts_ns)
 }
 
+// -------------------------------------------------------------------
+
+// StreamRequest
+
+// uint64 request_id = 1;
+inline void StreamRequest::clear_request_id() {
+  _impl_.request_id_ = uint64_t{0u};
+}
+inline uint64_t StreamRequest::_internal_request_id() const {
+  return _impl_.request_id_;
+}
+inline uint64_t StreamRequest::request_id() const {
+  // @@protoc_insertion_point(field_get:bloomcheck.StreamRequest.request_id)
+  return _internal_request_id();
+}
+inline void StreamRequest::_internal_set_request_id(uint64_t value) {
+  
+  _impl_.request_id_ = value;
+}
+inline void StreamRequest::set_request_id(uint64_t value) {
+  _internal_set_request_id(value);
+  // @@protoc_insertion_point(field_set:bloomcheck.StreamRequest.request_id)
+}
+
+// bytes user_key = 2;
+inline void StreamRequest::clear_user_key() {
+  _impl_.user_key_.ClearToEmpty();
+}
+inline const std::string& StreamRequest::user_key() const {
+  // @@protoc_insertion_point(field_get:bloomcheck.StreamRequest.user_key)
+  return _internal_user_key();
+}
+template <typename ArgT0, typename... ArgT>
+inline PROTOBUF_ALWAYS_INLINE
+void StreamRequest::set_user_key(ArgT0&& arg0, ArgT... args) {
+ 
+ _impl_.user_key_.SetBytes(static_cast<ArgT0 &&>(arg0), args..., GetArenaForAllocation());
+  // @@protoc_insertion_point(field_set:bloomcheck.StreamRequest.user_key)
+}
+inline std::string* StreamRequest::mutable_user_key() {
+  std::string* _s = _internal_mutable_user_key();
+  // @@protoc_insertion_point(field_mutable:bloomcheck.StreamRequest.user_key)
+  return _s;
+}
+inline const std::string& StreamRequest::_internal_user_key() const {
+  return _impl_.user_key_.Get();
+}
+inline void StreamRequest::_internal_set_user_key(const std::string& value) {
+  
+  _impl_.user_key_.Set(value, GetArenaForAllocation());
+}
+inline std::string* StreamRequest::_internal_mutable_user_key() {
+  
+  return _impl_.user_key_.Mutable(GetArenaForAllocation());
+}
+inline std::string* StreamRequest::release_user_key() {
+  // @@protoc_insertion_point(field_release:bloomcheck.StreamRequest.user_key)
+  return _impl_.user_key_.Release();
+}
+inline void StreamRequest::set_allocated_user_key(std::string* user_key) {
+  if (user_key != nullptr) {
+    
+  } else {
+    
+  }
+  _impl_.user_key_.SetAllocated(user_key, GetArenaForAllocation());
+#ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  if (_impl_.user_key_.IsDefault()) {
+    _impl_.user_key_.Set("", GetArenaForAllocation());
+  }
+#endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  // @@protoc_insertion_point(field_set_allocated:bloomcheck.StreamRequest.user_key)
+}
+
+// repeated uint64 sst_file_numbers = 3;
+inline int StreamRequest::_internal_sst_file_numbers_size() const {
+  return _impl_.sst_file_numbers_.size();
+}
+inline int StreamRequest::sst_file_numbers_size() const {
+  return _internal_sst_file_numbers_size();
+}
+inline void StreamRequest::clear_sst_file_numbers() {
+  _impl_.sst_file_numbers_.Clear();
+}
+inline uint64_t StreamRequest::_internal_sst_file_numbers(int index) const {
+  return _impl_.sst_file_numbers_.Get(index);
+}
+inline uint64_t StreamRequest::sst_file_numbers(int index) const {
+  // @@protoc_insertion_point(field_get:bloomcheck.StreamRequest.sst_file_numbers)
+  return _internal_sst_file_numbers(index);
+}
+inline void StreamRequest::set_sst_file_numbers(int index, uint64_t value) {
+  _impl_.sst_file_numbers_.Set(index, value);
+  // @@protoc_insertion_point(field_set:bloomcheck.StreamRequest.sst_file_numbers)
+}
+inline void StreamRequest::_internal_add_sst_file_numbers(uint64_t value) {
+  _impl_.sst_file_numbers_.Add(value);
+}
+inline void StreamRequest::add_sst_file_numbers(uint64_t value) {
+  _internal_add_sst_file_numbers(value);
+  // @@protoc_insertion_point(field_add:bloomcheck.StreamRequest.sst_file_numbers)
+}
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+StreamRequest::_internal_sst_file_numbers() const {
+  return _impl_.sst_file_numbers_;
+}
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+StreamRequest::sst_file_numbers() const {
+  // @@protoc_insertion_point(field_list:bloomcheck.StreamRequest.sst_file_numbers)
+  return _internal_sst_file_numbers();
+}
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+StreamRequest::_internal_mutable_sst_file_numbers() {
+  return &_impl_.sst_file_numbers_;
+}
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+StreamRequest::mutable_sst_file_numbers() {
+  // @@protoc_insertion_point(field_mutable_list:bloomcheck.StreamRequest.sst_file_numbers)
+  return _internal_mutable_sst_file_numbers();
+}
+
+// -------------------------------------------------------------------
+
+// StreamResponse
+
+// uint64 request_id = 1;
+inline void StreamResponse::clear_request_id() {
+  _impl_.request_id_ = uint64_t{0u};
+}
+inline uint64_t StreamResponse::_internal_request_id() const {
+  return _impl_.request_id_;
+}
+inline uint64_t StreamResponse::request_id() const {
+  // @@protoc_insertion_point(field_get:bloomcheck.StreamResponse.request_id)
+  return _internal_request_id();
+}
+inline void StreamResponse::_internal_set_request_id(uint64_t value) {
+  
+  _impl_.request_id_ = value;
+}
+inline void StreamResponse::set_request_id(uint64_t value) {
+  _internal_set_request_id(value);
+  // @@protoc_insertion_point(field_set:bloomcheck.StreamResponse.request_id)
+}
+
+// repeated uint64 may_match_sst_file_numbers = 2;
+inline int StreamResponse::_internal_may_match_sst_file_numbers_size() const {
+  return _impl_.may_match_sst_file_numbers_.size();
+}
+inline int StreamResponse::may_match_sst_file_numbers_size() const {
+  return _internal_may_match_sst_file_numbers_size();
+}
+inline void StreamResponse::clear_may_match_sst_file_numbers() {
+  _impl_.may_match_sst_file_numbers_.Clear();
+}
+inline uint64_t StreamResponse::_internal_may_match_sst_file_numbers(int index) const {
+  return _impl_.may_match_sst_file_numbers_.Get(index);
+}
+inline uint64_t StreamResponse::may_match_sst_file_numbers(int index) const {
+  // @@protoc_insertion_point(field_get:bloomcheck.StreamResponse.may_match_sst_file_numbers)
+  return _internal_may_match_sst_file_numbers(index);
+}
+inline void StreamResponse::set_may_match_sst_file_numbers(int index, uint64_t value) {
+  _impl_.may_match_sst_file_numbers_.Set(index, value);
+  // @@protoc_insertion_point(field_set:bloomcheck.StreamResponse.may_match_sst_file_numbers)
+}
+inline void StreamResponse::_internal_add_may_match_sst_file_numbers(uint64_t value) {
+  _impl_.may_match_sst_file_numbers_.Add(value);
+}
+inline void StreamResponse::add_may_match_sst_file_numbers(uint64_t value) {
+  _internal_add_may_match_sst_file_numbers(value);
+  // @@protoc_insertion_point(field_add:bloomcheck.StreamResponse.may_match_sst_file_numbers)
+}
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+StreamResponse::_internal_may_match_sst_file_numbers() const {
+  return _impl_.may_match_sst_file_numbers_;
+}
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+StreamResponse::may_match_sst_file_numbers() const {
+  // @@protoc_insertion_point(field_list:bloomcheck.StreamResponse.may_match_sst_file_numbers)
+  return _internal_may_match_sst_file_numbers();
+}
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+StreamResponse::_internal_mutable_may_match_sst_file_numbers() {
+  return &_impl_.may_match_sst_file_numbers_;
+}
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+StreamResponse::mutable_may_match_sst_file_numbers() {
+  // @@protoc_insertion_point(field_mutable_list:bloomcheck.StreamResponse.may_match_sst_file_numbers)
+  return _internal_mutable_may_match_sst_file_numbers();
+}
+
+// bool complete = 3;
+inline void StreamResponse::clear_complete() {
+  _impl_.complete_ = false;
+}
+inline bool StreamResponse::_internal_complete() const {
+  return _impl_.complete_;
+}
+inline bool StreamResponse::complete() const {
+  // @@protoc_insertion_point(field_get:bloomcheck.StreamResponse.complete)
+  return _internal_complete();
+}
+inline void StreamResponse::_internal_set_complete(bool value) {
+  
+  _impl_.complete_ = value;
+}
+inline void StreamResponse::set_complete(bool value) {
+  _internal_set_complete(value);
+  // @@protoc_insertion_point(field_set:bloomcheck.StreamResponse.complete)
+}
+
+// uint64 checked_count = 4;
+inline void StreamResponse::clear_checked_count() {
+  _impl_.checked_count_ = uint64_t{0u};
+}
+inline uint64_t StreamResponse::_internal_checked_count() const {
+  return _impl_.checked_count_;
+}
+inline uint64_t StreamResponse::checked_count() const {
+  // @@protoc_insertion_point(field_get:bloomcheck.StreamResponse.checked_count)
+  return _internal_checked_count();
+}
+inline void StreamResponse::_internal_set_checked_count(uint64_t value) {
+  
+  _impl_.checked_count_ = value;
+}
+inline void StreamResponse::set_checked_count(uint64_t value) {
+  _internal_set_checked_count(value);
+  // @@protoc_insertion_point(field_set:bloomcheck.StreamResponse.checked_count)
+}
+
+// uint64 total_candidates = 5;
+inline void StreamResponse::clear_total_candidates() {
+  _impl_.total_candidates_ = uint64_t{0u};
+}
+inline uint64_t StreamResponse::_internal_total_candidates() const {
+  return _impl_.total_candidates_;
+}
+inline uint64_t StreamResponse::total_candidates() const {
+  // @@protoc_insertion_point(field_get:bloomcheck.StreamResponse.total_candidates)
+  return _internal_total_candidates();
+}
+inline void StreamResponse::_internal_set_total_candidates(uint64_t value) {
+  
+  _impl_.total_candidates_ = value;
+}
+inline void StreamResponse::set_total_candidates(uint64_t value) {
+  _internal_set_total_candidates(value);
+  // @@protoc_insertion_point(field_set:bloomcheck.StreamResponse.total_candidates)
+}
+
 #ifdef __GNUC__
   #pragma GCC diagnostic pop
 #endif  // __GNUC__
+// -------------------------------------------------------------------
+
+// -------------------------------------------------------------------
+
 // -------------------------------------------------------------------
 
 // -------------------------------------------------------------------

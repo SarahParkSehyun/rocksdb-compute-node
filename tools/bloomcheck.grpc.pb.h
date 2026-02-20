@@ -49,6 +49,15 @@ class BloomCheck final {
     std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::bloomcheck::NoopResponse>> PrepareAsyncNoop(::grpc::ClientContext* context, const ::bloomcheck::NoopRequest& request, ::grpc::CompletionQueue* cq) {
       return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::bloomcheck::NoopResponse>>(PrepareAsyncNoopRaw(context, request, cq));
     }
+    std::unique_ptr< ::grpc::ClientReaderWriterInterface< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>> CheckBatchStream(::grpc::ClientContext* context) {
+      return std::unique_ptr< ::grpc::ClientReaderWriterInterface< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>>(CheckBatchStreamRaw(context));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncReaderWriterInterface< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>> AsyncCheckBatchStream(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq, void* tag) {
+      return std::unique_ptr< ::grpc::ClientAsyncReaderWriterInterface< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>>(AsyncCheckBatchStreamRaw(context, cq, tag));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncReaderWriterInterface< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>> PrepareAsyncCheckBatchStream(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncReaderWriterInterface< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>>(PrepareAsyncCheckBatchStreamRaw(context, cq));
+    }
     class async_interface {
      public:
       virtual ~async_interface() {}
@@ -56,6 +65,7 @@ class BloomCheck final {
       virtual void Check(::grpc::ClientContext* context, const ::bloomcheck::BatchRequest* request, ::bloomcheck::BatchResponse* response, ::grpc::ClientUnaryReactor* reactor) = 0;
       virtual void Noop(::grpc::ClientContext* context, const ::bloomcheck::NoopRequest* request, ::bloomcheck::NoopResponse* response, std::function<void(::grpc::Status)>) = 0;
       virtual void Noop(::grpc::ClientContext* context, const ::bloomcheck::NoopRequest* request, ::bloomcheck::NoopResponse* response, ::grpc::ClientUnaryReactor* reactor) = 0;
+      virtual void CheckBatchStream(::grpc::ClientContext* context, ::grpc::ClientBidiReactor< ::bloomcheck::StreamRequest,::bloomcheck::StreamResponse>* reactor) = 0;
     };
     typedef class async_interface experimental_async_interface;
     virtual class async_interface* async() { return nullptr; }
@@ -65,6 +75,9 @@ class BloomCheck final {
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::bloomcheck::BatchResponse>* PrepareAsyncCheckRaw(::grpc::ClientContext* context, const ::bloomcheck::BatchRequest& request, ::grpc::CompletionQueue* cq) = 0;
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::bloomcheck::NoopResponse>* AsyncNoopRaw(::grpc::ClientContext* context, const ::bloomcheck::NoopRequest& request, ::grpc::CompletionQueue* cq) = 0;
     virtual ::grpc::ClientAsyncResponseReaderInterface< ::bloomcheck::NoopResponse>* PrepareAsyncNoopRaw(::grpc::ClientContext* context, const ::bloomcheck::NoopRequest& request, ::grpc::CompletionQueue* cq) = 0;
+    virtual ::grpc::ClientReaderWriterInterface< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>* CheckBatchStreamRaw(::grpc::ClientContext* context) = 0;
+    virtual ::grpc::ClientAsyncReaderWriterInterface< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>* AsyncCheckBatchStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq, void* tag) = 0;
+    virtual ::grpc::ClientAsyncReaderWriterInterface< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>* PrepareAsyncCheckBatchStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq) = 0;
   };
   class Stub final : public StubInterface {
    public:
@@ -83,6 +96,15 @@ class BloomCheck final {
     std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::bloomcheck::NoopResponse>> PrepareAsyncNoop(::grpc::ClientContext* context, const ::bloomcheck::NoopRequest& request, ::grpc::CompletionQueue* cq) {
       return std::unique_ptr< ::grpc::ClientAsyncResponseReader< ::bloomcheck::NoopResponse>>(PrepareAsyncNoopRaw(context, request, cq));
     }
+    std::unique_ptr< ::grpc::ClientReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>> CheckBatchStream(::grpc::ClientContext* context) {
+      return std::unique_ptr< ::grpc::ClientReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>>(CheckBatchStreamRaw(context));
+    }
+    std::unique_ptr<  ::grpc::ClientAsyncReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>> AsyncCheckBatchStream(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq, void* tag) {
+      return std::unique_ptr< ::grpc::ClientAsyncReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>>(AsyncCheckBatchStreamRaw(context, cq, tag));
+    }
+    std::unique_ptr<  ::grpc::ClientAsyncReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>> PrepareAsyncCheckBatchStream(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>>(PrepareAsyncCheckBatchStreamRaw(context, cq));
+    }
     class async final :
       public StubInterface::async_interface {
      public:
@@ -90,6 +112,7 @@ class BloomCheck final {
       void Check(::grpc::ClientContext* context, const ::bloomcheck::BatchRequest* request, ::bloomcheck::BatchResponse* response, ::grpc::ClientUnaryReactor* reactor) override;
       void Noop(::grpc::ClientContext* context, const ::bloomcheck::NoopRequest* request, ::bloomcheck::NoopResponse* response, std::function<void(::grpc::Status)>) override;
       void Noop(::grpc::ClientContext* context, const ::bloomcheck::NoopRequest* request, ::bloomcheck::NoopResponse* response, ::grpc::ClientUnaryReactor* reactor) override;
+      void CheckBatchStream(::grpc::ClientContext* context, ::grpc::ClientBidiReactor< ::bloomcheck::StreamRequest,::bloomcheck::StreamResponse>* reactor) override;
      private:
       friend class Stub;
       explicit async(Stub* stub): stub_(stub) { }
@@ -105,8 +128,12 @@ class BloomCheck final {
     ::grpc::ClientAsyncResponseReader< ::bloomcheck::BatchResponse>* PrepareAsyncCheckRaw(::grpc::ClientContext* context, const ::bloomcheck::BatchRequest& request, ::grpc::CompletionQueue* cq) override;
     ::grpc::ClientAsyncResponseReader< ::bloomcheck::NoopResponse>* AsyncNoopRaw(::grpc::ClientContext* context, const ::bloomcheck::NoopRequest& request, ::grpc::CompletionQueue* cq) override;
     ::grpc::ClientAsyncResponseReader< ::bloomcheck::NoopResponse>* PrepareAsyncNoopRaw(::grpc::ClientContext* context, const ::bloomcheck::NoopRequest& request, ::grpc::CompletionQueue* cq) override;
+    ::grpc::ClientReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>* CheckBatchStreamRaw(::grpc::ClientContext* context) override;
+    ::grpc::ClientAsyncReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>* AsyncCheckBatchStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq, void* tag) override;
+    ::grpc::ClientAsyncReaderWriter< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>* PrepareAsyncCheckBatchStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq) override;
     const ::grpc::internal::RpcMethod rpcmethod_Check_;
     const ::grpc::internal::RpcMethod rpcmethod_Noop_;
+    const ::grpc::internal::RpcMethod rpcmethod_CheckBatchStream_;
   };
   static std::unique_ptr<Stub> NewStub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options = ::grpc::StubOptions());
 
@@ -116,6 +143,7 @@ class BloomCheck final {
     virtual ~Service();
     virtual ::grpc::Status Check(::grpc::ServerContext* context, const ::bloomcheck::BatchRequest* request, ::bloomcheck::BatchResponse* response);
     virtual ::grpc::Status Noop(::grpc::ServerContext* context, const ::bloomcheck::NoopRequest* request, ::bloomcheck::NoopResponse* response);
+    virtual ::grpc::Status CheckBatchStream(::grpc::ServerContext* context, ::grpc::ServerReaderWriter< ::bloomcheck::StreamResponse, ::bloomcheck::StreamRequest>* stream);
   };
   template <class BaseClass>
   class WithAsyncMethod_Check : public BaseClass {
@@ -157,7 +185,27 @@ class BloomCheck final {
       ::grpc::Service::RequestAsyncUnary(1, context, request, response, new_call_cq, notification_cq, tag);
     }
   };
-  typedef WithAsyncMethod_Check<WithAsyncMethod_Noop<Service > > AsyncService;
+  template <class BaseClass>
+  class WithAsyncMethod_CheckBatchStream : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithAsyncMethod_CheckBatchStream() {
+      ::grpc::Service::MarkMethodAsync(2);
+    }
+    ~WithAsyncMethod_CheckBatchStream() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status CheckBatchStream(::grpc::ServerContext* /*context*/, ::grpc::ServerReaderWriter< ::bloomcheck::StreamResponse, ::bloomcheck::StreamRequest>* /*stream*/)  override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestCheckBatchStream(::grpc::ServerContext* context, ::grpc::ServerAsyncReaderWriter< ::bloomcheck::StreamResponse, ::bloomcheck::StreamRequest>* stream, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncBidiStreaming(2, context, stream, new_call_cq, notification_cq, tag);
+    }
+  };
+  typedef WithAsyncMethod_Check<WithAsyncMethod_Noop<WithAsyncMethod_CheckBatchStream<Service > > > AsyncService;
   template <class BaseClass>
   class WithCallbackMethod_Check : public BaseClass {
    private:
@@ -212,7 +260,30 @@ class BloomCheck final {
     virtual ::grpc::ServerUnaryReactor* Noop(
       ::grpc::CallbackServerContext* /*context*/, const ::bloomcheck::NoopRequest* /*request*/, ::bloomcheck::NoopResponse* /*response*/)  { return nullptr; }
   };
-  typedef WithCallbackMethod_Check<WithCallbackMethod_Noop<Service > > CallbackService;
+  template <class BaseClass>
+  class WithCallbackMethod_CheckBatchStream : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithCallbackMethod_CheckBatchStream() {
+      ::grpc::Service::MarkMethodCallback(2,
+          new ::grpc::internal::CallbackBidiHandler< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>(
+            [this](
+                   ::grpc::CallbackServerContext* context) { return this->CheckBatchStream(context); }));
+    }
+    ~WithCallbackMethod_CheckBatchStream() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status CheckBatchStream(::grpc::ServerContext* /*context*/, ::grpc::ServerReaderWriter< ::bloomcheck::StreamResponse, ::bloomcheck::StreamRequest>* /*stream*/)  override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerBidiReactor< ::bloomcheck::StreamRequest, ::bloomcheck::StreamResponse>* CheckBatchStream(
+      ::grpc::CallbackServerContext* /*context*/)
+      { return nullptr; }
+  };
+  typedef WithCallbackMethod_Check<WithCallbackMethod_Noop<WithCallbackMethod_CheckBatchStream<Service > > > CallbackService;
   typedef CallbackService ExperimentalCallbackService;
   template <class BaseClass>
   class WithGenericMethod_Check : public BaseClass {
@@ -244,6 +315,23 @@ class BloomCheck final {
     }
     // disable synchronous version of this method
     ::grpc::Status Noop(::grpc::ServerContext* /*context*/, const ::bloomcheck::NoopRequest* /*request*/, ::bloomcheck::NoopResponse* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+  };
+  template <class BaseClass>
+  class WithGenericMethod_CheckBatchStream : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithGenericMethod_CheckBatchStream() {
+      ::grpc::Service::MarkMethodGeneric(2);
+    }
+    ~WithGenericMethod_CheckBatchStream() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status CheckBatchStream(::grpc::ServerContext* /*context*/, ::grpc::ServerReaderWriter< ::bloomcheck::StreamResponse, ::bloomcheck::StreamRequest>* /*stream*/)  override {
       abort();
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
@@ -289,6 +377,26 @@ class BloomCheck final {
     }
   };
   template <class BaseClass>
+  class WithRawMethod_CheckBatchStream : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawMethod_CheckBatchStream() {
+      ::grpc::Service::MarkMethodRaw(2);
+    }
+    ~WithRawMethod_CheckBatchStream() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status CheckBatchStream(::grpc::ServerContext* /*context*/, ::grpc::ServerReaderWriter< ::bloomcheck::StreamResponse, ::bloomcheck::StreamRequest>* /*stream*/)  override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestCheckBatchStream(::grpc::ServerContext* context, ::grpc::ServerAsyncReaderWriter< ::grpc::ByteBuffer, ::grpc::ByteBuffer>* stream, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncBidiStreaming(2, context, stream, new_call_cq, notification_cq, tag);
+    }
+  };
+  template <class BaseClass>
   class WithRawCallbackMethod_Check : public BaseClass {
    private:
     void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
@@ -331,6 +439,29 @@ class BloomCheck final {
     }
     virtual ::grpc::ServerUnaryReactor* Noop(
       ::grpc::CallbackServerContext* /*context*/, const ::grpc::ByteBuffer* /*request*/, ::grpc::ByteBuffer* /*response*/)  { return nullptr; }
+  };
+  template <class BaseClass>
+  class WithRawCallbackMethod_CheckBatchStream : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawCallbackMethod_CheckBatchStream() {
+      ::grpc::Service::MarkMethodRawCallback(2,
+          new ::grpc::internal::CallbackBidiHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
+            [this](
+                   ::grpc::CallbackServerContext* context) { return this->CheckBatchStream(context); }));
+    }
+    ~WithRawCallbackMethod_CheckBatchStream() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status CheckBatchStream(::grpc::ServerContext* /*context*/, ::grpc::ServerReaderWriter< ::bloomcheck::StreamResponse, ::bloomcheck::StreamRequest>* /*stream*/)  override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerBidiReactor< ::grpc::ByteBuffer, ::grpc::ByteBuffer>* CheckBatchStream(
+      ::grpc::CallbackServerContext* /*context*/)
+      { return nullptr; }
   };
   template <class BaseClass>
   class WithStreamedUnaryMethod_Check : public BaseClass {
