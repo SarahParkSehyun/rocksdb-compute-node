@@ -208,6 +208,39 @@ endif
 #-----------------------------------------------
 include src.mk
 
+# Optional eRPC support for NOOP_ONLY path in Version::Get (Makefile build).
+# Enable when ERPC_ROOT is set and a static library exists.
+ROCKSDB_BLOOMCHECK_ERPC ?= 0
+ERPC_DBBENCH_LDFLAGS :=
+ERPC_SRC_CXXFLAGS :=
+ifneq ($(strip $(ERPC_ROOT)),)
+  ifneq ($(wildcard $(ERPC_ROOT)/build_perf/liberpc.a),)
+    ERPC_LIB_PATH := $(ERPC_ROOT)/build_perf/liberpc.a
+  else ifneq ($(wildcard $(ERPC_ROOT)/build/liberpc.a),)
+    ERPC_LIB_PATH := $(ERPC_ROOT)/build/liberpc.a
+  else
+    ERPC_LIB_PATH :=
+  endif
+
+  ifneq ($(strip $(ERPC_LIB_PATH)),)
+    ROCKSDB_BLOOMCHECK_ERPC := 1
+    LIB_SOURCES += util/bloomcheck_erpc_client.cc
+    CXXFLAGS += -DROCKSDB_BLOOMCHECK_ERPC=1
+    ERPC_SRC_CXXFLAGS += -DERPC_INFINIBAND \
+                         -I$(ERPC_ROOT) -I$(ERPC_ROOT)/include -I$(ERPC_ROOT)/src \
+                         -I$(ERPC_ROOT)/third_party/asio/include \
+                         -Wno-error=volatile -Wno-error=unused-function
+    # Link eRPC only for executables like db_bench, not for librocksdb.so.
+    ERPC_DBBENCH_LDFLAGS += $(ERPC_LIB_PATH) -lnuma -libverbs -lpthread -lprotobuf
+    $(info ROCKSDB_BLOOMCHECK_ERPC enabled for Make build: ERPC_ROOT=$(ERPC_ROOT))
+  endif
+endif
+
+ifneq ($(strip $(ERPC_SRC_CXXFLAGS)),)
+$(OBJ_DIR)/util/bloomcheck_erpc_client.o: CXXFLAGS += $(ERPC_SRC_CXXFLAGS)
+$(OBJ_DIR)/util/bloomcheck_erpc_client.cc.d: CXXFLAGS += $(ERPC_SRC_CXXFLAGS)
+endif
+
 AM_DEFAULT_VERBOSITY ?= 0
 
 AM_V_GEN = $(am__v_GEN_$(V))
@@ -1255,7 +1288,7 @@ librocksdb_env_basic_test.a: $(OBJ_DIR)/env/env_basic_test.o $(LIB_OBJECTS) $(TE
 	$(AM_V_at)$(AR) $(ARFLAGS) $@ $^
 
 db_bench: $(OBJ_DIR)/tools/db_bench.o $(BENCH_OBJECTS) $(TESTUTIL) $(LIBRARY)
-	$(AM_V_CCLD)$(CXX) -L. $(patsubst lib%.a, -l%, $(patsubst lib%.$(PLATFORM_SHARED_EXT), -l%, $^)) $(EXEC_LDFLAGS) -o $@ $(LDFLAGS) $(COVERAGEFLAGS) $(shell pkg-config --libs grpc++ protobuf 2>/dev/null || echo "-lgrpc++ -lgrpc -lprotobuf")
+	$(AM_V_CCLD)$(CXX) -L. $(patsubst lib%.a, -l%, $(patsubst lib%.$(PLATFORM_SHARED_EXT), -l%, $^)) $(EXEC_LDFLAGS) -o $@ $(LDFLAGS) $(COVERAGEFLAGS) $(shell pkg-config --libs grpc++ protobuf 2>/dev/null || echo "-lgrpc++ -lgrpc -lprotobuf") $(ERPC_DBBENCH_LDFLAGS)
 
 trace_analyzer: $(OBJ_DIR)/tools/trace_analyzer.o $(ANALYZE_OBJECTS) $(TOOLS_LIBRARY) $(LIBRARY)
 	$(AM_LINK)

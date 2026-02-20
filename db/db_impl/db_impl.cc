@@ -290,10 +290,21 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   // BloomCheck 서비스 초기화 (환경 변수에서 읽기)
   // 성능을 위해 lazy initialization으로 변경 가능
   const char* bloomcheck_server = std::getenv("BLOOMCHECK_SERVER");
+  const bool use_erpc_check = []() {
+    const char* env = std::getenv("BLOOMCHECK_USE_ERPC");
+    return env != nullptr && std::string(env) == "1";
+  }();
+  const bool use_erpc_noop = []() {
+    const char* env = std::getenv("BLOOMCHECK_USE_ERPC_NOOP");
+    return env != nullptr && std::string(env) == "1";
+  }();
   fprintf(stderr, "[DBImplCtor] BloomCheck init: bloomcheck_server=%s, bloomcheck_client_=%p\n",
           bloomcheck_server ? bloomcheck_server : "(null)",
           static_cast<void*>(bloomcheck_client_.get()));
-  if (bloomcheck_server && bloomcheck_server[0] != '\0') {
+  if (use_erpc_check || use_erpc_noop) {
+    fprintf(stderr,
+            "[DBImplCtor] eRPC BloomCheck mode enabled; skipping gRPC BloomCheckServiceClient initialization\n");
+  } else if (bloomcheck_server && bloomcheck_server[0] != '\0') {
     bloomcheck_server_address_ = std::string(bloomcheck_server);
     fprintf(stderr, "[DBImplCtor] Creating BloomCheckServiceClient...\n");
     try {

@@ -2822,7 +2822,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     if (noop_only_mode) {
       uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
       size_t channel_idx = 0;
-      bool noop_ok = client->AsyncNoop(&channel_idx);  // Use async version to avoid gRPC mutex contention
+      BloomCheckServiceClient::RpcTimingBreakdown rpc_timing;
+      bool noop_ok = client->AsyncNoop(&channel_idx, &rpc_timing);  // Use async version to avoid gRPC mutex contention
       uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
       size_t channel_count = client->GetChannelCount();
 
@@ -2835,8 +2836,16 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         uint64_t sample_rate = rpc_log_enabled ? rpc_log_sample_rate : noop_log_sample_rate;
         // 샘플링 레이트가 1이면 항상 로그, 아니면 샘플링
         if (sample_rate == 1 || counter % sample_rate == 0) {
-          ROCKS_LOG_INFO(info_log_, "[NoopRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d",
-                         channel_count, channel_idx, (unsigned long long)rpc_us, noop_ok ? 1 : 0);
+          ROCKS_LOG_INFO(info_log_,
+                         "[NoopRPC] channels=%zu idx=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d",
+                         channel_count, channel_idx,
+                         (unsigned long long)rpc_us,
+                         (unsigned long long)rpc_timing.acquire_wait_us,
+                         (unsigned long long)rpc_timing.submit_prep_us,
+                         (unsigned long long)rpc_timing.wait_completion_us,
+                         (unsigned long long)rpc_timing.wake_up_us,
+                         (unsigned long long)rpc_timing.response_parse_us,
+                         noop_ok ? 1 : 0);
         }
       }
 
@@ -2879,14 +2888,16 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       for (uint64_t file_number : candidate_file_numbers) {
         key_req->add_sst_file_numbers(file_number);
       }
+      const size_t request_bytes = static_cast<size_t>(request.ByteSizeLong());
 
       // Execute async RPC (blocks on condition_variable, NOT on gRPC polling)
       bloomcheck::BatchResponse response;
       size_t channel_idx = 0;
       size_t channel_count = client->GetChannelCount();
+      BloomCheckServiceClient::RpcTimingBreakdown rpc_timing;
       
       uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
-      bool check_ok = client->AsyncCheckBatch(request, &response, &channel_idx);
+      bool check_ok = client->AsyncCheckBatch(request, &response, &channel_idx, &rpc_timing);
       uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
 
       // Map response back to may_match_files
@@ -2911,14 +2922,26 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
               ? response.resps(0).may_match_sst_file_numbers_size() : 0;
           if (info_log_) {
             ROCKS_LOG_INFO(info_log_,
-                           "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d total_may=%d",
+                           "[BloomCheckRPC] channels=%zu idx=%zu req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d",
                            channel_count, channel_idx,
+                           request_bytes,
                            (unsigned long long)rpc_us,
+                           (unsigned long long)rpc_timing.acquire_wait_us,
+                           (unsigned long long)rpc_timing.submit_prep_us,
+                           (unsigned long long)rpc_timing.wait_completion_us,
+                           (unsigned long long)rpc_timing.wake_up_us,
+                           (unsigned long long)rpc_timing.response_parse_us,
                            check_ok ? 1 : 0, total_may);
           } else {
-            fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu rpc_us=%llu ok=%d total_may=%d\n",
+            fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d\n",
                     channel_count, channel_idx,
+                    request_bytes,
                     (unsigned long long)rpc_us,
+                    (unsigned long long)rpc_timing.acquire_wait_us,
+                    (unsigned long long)rpc_timing.submit_prep_us,
+                    (unsigned long long)rpc_timing.wait_completion_us,
+                    (unsigned long long)rpc_timing.wake_up_us,
+                    (unsigned long long)rpc_timing.response_parse_us,
                     check_ok ? 1 : 0, total_may);
           }
         }

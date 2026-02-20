@@ -534,6 +534,9 @@ class KeyResponse final :
 
   enum : int {
     kMayMatchSstFileNumbersFieldNumber = 1,
+    kCheckedCountFieldNumber = 3,
+    kTotalCandidatesFieldNumber = 4,
+    kCompleteFieldNumber = 2,
   };
   // repeated uint64 may_match_sst_file_numbers = 1;
   int may_match_sst_file_numbers_size() const;
@@ -557,6 +560,33 @@ class KeyResponse final :
   ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
       mutable_may_match_sst_file_numbers();
 
+  // uint64 checked_count = 3;
+  void clear_checked_count();
+  uint64_t checked_count() const;
+  void set_checked_count(uint64_t value);
+  private:
+  uint64_t _internal_checked_count() const;
+  void _internal_set_checked_count(uint64_t value);
+  public:
+
+  // uint64 total_candidates = 4;
+  void clear_total_candidates();
+  uint64_t total_candidates() const;
+  void set_total_candidates(uint64_t value);
+  private:
+  uint64_t _internal_total_candidates() const;
+  void _internal_set_total_candidates(uint64_t value);
+  public:
+
+  // bool complete = 2;
+  void clear_complete();
+  bool complete() const;
+  void set_complete(bool value);
+  private:
+  bool _internal_complete() const;
+  void _internal_set_complete(bool value);
+  public:
+
   // @@protoc_insertion_point(class_scope:bloomcheck.KeyResponse)
  private:
   class _Internal;
@@ -567,6 +597,9 @@ class KeyResponse final :
   struct Impl_ {
     ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t > may_match_sst_file_numbers_;
     mutable std::atomic<int> _may_match_sst_file_numbers_cached_byte_size_;
+    uint64_t checked_count_;
+    uint64_t total_candidates_;
+    bool complete_;
     mutable ::PROTOBUF_NAMESPACE_ID::internal::CachedSize _cached_size_;
   };
   union { Impl_ _impl_; };
@@ -850,9 +883,10 @@ class NoopRequest final :
 // -------------------------------------------------------------------
 
 class NoopResponse final :
-    public ::PROTOBUF_NAMESPACE_ID::internal::ZeroFieldsBase /* @@protoc_insertion_point(class_definition:bloomcheck.NoopResponse) */ {
+    public ::PROTOBUF_NAMESPACE_ID::Message /* @@protoc_insertion_point(class_definition:bloomcheck.NoopResponse) */ {
  public:
   inline NoopResponse() : NoopResponse(nullptr) {}
+  ~NoopResponse() override;
   explicit PROTOBUF_CONSTEXPR NoopResponse(::PROTOBUF_NAMESPACE_ID::internal::ConstantInitialized);
 
   NoopResponse(const NoopResponse& from);
@@ -925,15 +959,29 @@ class NoopResponse final :
   NoopResponse* New(::PROTOBUF_NAMESPACE_ID::Arena* arena = nullptr) const final {
     return CreateMaybeMessage<NoopResponse>(arena);
   }
-  using ::PROTOBUF_NAMESPACE_ID::internal::ZeroFieldsBase::CopyFrom;
-  inline void CopyFrom(const NoopResponse& from) {
-    ::PROTOBUF_NAMESPACE_ID::internal::ZeroFieldsBase::CopyImpl(*this, from);
+  using ::PROTOBUF_NAMESPACE_ID::Message::CopyFrom;
+  void CopyFrom(const NoopResponse& from);
+  using ::PROTOBUF_NAMESPACE_ID::Message::MergeFrom;
+  void MergeFrom( const NoopResponse& from) {
+    NoopResponse::MergeImpl(*this, from);
   }
-  using ::PROTOBUF_NAMESPACE_ID::internal::ZeroFieldsBase::MergeFrom;
-  void MergeFrom(const NoopResponse& from) {
-    ::PROTOBUF_NAMESPACE_ID::internal::ZeroFieldsBase::MergeImpl(*this, from);
-  }
+  private:
+  static void MergeImpl(::PROTOBUF_NAMESPACE_ID::Message& to_msg, const ::PROTOBUF_NAMESPACE_ID::Message& from_msg);
   public:
+  PROTOBUF_ATTRIBUTE_REINITIALIZES void Clear() final;
+  bool IsInitialized() const final;
+
+  size_t ByteSizeLong() const final;
+  const char* _InternalParse(const char* ptr, ::PROTOBUF_NAMESPACE_ID::internal::ParseContext* ctx) final;
+  uint8_t* _InternalSerialize(
+      uint8_t* target, ::PROTOBUF_NAMESPACE_ID::io::EpsCopyOutputStream* stream) const final;
+  int GetCachedSize() const final { return _impl_._cached_size_.Get(); }
+
+  private:
+  void SharedCtor(::PROTOBUF_NAMESPACE_ID::Arena* arena, bool is_message_owned);
+  void SharedDtor();
+  void SetCachedSize(int size) const final;
+  void InternalSwap(NoopResponse* other);
 
   private:
   friend class ::PROTOBUF_NAMESPACE_ID::internal::AnyMetadata;
@@ -954,6 +1002,22 @@ class NoopResponse final :
 
   // accessors -------------------------------------------------------
 
+  enum : int {
+    kServerTsNsFieldNumber = 1,
+  };
+  // optional uint64 server_ts_ns = 1;
+  bool has_server_ts_ns() const;
+  private:
+  bool _internal_has_server_ts_ns() const;
+  public:
+  void clear_server_ts_ns();
+  uint64_t server_ts_ns() const;
+  void set_server_ts_ns(uint64_t value);
+  private:
+  uint64_t _internal_server_ts_ns() const;
+  void _internal_set_server_ts_ns(uint64_t value);
+  public:
+
   // @@protoc_insertion_point(class_scope:bloomcheck.NoopResponse)
  private:
   class _Internal;
@@ -962,7 +1026,11 @@ class NoopResponse final :
   typedef void InternalArenaConstructable_;
   typedef void DestructorSkippable_;
   struct Impl_ {
+    ::PROTOBUF_NAMESPACE_ID::internal::HasBits<1> _has_bits_;
+    mutable ::PROTOBUF_NAMESPACE_ID::internal::CachedSize _cached_size_;
+    uint64_t server_ts_ns_;
   };
+  union { Impl_ _impl_; };
   friend struct ::TableStruct_tools_2fbloomcheck_2eproto;
 };
 // ===================================================================
@@ -1168,6 +1236,66 @@ KeyResponse::mutable_may_match_sst_file_numbers() {
   return _internal_mutable_may_match_sst_file_numbers();
 }
 
+// bool complete = 2;
+inline void KeyResponse::clear_complete() {
+  _impl_.complete_ = false;
+}
+inline bool KeyResponse::_internal_complete() const {
+  return _impl_.complete_;
+}
+inline bool KeyResponse::complete() const {
+  // @@protoc_insertion_point(field_get:bloomcheck.KeyResponse.complete)
+  return _internal_complete();
+}
+inline void KeyResponse::_internal_set_complete(bool value) {
+  
+  _impl_.complete_ = value;
+}
+inline void KeyResponse::set_complete(bool value) {
+  _internal_set_complete(value);
+  // @@protoc_insertion_point(field_set:bloomcheck.KeyResponse.complete)
+}
+
+// uint64 checked_count = 3;
+inline void KeyResponse::clear_checked_count() {
+  _impl_.checked_count_ = uint64_t{0u};
+}
+inline uint64_t KeyResponse::_internal_checked_count() const {
+  return _impl_.checked_count_;
+}
+inline uint64_t KeyResponse::checked_count() const {
+  // @@protoc_insertion_point(field_get:bloomcheck.KeyResponse.checked_count)
+  return _internal_checked_count();
+}
+inline void KeyResponse::_internal_set_checked_count(uint64_t value) {
+  
+  _impl_.checked_count_ = value;
+}
+inline void KeyResponse::set_checked_count(uint64_t value) {
+  _internal_set_checked_count(value);
+  // @@protoc_insertion_point(field_set:bloomcheck.KeyResponse.checked_count)
+}
+
+// uint64 total_candidates = 4;
+inline void KeyResponse::clear_total_candidates() {
+  _impl_.total_candidates_ = uint64_t{0u};
+}
+inline uint64_t KeyResponse::_internal_total_candidates() const {
+  return _impl_.total_candidates_;
+}
+inline uint64_t KeyResponse::total_candidates() const {
+  // @@protoc_insertion_point(field_get:bloomcheck.KeyResponse.total_candidates)
+  return _internal_total_candidates();
+}
+inline void KeyResponse::_internal_set_total_candidates(uint64_t value) {
+  
+  _impl_.total_candidates_ = value;
+}
+inline void KeyResponse::set_total_candidates(uint64_t value) {
+  _internal_set_total_candidates(value);
+  // @@protoc_insertion_point(field_set:bloomcheck.KeyResponse.total_candidates)
+}
+
 // -------------------------------------------------------------------
 
 // BatchResponse
@@ -1219,6 +1347,34 @@ BatchResponse::resps() const {
 // -------------------------------------------------------------------
 
 // NoopResponse
+
+// optional uint64 server_ts_ns = 1;
+inline bool NoopResponse::_internal_has_server_ts_ns() const {
+  bool value = (_impl_._has_bits_[0] & 0x00000001u) != 0;
+  return value;
+}
+inline bool NoopResponse::has_server_ts_ns() const {
+  return _internal_has_server_ts_ns();
+}
+inline void NoopResponse::clear_server_ts_ns() {
+  _impl_.server_ts_ns_ = uint64_t{0u};
+  _impl_._has_bits_[0] &= ~0x00000001u;
+}
+inline uint64_t NoopResponse::_internal_server_ts_ns() const {
+  return _impl_.server_ts_ns_;
+}
+inline uint64_t NoopResponse::server_ts_ns() const {
+  // @@protoc_insertion_point(field_get:bloomcheck.NoopResponse.server_ts_ns)
+  return _internal_server_ts_ns();
+}
+inline void NoopResponse::_internal_set_server_ts_ns(uint64_t value) {
+  _impl_._has_bits_[0] |= 0x00000001u;
+  _impl_.server_ts_ns_ = value;
+}
+inline void NoopResponse::set_server_ts_ns(uint64_t value) {
+  _internal_set_server_ts_ns(value);
+  // @@protoc_insertion_point(field_set:bloomcheck.NoopResponse.server_ts_ns)
+}
 
 #ifdef __GNUC__
   #pragma GCC diagnostic pop

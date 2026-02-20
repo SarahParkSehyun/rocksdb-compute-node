@@ -25,6 +25,13 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+inline uint64_t BloomNowMicros() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
 // Simple semaphore implementation for inflight RPC limiting
 class Semaphore {
  public:
@@ -130,6 +137,7 @@ class AsyncRPCCallBase {
   void Signal() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      signal_us_.store(BloomNowMicros(), std::memory_order_release);
       completed_ = true;
     }
     cv_.notify_one();
@@ -138,6 +146,7 @@ class AsyncRPCCallBase {
   bool ok_;
   grpc::Status status_;
   size_t channel_idx_ = 0;
+  std::atomic<uint64_t> signal_us_{0};
 
  protected:
   std::mutex mutex_;
@@ -170,6 +179,14 @@ class AsyncNoopCall : public AsyncRPCCallBase {
 // BloomCheckServiceClient provides a C++ client interface for the BloomCheck gRPC service
 class BloomCheckServiceClient {
  public:
+  struct RpcTimingBreakdown {
+    uint64_t acquire_wait_us = 0;
+    uint64_t submit_prep_us = 0;
+    uint64_t wait_completion_us = 0;
+    uint64_t wake_up_us = 0;
+    uint64_t response_parse_us = 0;
+  };
+
   explicit BloomCheckServiceClient(const std::string& server_address)
       : channel_count_(32), shutdown_(false), stats_thread_started_(false) {  // Default: 32 channels for 32 physical cores
     
@@ -280,6 +297,14 @@ class BloomCheckServiceClient {
       // Use minimal executor pool size to avoid background tasks on poller-dedicated cores
       channel_args.SetInt(GRPC_ARG_MAX_SEND_MESSAGE_LENGTH, -1);
       channel_args.SetInt(GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH, -1);
+      // Disable Nagle's algorithm on client sockets to reduce small-RPC latency.
+      channel_args.SetInt("grpc.tcp_nodelay", 1);
+      // Increase HTTP/2 flow-control windows for higher throughput under concurrency.
+      channel_args.SetInt("grpc.http2.initial_stream_window_size", 1 << 20);       // 1MB
+      channel_args.SetInt("grpc.http2.initial_connection_window_size", 16 << 20);  // 16MB
+      // Set HTTP/2 concurrent streams limit.
+      // This maps to SETTINGS_MAX_CONCURRENT_STREAMS.
+      channel_args.SetInt("grpc.max_concurrent_streams", 1000);
       
       // Disable resolver background threads that might interfere
       channel_args.SetInt(GRPC_ARG_ENABLE_RETRIES, 0);
@@ -335,6 +360,22 @@ class BloomCheckServiceClient {
               "will use round-robin mapping\n", channel_count_, poller_cores.size());
     }
     
+    // Optional poller RT priority override (default: 10)
+    int poller_fifo_prio = 10;
+    int fifo_min_prio = sched_get_priority_min(SCHED_FIFO);
+    int fifo_max_prio = sched_get_priority_max(SCHED_FIFO);
+    const char* poller_prio_env = std::getenv("BLOOMCHECK_POLLER_FIFO_PRIO");
+    if (poller_prio_env != nullptr) {
+      int requested = std::atoi(poller_prio_env);
+      if (requested >= fifo_min_prio && requested <= fifo_max_prio) {
+        poller_fifo_prio = requested;
+      } else {
+        fprintf(stderr,
+                "[BloomCheckClient] Invalid BLOOMCHECK_POLLER_FIFO_PRIO=%d (valid range: %d-%d), using default=%d\n",
+                requested, fifo_min_prio, fifo_max_prio, poller_fifo_prio);
+      }
+    }
+
     cq_poller_threads_.reserve(cq_count);
     for (size_t i = 0; i < cq_count; ++i) {
       cq_poller_threads_.emplace_back(
@@ -352,7 +393,7 @@ class BloomCheckServiceClient {
         // Set SCHED_FIFO with low priority (10-20 range)
         // This gives poller threads real-time scheduling but with low priority to avoid starvation
         struct sched_param param;
-        param.sched_priority = 10;  // Low priority in SCHED_FIFO (range: 1-99, typically max is 99)
+        param.sched_priority = poller_fifo_prio;
         int sched_ret = pthread_setschedparam(thread_handle, SCHED_FIFO, &param);
         if (sched_ret == 0) {
           fprintf(stderr, "[BloomCheckClient] CQ poller thread %zu pinned to CPU %d with SCHED_FIFO priority %d\n", 
@@ -368,9 +409,9 @@ class BloomCheckServiceClient {
     }
     
     // Log poller core assignment summary
-    fprintf(stderr, "[BloomCheckClient] Poller isolation: %d poller threads pinned to top cores with SCHED_FIFO priority 10, "
+    fprintf(stderr, "[BloomCheckClient] Poller isolation: %d poller threads pinned to top cores with SCHED_FIFO priority %d, "
             "RocksDB workers use system default scheduling\n",
-            static_cast<int>(cq_count));
+            static_cast<int>(cq_count), poller_fifo_prio);
     
     // Log initialization info
     fprintf(stderr, "[BloomCheckClient] Initialized: stubs_.size()=%zu, cqs_.size()=%zu, poller_thread_count=%zu\n",
@@ -539,10 +580,13 @@ class BloomCheckServiceClient {
   // Blocks the calling thread until RPC completes, but does NOT participate in pollset_work
   // Respects MAX_INFLIGHT limit if set via BLOOMCHECK_MAX_INFLIGHT environment variable
   bool AsyncCheckBatch(const bloomcheck::BatchRequest& request,
-                       bloomcheck::BatchResponse* response, size_t* channel_idx = nullptr) {
+                       bloomcheck::BatchResponse* response, size_t* channel_idx = nullptr,
+                       RpcTimingBreakdown* timing = nullptr) {
+    const uint64_t t_acquire_begin = BloomNowMicros();
     // Acquire semaphore slot if inflight limiting is enabled
     // This will block if MAX_INFLIGHT limit is reached
     SemaphoreGuard guard(inflight_semaphore_.get());
+    const uint64_t t_after_acquire = BloomNowMicros();
 
     // Select channel and CQ
     size_t stub_idx = GetChannelIndex();
@@ -564,6 +608,7 @@ class BloomCheckServiceClient {
     // Finish is an async operation - tag must remain valid until CQ poller processes it
     void* tag = call.get();
     rpc->Finish(&call->response_, &call->status_, tag);
+    const uint64_t t_after_finish = BloomNowMicros();
 
     // Increment inflight counters AFTER rpc->Finish() (RPC is now outstanding)
     // Use RAII guard to ensure decrement even on exception/early return
@@ -578,7 +623,9 @@ class BloomCheckServiceClient {
 
     // Keep rpc alive until Wait() completes (rpc destructor is safe after Finish)
     // Block on condition_variable (NOT on gRPC polling)
+    const uint64_t t_wait_begin = BloomNowMicros();
     call->Wait();
+    const uint64_t t_wait_end = BloomNowMicros();
 
     // RPC completed - inflight_guard destructor will decrement counters
     // Increment completed counter
@@ -587,6 +634,31 @@ class BloomCheckServiceClient {
     // Copy results
     // Note: SemaphoreGuard destructor will release the semaphore slot here
     *response = call->response_;
+    const uint64_t t_parse_end = BloomNowMicros();
+    if (timing != nullptr) {
+      timing->acquire_wait_us = t_after_acquire - t_acquire_begin;
+      timing->submit_prep_us = t_after_finish - t_after_acquire;
+      const uint64_t signal_us = call->signal_us_.load(std::memory_order_acquire);
+      if (signal_us > 0) {
+        if (signal_us > t_wait_begin) {
+          timing->wait_completion_us = signal_us - t_wait_begin;
+          if (t_wait_end > signal_us) {
+            timing->wake_up_us = t_wait_end - signal_us;
+          }
+        } else {
+          // Completion already arrived before or at Wait() entry.
+          timing->wait_completion_us = 0;
+          if (t_wait_end > t_wait_begin) {
+            timing->wake_up_us = t_wait_end - t_wait_begin;
+          }
+        }
+      } else {
+        // Fallback: unknown signal timestamp, treat entire wait as completion wait.
+        timing->wait_completion_us = t_wait_end - t_wait_begin;
+        timing->wake_up_us = 0;
+      }
+      timing->response_parse_us = t_parse_end - t_wait_end;
+    }
     return call->status_.ok();
   }
 
@@ -613,10 +685,12 @@ class BloomCheckServiceClient {
   // Async version: Noop RPC for latency measurement
   // Blocks the calling thread until RPC completes, but does NOT participate in pollset_work
   // Respects MAX_INFLIGHT limit if set via BLOOMCHECK_MAX_INFLIGHT environment variable
-  bool AsyncNoop(size_t* channel_idx = nullptr) {
+  bool AsyncNoop(size_t* channel_idx = nullptr, RpcTimingBreakdown* timing = nullptr) {
+    const uint64_t t_acquire_begin = BloomNowMicros();
     // Acquire semaphore slot if inflight limiting is enabled
     // This will block if MAX_INFLIGHT limit is reached
     SemaphoreGuard guard(inflight_semaphore_.get());
+    const uint64_t t_after_acquire = BloomNowMicros();
 
     // Select channel and CQ
     size_t stub_idx = GetChannelIndex();
@@ -637,12 +711,38 @@ class BloomCheckServiceClient {
     // Finish is an async operation - tag must remain valid until CQ poller processes it
     void* tag = call.get();
     rpc->Finish(&call->response_, &call->status_, tag);
+    const uint64_t t_after_finish = BloomNowMicros();
 
     // Keep rpc alive until Wait() completes (rpc destructor is safe after Finish)
     // Block on condition_variable (NOT on gRPC polling)
+    const uint64_t t_wait_begin = BloomNowMicros();
     call->Wait();
+    const uint64_t t_wait_end = BloomNowMicros();
 
     // Note: SemaphoreGuard destructor will release the semaphore slot here
+    const uint64_t t_parse_end = BloomNowMicros();
+    if (timing != nullptr) {
+      timing->acquire_wait_us = t_after_acquire - t_acquire_begin;
+      timing->submit_prep_us = t_after_finish - t_after_acquire;
+      const uint64_t signal_us = call->signal_us_.load(std::memory_order_acquire);
+      if (signal_us > 0) {
+        if (signal_us > t_wait_begin) {
+          timing->wait_completion_us = signal_us - t_wait_begin;
+          if (t_wait_end > signal_us) {
+            timing->wake_up_us = t_wait_end - signal_us;
+          }
+        } else {
+          timing->wait_completion_us = 0;
+          if (t_wait_end > t_wait_begin) {
+            timing->wake_up_us = t_wait_end - t_wait_begin;
+          }
+        }
+      } else {
+        timing->wait_completion_us = t_wait_end - t_wait_begin;
+        timing->wake_up_us = 0;
+      }
+      timing->response_parse_us = t_parse_end - t_wait_end;
+    }
     return call->status_.ok();
   }
 

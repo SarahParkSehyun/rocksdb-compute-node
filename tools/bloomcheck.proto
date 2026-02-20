@@ -12,6 +12,9 @@ message BatchRequest {
 
 message KeyResponse {
   repeated uint64 may_match_sst_file_numbers = 1;
+  bool complete = 2;  // 모든 candidate 파일을 검사했는지 여부
+  uint64 checked_count = 3;  // 실제로 검사한 파일 수
+  uint64 total_candidates = 4;  // 요청된 전체 candidate 파일 수
 }
 
 message BatchResponse {
@@ -19,11 +22,10 @@ message BatchResponse {
 }
 
 message NoopRequest {
-  // Empty message for no-op RPC
 }
 
 message NoopResponse {
-  // Empty message for no-op RPC
+  optional uint64 server_ts_ns = 1;
 }
 
 service BloomCheck {
