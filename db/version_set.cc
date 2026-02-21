@@ -2772,48 +2772,48 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   }();
 
   // NOOP 로깅 설정: 환경변수로 활성화 (deprecated, use BLOOMCHECK_RPC_LOG)
-  static bool noop_log_enabled = []() {
-    const char* env = std::getenv("BLOOMCHECK_NOOP_LOG");
-    bool enabled = env != nullptr && std::string(env) == "1";
-    return enabled;
-  }();
+  // static bool noop_log_enabled = []() {
+  //   const char* env = std::getenv("BLOOMCHECK_NOOP_LOG");
+  //   bool enabled = env != nullptr && std::string(env) == "1";
+  //   return enabled;
+  // }();
 
   // RPC 로깅 설정: 환경변수로 활성화 (통합 로깅)
-  static bool rpc_log_enabled = []() {
-    const char* env = std::getenv("BLOOMCHECK_RPC_LOG");
-    return env != nullptr && std::string(env) == "1";
-  }();
-  static bool bloomcheck_use_streaming = []() {
-    const char* env = std::getenv("BLOOMCHECK_USE_STREAMING");
-    return env != nullptr && std::string(env) == "1";
-  }();
+  // static bool rpc_log_enabled = []() {
+  //   const char* env = std::getenv("BLOOMCHECK_RPC_LOG");
+  //   return env != nullptr && std::string(env) == "1";
+  // }();
+  // static bool bloomcheck_use_streaming = []() {
+  //   const char* env = std::getenv("BLOOMCHECK_USE_STREAMING");
+  //   return env != nullptr && std::string(env) == "1";
+  // }();
 
   // 샘플링 레이트: 기본값 1000 (1/1000)
-  static std::atomic<uint64_t> noop_log_counter(0);
-  static std::atomic<uint64_t> rpc_log_counter(0);
-  static uint64_t noop_log_sample_rate = []() {
-    const char* env = std::getenv("BLOOMCHECK_NOOP_LOG_SAMPLE_RATE");
-    if (env != nullptr) {
-      return static_cast<uint64_t>(std::atoi(env));
-    }
-    return static_cast<uint64_t>(1000);
-  }();
-  static uint64_t rpc_log_sample_rate = []() {
-    const char* env = std::getenv("BLOOMCHECK_RPC_LOG_SAMPLE_RATE");
-    if (env != nullptr) {
-      return static_cast<uint64_t>(std::atoi(env));
-    }
-    return static_cast<uint64_t>(1000);
-  }();
+  // static std::atomic<uint64_t> noop_log_counter(0);
+  // static std::atomic<uint64_t> rpc_log_counter(0);
+  // static uint64_t noop_log_sample_rate = []() {
+  //   const char* env = std::getenv("BLOOMCHECK_NOOP_LOG_SAMPLE_RATE");
+  //   if (env != nullptr) {
+  //     return static_cast<uint64_t>(std::atoi(env));
+  //   }
+  //   return static_cast<uint64_t>(1000);
+  // }();
+  // static uint64_t rpc_log_sample_rate = []() {
+  //   const char* env = std::getenv("BLOOMCHECK_RPC_LOG_SAMPLE_RATE");
+  //   if (env != nullptr) {
+  //     return static_cast<uint64_t>(std::atoi(env));
+  //   }
+  //   return static_cast<uint64_t>(1000);
+  // }();
 
 
   // cache-only 모드에서는 bloomcheck 건너뛰기 (네트워크 I/O 방지)
   // 디버깅: bloomcheck_client 및 noop_only_mode 상태 확인
-  if (info_log_ && noop_only_mode) {
-    ROCKS_LOG_INFO(info_log_, "[NoopRPC] noop_only_mode=%d, bloomcheck_client=%p, read_tier=%d",
-                   noop_only_mode ? 1 : 0, read_options.bloomcheck_client,
-                   static_cast<int>(read_options.read_tier));
-  }
+  // if (info_log_ && noop_only_mode) {
+  //   ROCKS_LOG_INFO(info_log_, "[NoopRPC] noop_only_mode=%d, bloomcheck_client=%p, read_tier=%d",
+  //                  noop_only_mode ? 1 : 0, read_options.bloomcheck_client,
+  //                  static_cast<int>(read_options.read_tier));
+  // }
 
   if (read_options.bloomcheck_client != nullptr &&
       read_options.read_tier == kReadAllTier) {
@@ -2824,34 +2824,36 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
 
     // NOOP_ONLY 모드: Noop RPC만 호출하고 나머지 로직은 건너뛰기
     if (noop_only_mode) {
-      uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+      // uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
       size_t channel_idx = 0;
       BloomCheckServiceClient::RpcTimingBreakdown rpc_timing;
       bool noop_ok = client->AsyncNoop(&channel_idx, &rpc_timing);  // Use async version to avoid gRPC mutex contention
-      uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
-      size_t channel_count = client->GetChannelCount();
+      // uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+      // size_t channel_count = client->GetChannelCount();
+      (void)noop_ok;  // Suppress unused variable warning
+      (void)rpc_timing;  // Suppress unused variable warning
 
       // 로깅 (샘플링 적용)
-      bool should_log = (noop_log_enabled || rpc_log_enabled) && info_log_;
-      if (should_log) {
-        uint64_t counter = rpc_log_enabled 
-            ? rpc_log_counter.fetch_add(1, std::memory_order_relaxed)
-            : noop_log_counter.fetch_add(1, std::memory_order_relaxed);
-        uint64_t sample_rate = rpc_log_enabled ? rpc_log_sample_rate : noop_log_sample_rate;
-        // 샘플링 레이트가 1이면 항상 로그, 아니면 샘플링
-        if (sample_rate == 1 || counter % sample_rate == 0) {
-          ROCKS_LOG_INFO(info_log_,
-                         "[NoopRPC] channels=%zu idx=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d",
-                         channel_count, channel_idx,
-                         (unsigned long long)rpc_us,
-                         (unsigned long long)rpc_timing.acquire_wait_us,
-                         (unsigned long long)rpc_timing.submit_prep_us,
-                         (unsigned long long)rpc_timing.wait_completion_us,
-                         (unsigned long long)rpc_timing.wake_up_us,
-                         (unsigned long long)rpc_timing.response_parse_us,
-                         noop_ok ? 1 : 0);
-        }
-      }
+      // bool should_log = (noop_log_enabled || rpc_log_enabled) && info_log_;
+      // if (should_log) {
+      //   uint64_t counter = rpc_log_enabled 
+      //       ? rpc_log_counter.fetch_add(1, std::memory_order_relaxed)
+      //       : noop_log_counter.fetch_add(1, std::memory_order_relaxed);
+      //   uint64_t sample_rate = rpc_log_enabled ? rpc_log_sample_rate : noop_log_sample_rate;
+      //   샘플링 레이트가 1이면 항상 로그, 아니면 샘플링
+      //   if (sample_rate == 1 || counter % sample_rate == 0) {
+      //     ROCKS_LOG_INFO(info_log_,
+      //                    "[NoopRPC] channels=%zu idx=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d",
+      //                    channel_count, channel_idx,
+      //                    (unsigned long long)rpc_us,
+      //                    (unsigned long long)rpc_timing.acquire_wait_us,
+      //                    (unsigned long long)rpc_timing.submit_prep_us,
+      //                    (unsigned long long)rpc_timing.wait_completion_us,
+      //                    (unsigned long long)rpc_timing.wake_up_us,
+      //                    (unsigned long long)rpc_timing.response_parse_us,
+      //                    noop_ok ? 1 : 0);
+      //   }
+      // }
 
       // NOOP_ONLY 모드에서는 bloomcheck_may_match_files를 설정하지 않음
       // (baseline RocksDB 동작으로 진행)
@@ -2892,17 +2894,18 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       for (uint64_t file_number : candidate_file_numbers) {
         key_req->add_sst_file_numbers(file_number);
       }
-      const size_t request_bytes = static_cast<size_t>(request.ByteSizeLong());
+      // const size_t request_bytes = static_cast<size_t>(request.ByteSizeLong());
 
       // Execute async RPC (blocks on condition_variable, NOT on gRPC polling)
       bloomcheck::BatchResponse response;
       size_t channel_idx = 0;
-      size_t channel_count = client->GetChannelCount();
+      // size_t channel_count = client->GetChannelCount();
       BloomCheckServiceClient::RpcTimingBreakdown rpc_timing;
       
-      uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
+      // uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
       bool check_ok = client->AsyncCheckBatch(request, &response, &channel_idx, &rpc_timing);
-      uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+      // uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
+      (void)rpc_timing;  // Suppress unused variable warning
 
       // Map response back to may_match_files
       if (check_ok && response.resps_size() == 1) {
@@ -2918,40 +2921,40 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       }
 
       // Logging
-      if (rpc_log_enabled) {
-        static std::atomic<uint64_t> rpc_counter(0);
-        uint64_t counter = rpc_counter.fetch_add(1, std::memory_order_relaxed);
-        if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
-          int total_may = check_ok && response.resps_size() > 0
-              ? response.resps(0).may_match_sst_file_numbers_size() : 0;
-          if (info_log_) {
-            ROCKS_LOG_INFO(info_log_,
-                           "[BloomCheckRPC] channels=%zu idx=%zu streaming=%d req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d",
-                           channel_count, channel_idx,
-                           bloomcheck_use_streaming ? 1 : 0,
-                           request_bytes,
-                           (unsigned long long)rpc_us,
-                           (unsigned long long)rpc_timing.acquire_wait_us,
-                           (unsigned long long)rpc_timing.submit_prep_us,
-                           (unsigned long long)rpc_timing.wait_completion_us,
-                           (unsigned long long)rpc_timing.wake_up_us,
-                           (unsigned long long)rpc_timing.response_parse_us,
-                           check_ok ? 1 : 0, total_may);
-          } else {
-            fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu streaming=%d req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d\n",
-                    channel_count, channel_idx,
-                    bloomcheck_use_streaming ? 1 : 0,
-                    request_bytes,
-                    (unsigned long long)rpc_us,
-                    (unsigned long long)rpc_timing.acquire_wait_us,
-                    (unsigned long long)rpc_timing.submit_prep_us,
-                    (unsigned long long)rpc_timing.wait_completion_us,
-                    (unsigned long long)rpc_timing.wake_up_us,
-                    (unsigned long long)rpc_timing.response_parse_us,
-                    check_ok ? 1 : 0, total_may);
-          }
-        }
-      }
+      // if (rpc_log_enabled) {
+      //   static std::atomic<uint64_t> rpc_counter(0);
+      //   uint64_t counter = rpc_counter.fetch_add(1, std::memory_order_relaxed);
+      //   if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
+      //     int total_may = check_ok && response.resps_size() > 0
+      //         ? response.resps(0).may_match_sst_file_numbers_size() : 0;
+      //     if (info_log_) {
+      //       ROCKS_LOG_INFO(info_log_,
+      //                      "[BloomCheckRPC] channels=%zu idx=%zu streaming=%d req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d",
+      //                      channel_count, channel_idx,
+      //                      bloomcheck_use_streaming ? 1 : 0,
+      //                      request_bytes,
+      //                      (unsigned long long)rpc_us,
+      //                      (unsigned long long)rpc_timing.acquire_wait_us,
+      //                      (unsigned long long)rpc_timing.submit_prep_us,
+      //                      (unsigned long long)rpc_timing.wait_completion_us,
+      //                      (unsigned long long)rpc_timing.wake_up_us,
+      //                      (unsigned long long)rpc_timing.response_parse_us,
+      //                      check_ok ? 1 : 0, total_may);
+      //     } else {
+      //       fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu streaming=%d req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d\n",
+      //               channel_count, channel_idx,
+      //               bloomcheck_use_streaming ? 1 : 0,
+      //               request_bytes,
+      //               (unsigned long long)rpc_us,
+      //               (unsigned long long)rpc_timing.acquire_wait_us,
+      //               (unsigned long long)rpc_timing.submit_prep_us,
+      //               (unsigned long long)rpc_timing.wait_completion_us,
+      //               (unsigned long long)rpc_timing.wake_up_us,
+      //               (unsigned long long)rpc_timing.response_parse_us,
+      //               check_ok ? 1 : 0, total_may);
+      //     }
+      //   }
+      // }
       
       bloomcheck_ok = check_ok;
     }

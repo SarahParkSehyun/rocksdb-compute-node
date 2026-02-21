@@ -229,9 +229,9 @@ class BloomCheckServiceClient {
     if (poll_strategy == nullptr) {
       // Default to epoll1 for better isolation (if not already set)
       setenv("GRPC_POLL_STRATEGY", "epoll1", 0);  // 0 = don't overwrite if exists
-      fprintf(stderr, "[BloomCheckClient] Set GRPC_POLL_STRATEGY=epoll1 for pollset isolation\n");
+      // fprintf(stderr, "[BloomCheckClient] Set GRPC_POLL_STRATEGY=epoll1 for pollset isolation\n");
     } else {
-      fprintf(stderr, "[BloomCheckClient] Using existing GRPC_POLL_STRATEGY=%s\n", poll_strategy);
+      // fprintf(stderr, "[BloomCheckClient] Using existing GRPC_POLL_STRATEGY=%s\n", poll_strategy);
     }
     
     // Read channel count from environment variable (default: 32)
@@ -255,7 +255,7 @@ class BloomCheckServiceClient {
     
     // Ensure CQ count matches channel count for 1:1 mapping
     if (cq_count != channel_count_) {
-      fprintf(stderr, "[BloomCheckClient] Warning: CQ count (%zu) != channel count (%zu), adjusting CQ count to match\n", cq_count, channel_count_);
+      // fprintf(stderr, "[BloomCheckClient] Warning: CQ count (%zu) != channel count (%zu), adjusting CQ count to match\n", cq_count, channel_count_);
       cq_count = channel_count_;
     }
 
@@ -275,10 +275,10 @@ class BloomCheckServiceClient {
     // This is appropriate for "total concurrent RPC limit" goal
     if (max_inflight > 0) {
       inflight_semaphore_ = std::make_unique<Semaphore>(max_inflight);
-      fprintf(stderr, "[BloomCheckClient] Inflight limiting enabled: max_inflight=%zu (GLOBAL semaphore, shared across all %zu channels)\n", 
-              max_inflight, channel_count_);
+      // fprintf(stderr, "[BloomCheckClient] Inflight limiting enabled: max_inflight=%zu (GLOBAL semaphore, shared across all %zu channels)\n", 
+      //         max_inflight, channel_count_);
     } else {
-      fprintf(stderr, "[BloomCheckClient] Inflight limiting disabled (unlimited)\n");
+      // fprintf(stderr, "[BloomCheckClient] Inflight limiting disabled (unlimited)\n");
     }
 
     use_streaming_ = false;
@@ -390,8 +390,8 @@ class BloomCheckServiceClient {
     
     // Ensure we don't exceed available cores
     if (channel_count_ > poller_cores.size()) {
-      fprintf(stderr, "[BloomCheckClient] Warning: channel_count (%zu) > available poller cores (%zu), "
-              "will use round-robin mapping\n", channel_count_, poller_cores.size());
+      // fprintf(stderr, "[BloomCheckClient] Warning: channel_count (%zu) > available poller cores (%zu), "
+      //         "will use round-robin mapping\n", channel_count_, poller_cores.size());
     }
     
     // Optional poller RT priority override (default: 10)
@@ -404,9 +404,9 @@ class BloomCheckServiceClient {
       if (requested >= fifo_min_prio && requested <= fifo_max_prio) {
         poller_fifo_prio = requested;
       } else {
-        fprintf(stderr,
-                "[BloomCheckClient] Invalid BLOOMCHECK_POLLER_FIFO_PRIO=%d (valid range: %d-%d), using default=%d\n",
-                requested, fifo_min_prio, fifo_max_prio, poller_fifo_prio);
+        // fprintf(stderr,
+        //         "[BloomCheckClient] Invalid BLOOMCHECK_POLLER_FIFO_PRIO=%d (valid range: %d-%d), using default=%d\n",
+        //         requested, fifo_min_prio, fifo_max_prio, poller_fifo_prio);
       }
     }
 
@@ -430,26 +430,26 @@ class BloomCheckServiceClient {
         param.sched_priority = poller_fifo_prio;
         int sched_ret = pthread_setschedparam(thread_handle, SCHED_FIFO, &param);
         if (sched_ret == 0) {
-          fprintf(stderr, "[BloomCheckClient] CQ poller thread %zu pinned to CPU %d with SCHED_FIFO priority %d\n", 
-                  i, cpu_id, param.sched_priority);
+          // fprintf(stderr, "[BloomCheckClient] CQ poller thread %zu pinned to CPU %d with SCHED_FIFO priority %d\n", 
+          //         i, cpu_id, param.sched_priority);
         } else {
-          fprintf(stderr, "[BloomCheckClient] CQ poller thread %zu pinned to CPU %d with default priority (SCHED_FIFO failed: %d)\n", 
-                  i, cpu_id, sched_ret);
+          // fprintf(stderr, "[BloomCheckClient] CQ poller thread %zu pinned to CPU %d with default priority (SCHED_FIFO failed: %d)\n", 
+          //         i, cpu_id, sched_ret);
         }
       } else {
-        fprintf(stderr, "[BloomCheckClient] Warning: Failed to pin CQ poller thread %zu to CPU %d (errno=%d)\n", 
-                i, cpu_id, ret);
+        // fprintf(stderr, "[BloomCheckClient] Warning: Failed to pin CQ poller thread %zu to CPU %d (errno=%d)\n", 
+        //         i, cpu_id, ret);
       }
     }
     
     // Log poller core assignment summary
-    fprintf(stderr, "[BloomCheckClient] Poller isolation: %d poller threads pinned to top cores with SCHED_FIFO priority %d, "
-            "RocksDB workers use system default scheduling\n",
-            static_cast<int>(cq_count), poller_fifo_prio);
+    // fprintf(stderr, "[BloomCheckClient] Poller isolation: %d poller threads pinned to top cores with SCHED_FIFO priority %d, "
+    //         "RocksDB workers use system default scheduling\n",
+    //         static_cast<int>(cq_count), poller_fifo_prio);
     
     // Log initialization info
-    fprintf(stderr, "[BloomCheckClient] Initialized: stubs_.size()=%zu, cqs_.size()=%zu, poller_thread_count=%zu\n",
-            stubs_.size(), cqs_.size(), cq_poller_threads_.size());
+    // fprintf(stderr, "[BloomCheckClient] Initialized: stubs_.size()=%zu, cqs_.size()=%zu, poller_thread_count=%zu\n",
+    //         stubs_.size(), cqs_.size(), cq_poller_threads_.size());
 
     if (use_streaming_) {
       stream_sessions_.resize(channel_count_);
@@ -462,11 +462,11 @@ class BloomCheckServiceClient {
               this, ch, s, cq_idx, stream_max_pending_));
         }
       }
-      fprintf(stderr,
-              "[BloomCheckClient] Streaming enabled: channels=%zu streams_per_channel=%zu stream_max_pending=%zu\n",
-              channel_count_, streams_per_channel_, stream_max_pending_);
+      // fprintf(stderr,
+      //         "[BloomCheckClient] Streaming enabled: channels=%zu streams_per_channel=%zu stream_max_pending=%zu\n",
+      //         channel_count_, streams_per_channel_, stream_max_pending_);
     } else {
-      fprintf(stderr, "[BloomCheckClient] Streaming disabled: using unary RPC path\n");
+      // fprintf(stderr, "[BloomCheckClient] Streaming disabled: using unary RPC path\n");
     }
     
     // Initialize inflight statistics
@@ -492,21 +492,21 @@ class BloomCheckServiceClient {
       // Use atomic flag to prevent duplicate stats thread starts
       bool expected = false;
       if (!stats_thread_started_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        fprintf(stderr, "[BloomCheckClient] WARNING: Stats thread already started! Not starting duplicate. [this=%p]\n",
-                static_cast<void*>(this));
+        // fprintf(stderr, "[BloomCheckClient] WARNING: Stats thread already started! Not starting duplicate. [this=%p]\n",
+        //         static_cast<void*>(this));
       } else {
         // Check if stats thread is already running (guard against duplicate starts)
         if (stats_thread_.joinable()) {
-          fprintf(stderr, "[BloomCheckClient] WARNING: Stats thread already running! Not starting duplicate. [this=%p]\n",
-                  static_cast<void*>(this));
+          // fprintf(stderr, "[BloomCheckClient] WARNING: Stats thread already running! Not starting duplicate. [this=%p]\n",
+          //         static_cast<void*>(this));
           stats_thread_started_.store(false, std::memory_order_release);  // Reset flag
         } else {
-          pid_t pid = getpid();
-          pid_t tid = syscall(SYS_gettid);
-          void* this_ptr = static_cast<void*>(this);
+          // pid_t pid = getpid();
+          // pid_t tid = syscall(SYS_gettid);
+          // void* this_ptr = static_cast<void*>(this);
           stats_thread_ = std::thread(&BloomCheckServiceClient::StatsThread, this);
-          fprintf(stderr, "[BloomCheckClient] Stats thread enabled (BLOOMCHECK_CLIENT_STATS=1) [pid=%d][tid=%d][this=%p]\n",
-                  pid, tid, this_ptr);
+          // fprintf(stderr, "[BloomCheckClient] Stats thread enabled (BLOOMCHECK_CLIENT_STATS=1) [pid=%d][tid=%d][this=%p]\n",
+          //         pid, tid, this_ptr);
         }
       }
     }
@@ -523,45 +523,45 @@ class BloomCheckServiceClient {
     }
     
     // Print final inflight statistics before shutdown
-    int64_t final_inflight = inflight_now_.load(std::memory_order_relaxed);
-    int64_t final_max = inflight_max_.load(std::memory_order_relaxed);
-    uint64_t total_started = rpc_started_total_.load(std::memory_order_relaxed);
-    uint64_t total_completed = rpc_completed_total_.load(std::memory_order_relaxed);
+    // int64_t final_inflight = inflight_now_.load(std::memory_order_relaxed);
+    // int64_t final_max = inflight_max_.load(std::memory_order_relaxed);
+    // uint64_t total_started = rpc_started_total_.load(std::memory_order_relaxed);
+    // uint64_t total_completed = rpc_completed_total_.load(std::memory_order_relaxed);
     
-    fprintf(stderr, "[BloomCheckClient] Final statistics: inflight_now=%lld inflight_max=%lld "
-            "rpc_started_total=%llu rpc_completed_total=%llu\n",
-            (long long)final_inflight, (long long)final_max,
-            (unsigned long long)total_started, (unsigned long long)total_completed);
+    // fprintf(stderr, "[BloomCheckClient] Final statistics: inflight_now=%lld inflight_max=%lld "
+    //         "rpc_started_total=%llu rpc_completed_total=%llu\n",
+    //         (long long)final_inflight, (long long)final_max,
+    //         (unsigned long long)total_started, (unsigned long long)total_completed);
     
     // Print per-channel max inflight
-    fprintf(stderr, "[BloomCheckClient] Per-channel max inflight: [");
-    for (size_t i = 0; i < std::min(channel_count_, static_cast<size_t>(10)); ++i) {
-      int64_t ch_max = inflight_per_channel_max_[i]->load(std::memory_order_relaxed);
-      if (i > 0) fprintf(stderr, ",");
-      fprintf(stderr, "%lld", (long long)ch_max);
-    }
-    if (channel_count_ > 10) {
-      fprintf(stderr, ",...(%zu total)", channel_count_);
-    }
-    fprintf(stderr, "]\n");
+    // fprintf(stderr, "[BloomCheckClient] Per-channel max inflight: [");
+    // for (size_t i = 0; i < std::min(channel_count_, static_cast<size_t>(10)); ++i) {
+    //   int64_t ch_max = inflight_per_channel_max_[i]->load(std::memory_order_relaxed);
+    //   if (i > 0) fprintf(stderr, ",");
+    //   fprintf(stderr, "%lld", (long long)ch_max);
+    // }
+    // if (channel_count_ > 10) {
+    //   fprintf(stderr, ",...(%zu total)", channel_count_);
+    // }
+    // fprintf(stderr, "]\n");
     
     // Interpretation hint if inflight_max is low relative to typical thread counts
-    if (final_max < 10) {
-      fprintf(stderr, "[BloomCheckClient] NOTE: inflight_max=%lld is low. "
-              "If RocksDB uses many worker threads (e.g., threads=128/256), "
-              "this suggests RPCs may be completing too quickly or there's a bottleneck preventing concurrent RPCs.\n",
-              (long long)final_max);
-    }
+    // if (final_max < 10) {
+    //   fprintf(stderr, "[BloomCheckClient] NOTE: inflight_max=%lld is low. "
+    //           "If RocksDB uses many worker threads (e.g., threads=128/256), "
+    //           "this suggests RPCs may be completing too quickly or there's a bottleneck preventing concurrent RPCs.\n",
+    //           (long long)final_max);
+    // }
     
-    if (inflight_semaphore_) {
-      uint64_t wait_cnt = 0, wait_us_total = 0, max_wait_us = 0;
-      inflight_semaphore_->GetStats(wait_cnt, wait_us_total, max_wait_us);
-      fprintf(stderr, "[BloomCheckClient] Inflight semaphore statistics: wait_cnt=%llu, wait_us_total=%llu, max_wait_us=%llu\n",
-              (unsigned long long)wait_cnt, (unsigned long long)wait_us_total, (unsigned long long)max_wait_us);
-      if (wait_cnt == 0) {
-        fprintf(stderr, "[BloomCheckClient] WARNING: wait_cnt=0 means inflight limiting may not be effective\n");
-      }
-    }
+    // if (inflight_semaphore_) {
+    //   uint64_t wait_cnt = 0, wait_us_total = 0, max_wait_us = 0;
+    //   inflight_semaphore_->GetStats(wait_cnt, wait_us_total, max_wait_us);
+    //   fprintf(stderr, "[BloomCheckClient] Inflight semaphore statistics: wait_cnt=%llu, wait_us_total=%llu, max_wait_us=%llu\n",
+    //           (unsigned long long)wait_cnt, (unsigned long long)wait_us_total, (unsigned long long)max_wait_us);
+    //   if (wait_cnt == 0) {
+    //     fprintf(stderr, "[BloomCheckClient] WARNING: wait_cnt=0 means inflight limiting may not be effective\n");
+    //   }
+    // }
 
     if (use_streaming_) {
       for (auto& per_channel : stream_sessions_) {
@@ -1266,8 +1266,8 @@ class BloomCheckServiceClient {
       }
       
       // Read baseline values BEFORE sampling interval
-      uint64_t baseline_started = rpc_started_total_.load(std::memory_order_relaxed);
-      uint64_t baseline_completed = rpc_completed_total_.load(std::memory_order_relaxed);
+      // uint64_t baseline_started = rpc_started_total_.load(std::memory_order_relaxed);
+      // uint64_t baseline_completed = rpc_completed_total_.load(std::memory_order_relaxed);
       
       // Sample inflight multiple times per second for accurate average
       // Sample every 10ms (100 samples per second)
@@ -1297,47 +1297,47 @@ class BloomCheckServiceClient {
       }
       
       // Read current values AFTER sampling interval
-      uint64_t current_started = rpc_started_total_.load(std::memory_order_relaxed);
-      uint64_t current_completed = rpc_completed_total_.load(std::memory_order_relaxed);
-      int64_t current_inflight = inflight_now_.load(std::memory_order_relaxed);
-      int64_t current_max = inflight_max_.load(std::memory_order_relaxed);
+      // uint64_t current_started = rpc_started_total_.load(std::memory_order_relaxed);
+      // uint64_t current_completed = rpc_completed_total_.load(std::memory_order_relaxed);
+      // int64_t current_inflight = inflight_now_.load(std::memory_order_relaxed);
+      // int64_t current_max = inflight_max_.load(std::memory_order_relaxed);
       
       // Calculate deltas using baseline (from start of interval)
-      uint64_t started_per_sec = current_started - baseline_started;
-      uint64_t completed_per_sec = current_completed - baseline_completed;
+      // uint64_t started_per_sec = current_started - baseline_started;
+      // uint64_t completed_per_sec = current_completed - baseline_completed;
       
       // Calculate average from local samples
-      double inflight_avg = 0.0;
-      if (local_sample_count > 0) {
-        inflight_avg = static_cast<double>(local_inflight_sum) / static_cast<double>(local_sample_count);
-      }
+      // double inflight_avg = 0.0;
+      // if (local_sample_count > 0) {
+      //   inflight_avg = static_cast<double>(local_inflight_sum) / static_cast<double>(local_sample_count);
+      // }
       
       // Get process ID, thread ID, and object pointer for debugging
-      pid_t pid = getpid();
-      pid_t tid = syscall(SYS_gettid);
-      void* this_ptr = static_cast<void*>(this);
+      // pid_t pid = getpid();
+      // pid_t tid = syscall(SYS_gettid);
+      // void* this_ptr = static_cast<void*>(this);
       
       // Print statistics with [pid][tid][this] for debugging duplicate instances/threads
-      fprintf(stderr, "[ClientStats][pid=%d][tid=%d][this=%p] started/s=%llu completed/s=%llu inflight_now=%lld inflight_avg=%.2f inflight_max=%lld",
-              pid, tid, this_ptr,
-              (unsigned long long)started_per_sec,
-              (unsigned long long)completed_per_sec,
-              (long long)current_inflight,
-              inflight_avg,
-              (long long)current_max);
+      // fprintf(stderr, "[ClientStats][pid=%d][tid=%d][this=%p] started/s=%llu completed/s=%llu inflight_now=%lld inflight_avg=%.2f inflight_max=%lld",
+      //         pid, tid, this_ptr,
+      //         (unsigned long long)started_per_sec,
+      //         (unsigned long long)completed_per_sec,
+      //         (long long)current_inflight,
+      //         inflight_avg,
+      //         (long long)current_max);
       
       // Print per-channel inflight (show top channels if many)
-      fprintf(stderr, " inflight_per_channel=[");
-      size_t channels_to_show = std::min(channel_count_, static_cast<size_t>(10));
-      for (size_t i = 0; i < channels_to_show; ++i) {
-        int64_t ch_inflight = inflight_per_channel_[i]->load(std::memory_order_relaxed);
-        if (i > 0) fprintf(stderr, ",");
-        fprintf(stderr, "%lld", (long long)ch_inflight);
-      }
-      if (channel_count_ > channels_to_show) {
-        fprintf(stderr, ",...(%zu total)", channel_count_);
-      }
-      fprintf(stderr, "]\n");
+      // fprintf(stderr, " inflight_per_channel=[");
+      // size_t channels_to_show = std::min(channel_count_, static_cast<size_t>(10));
+      // for (size_t i = 0; i < channels_to_show; ++i) {
+      //   int64_t ch_inflight = inflight_per_channel_[i]->load(std::memory_order_relaxed);
+      //   if (i > 0) fprintf(stderr, ",");
+      //   fprintf(stderr, "%lld", (long long)ch_inflight);
+      // }
+      // if (channel_count_ > channels_to_show) {
+      //   fprintf(stderr, ",...(%zu total)", channel_count_);
+      // }
+      // fprintf(stderr, "]\n");
     }
   }
   
