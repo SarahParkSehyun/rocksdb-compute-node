@@ -585,6 +585,16 @@ class BloomCheckServiceClient {
     }
   }
 
+  // SplitMix64 hash mixing function for independent stream index selection
+  static inline uint64_t SplitMix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+  }
+
   uint64_t GetThreadHash() const {
     std::hash<std::thread::id> hasher;
     return static_cast<uint64_t>(hasher(std::this_thread::get_id()));
@@ -754,10 +764,13 @@ class BloomCheckServiceClient {
                                   t_acquire_begin, t_after_acquire);
     }
 
-    const uint64_t tid_hash = GetThreadHash();
-    const size_t stub_idx = static_cast<size_t>(tid_hash % channel_count_);
-    const size_t stream_idx =
-        static_cast<size_t>(tid_hash % streams_per_channel_);
+    // Use independent hashing for channel and stream selection to avoid correlation
+    const uint64_t h = GetThreadHash();
+    const size_t stub_idx = static_cast<size_t>(h % channel_count_);
+    
+    // Mix hash with salt and apply SplitMix64 for independent stream index
+    const uint64_t h2 = SplitMix64(h ^ 0x9e3779b97f4a7c15ULL);
+    const size_t stream_idx = static_cast<size_t>(h2 % streams_per_channel_);
     if (channel_idx != nullptr) {
       *channel_idx = stub_idx;
     }
