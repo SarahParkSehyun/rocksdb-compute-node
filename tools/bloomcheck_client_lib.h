@@ -200,7 +200,10 @@ class BloomCheckServiceClient {
   };
 
   explicit BloomCheckServiceClient(const std::string& server_address)
-      : channel_count_(32), shutdown_(false), stats_thread_started_(false) {  // Default: 32 channels for 32 physical cores
+      : channel_count_(32),
+        shutdown_(false),
+        stream_stats_enabled_(false),
+        stats_thread_started_(false) {  // Default: 32 channels for 32 physical cores
     
     // Log constructor invocation to track duplicate instances
     // IMPORTANT: This log MUST be at the very beginning of constructor body
@@ -476,6 +479,11 @@ class BloomCheckServiceClient {
     inflight_samples_.store(0, std::memory_order_relaxed);
     rpc_started_total_.store(0, std::memory_order_relaxed);
     rpc_completed_total_.store(0, std::memory_order_relaxed);
+    stream_enq_ok_total_.store(0, std::memory_order_relaxed);
+    stream_enq_fail_total_.store(0, std::memory_order_relaxed);
+    stream_write_done_total_.store(0, std::memory_order_relaxed);
+    stream_read_done_total_.store(0, std::memory_order_relaxed);
+    stream_unmatched_resp_total_.store(0, std::memory_order_relaxed);
     
     // Initialize per-channel inflight arrays
     // Note: std::atomic is not copyable, so we use unique_ptr
@@ -488,7 +496,8 @@ class BloomCheckServiceClient {
     
     // Start stats thread if enabled
     const char* stats_env = std::getenv("BLOOMCHECK_CLIENT_STATS");
-    if (stats_env != nullptr && std::atoi(stats_env) != 0) {
+    stream_stats_enabled_ = (stats_env != nullptr && std::atoi(stats_env) != 0);
+    if (stream_stats_enabled_) {
       // Use atomic flag to prevent duplicate stats thread starts
       bool expected = false;
       if (!stats_thread_started_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
@@ -704,14 +713,23 @@ class BloomCheckServiceClient {
 
     // Increment inflight counters AFTER rpc->Finish() (RPC is now outstanding)
     // Use RAII guard to ensure decrement even on exception/early return
-    InflightGuard inflight_guard(
-        &inflight_now_,
-        inflight_per_channel_[stub_idx].get(),
-        &inflight_max_,
-        inflight_per_channel_max_[stub_idx].get());
+    std::atomic<int64_t>* total_inflight = nullptr;
+    std::atomic<int64_t>* channel_inflight = nullptr;
+    std::atomic<int64_t>* total_max = nullptr;
+    std::atomic<int64_t>* channel_max = nullptr;
+    if (stream_stats_enabled_) {
+      total_inflight = &inflight_now_;
+      channel_inflight = inflight_per_channel_[stub_idx].get();
+      total_max = &inflight_max_;
+      channel_max = inflight_per_channel_max_[stub_idx].get();
+    }
+    InflightGuard inflight_guard(total_inflight, channel_inflight, total_max,
+                                 channel_max);
     
     // Increment started counter
-    rpc_started_total_.fetch_add(1, std::memory_order_relaxed);
+    if (stream_stats_enabled_) {
+      rpc_started_total_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // Keep rpc alive until Wait() completes (rpc destructor is safe after Finish)
     // Block on condition_variable (NOT on gRPC polling)
@@ -721,7 +739,9 @@ class BloomCheckServiceClient {
 
     // RPC completed - inflight_guard destructor will decrement counters
     // Increment completed counter
-    rpc_completed_total_.fetch_add(1, std::memory_order_relaxed);
+    if (stream_stats_enabled_) {
+      rpc_completed_total_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // Copy results
     // Note: SemaphoreGuard destructor will release the semaphore slot here
@@ -798,15 +818,28 @@ class BloomCheckServiceClient {
       return false;
     }
 
-    InflightGuard inflight_guard(
-        &inflight_now_, inflight_per_channel_[stub_idx].get(), &inflight_max_,
-        inflight_per_channel_max_[stub_idx].get());
-    rpc_started_total_.fetch_add(1, std::memory_order_relaxed);
+    std::atomic<int64_t>* total_inflight = nullptr;
+    std::atomic<int64_t>* channel_inflight = nullptr;
+    std::atomic<int64_t>* total_max = nullptr;
+    std::atomic<int64_t>* channel_max = nullptr;
+    if (stream_stats_enabled_) {
+      total_inflight = &inflight_now_;
+      channel_inflight = inflight_per_channel_[stub_idx].get();
+      total_max = &inflight_max_;
+      channel_max = inflight_per_channel_max_[stub_idx].get();
+    }
+    InflightGuard inflight_guard(total_inflight, channel_inflight, total_max,
+                                 channel_max);
+    if (stream_stats_enabled_) {
+      rpc_started_total_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     const uint64_t t_wait_begin = BloomNowMicros();
     bool ok = pending->Wait();
     const uint64_t t_wait_end = BloomNowMicros();
-    rpc_completed_total_.fetch_add(1, std::memory_order_relaxed);
+    if (stream_stats_enabled_) {
+      rpc_completed_total_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     if (ok) {
       response->Clear();
@@ -1003,13 +1036,22 @@ class BloomCheckServiceClient {
                         const std::shared_ptr<PendingStreamCall>& call) {
       std::lock_guard<std::mutex> lock(mu_);
       if (state_ == State::kClosed) {
+        if (owner_->stream_stats_enabled_) {
+          owner_->stream_enq_fail_total_.fetch_add(1, std::memory_order_relaxed);
+        }
         return false;
       }
       if (pending_.size() >= max_pending_) {
+        if (owner_->stream_stats_enabled_) {
+          owner_->stream_enq_fail_total_.fetch_add(1, std::memory_order_relaxed);
+        }
         return false;
       }
       pending_[req.request_id()] = call;
       write_queue_.push_back(req);
+      if (owner_->stream_stats_enabled_) {
+        owner_->stream_enq_ok_total_.fetch_add(1, std::memory_order_relaxed);
+      }
       if (state_ == State::kInit || state_ == State::kBroken) {
         StartLocked();
       }
@@ -1037,6 +1079,12 @@ class BloomCheckServiceClient {
       for (const auto& call : to_fail) {
         call->CompleteFailure();
       }
+    }
+
+    void SnapshotDepths(size_t* pending_size, size_t* writeq_size) {
+      std::lock_guard<std::mutex> lock(mu_);
+      *pending_size = pending_.size();
+      *writeq_size = write_queue_.size();
     }
 
    private:
@@ -1138,6 +1186,9 @@ class BloomCheckServiceClient {
         if (!ok) {
           BreakAndReconnectLocked(&to_fail);
         } else {
+          if (owner_->stream_stats_enabled_) {
+            owner_->stream_write_done_total_.fetch_add(1, std::memory_order_relaxed);
+          }
           StartNextWriteLocked();
         }
       }
@@ -1149,6 +1200,7 @@ class BloomCheckServiceClient {
     void OnReadComplete(bool ok) {
       std::shared_ptr<PendingStreamCall> done_call;
       bloomcheck::StreamResponse resp_copy;
+      bool unmatched_resp = false;
       std::vector<std::shared_ptr<PendingStreamCall>> to_fail;
       {
         std::lock_guard<std::mutex> lock(mu_);
@@ -1156,17 +1208,26 @@ class BloomCheckServiceClient {
         if (!ok) {
           BreakAndReconnectLocked(&to_fail);
         } else {
+          if (owner_->stream_stats_enabled_) {
+            owner_->stream_read_done_total_.fetch_add(1, std::memory_order_relaxed);
+          }
           resp_copy = read_resp_;
           auto it = pending_.find(resp_copy.request_id());
           if (it != pending_.end()) {
             done_call = it->second;
             pending_.erase(it);
+          } else {
+            unmatched_resp = true;
           }
           if (state_ == State::kReady && stream_) {
             read_in_flight_ = true;
             stream_->Read(&read_resp_, &read_tag_);
           }
         }
+      }
+
+      if (unmatched_resp && owner_->stream_stats_enabled_) {
+        owner_->stream_unmatched_resp_total_.fetch_add(1, std::memory_order_relaxed);
       }
 
       if (done_call) {
@@ -1261,16 +1322,21 @@ class BloomCheckServiceClient {
     bool active_;
   };
   
-  // Stats thread function (prints statistics every second)
+  // Stats thread function: 1s마다 출력, read_done은 10초 구간 누적/Δ도 함께 출력
   void StatsThread() {
     pthread_setname_np(pthread_self(), "bloom_stats");
     
-    // Local sampling counters (avoid race conditions with reset)
-    int64_t local_inflight_sum = 0;
     uint64_t local_sample_count = 0;
+    const int samples_per_second = 100;
+    const auto sample_interval = std::chrono::milliseconds(10);
+    
+    // 10초 구간 read_done Δ 계산용: 10초 전 시점의 read_done 누적값
+    uint64_t read_done_snapshot_10s_ago[10] = {0};
+    int read_done_ring_idx = 0;
+    int read_done_ring_filled = 0;  // 10초 채워질 때까지 0..9
+    const int kRingSize = 10;
     
     while (true) {
-      // Check shutdown flag
       {
         std::lock_guard<std::mutex> lock(shutdown_mutex_);
         if (shutdown_) {
@@ -1278,79 +1344,98 @@ class BloomCheckServiceClient {
         }
       }
       
-      // Read baseline values BEFORE sampling interval
-      // uint64_t baseline_started = rpc_started_total_.load(std::memory_order_relaxed);
-      // uint64_t baseline_completed = rpc_completed_total_.load(std::memory_order_relaxed);
+      const uint64_t baseline_enq_ok =
+          stream_enq_ok_total_.load(std::memory_order_relaxed);
+      const uint64_t baseline_enq_fail =
+          stream_enq_fail_total_.load(std::memory_order_relaxed);
+      const uint64_t baseline_write_done =
+          stream_write_done_total_.load(std::memory_order_relaxed);
+      const uint64_t baseline_read_done =
+          stream_read_done_total_.load(std::memory_order_relaxed);
+      const uint64_t baseline_unmatched =
+          stream_unmatched_resp_total_.load(std::memory_order_relaxed);
       
-      // Sample inflight multiple times per second for accurate average
-      // Sample every 10ms (100 samples per second)
-      const int samples_per_second = 100;
-      const auto sample_interval = std::chrono::milliseconds(10);
-      
-      // Reset local counters at start of each interval
-      local_inflight_sum = 0;
       local_sample_count = 0;
+      uint64_t local_pending_sum = 0;
+      uint64_t local_writeq_sum = 0;
+      size_t local_pending_max = 0;
+      size_t local_writeq_max = 0;
       
       for (int i = 0; i < samples_per_second; ++i) {
-        // Check shutdown flag before each sample
         {
           std::lock_guard<std::mutex> lock(shutdown_mutex_);
           if (shutdown_) {
             return;
           }
         }
-        
-        // Sample current inflight (accumulate locally)
-        int64_t current = inflight_now_.load(std::memory_order_relaxed);
-        local_inflight_sum += current;
         local_sample_count++;
-        
-        // Sleep for sample interval
+        if (use_streaming_) {
+          size_t sample_pending_total = 0;
+          size_t sample_writeq_total = 0;
+          for (auto& per_channel : stream_sessions_) {
+            for (auto& session : per_channel) {
+              if (!session) continue;
+              size_t pending_size = 0;
+              size_t writeq_size = 0;
+              session->SnapshotDepths(&pending_size, &writeq_size);
+              sample_pending_total += pending_size;
+              sample_writeq_total += writeq_size;
+            }
+          }
+          local_pending_sum += sample_pending_total;
+          local_writeq_sum += sample_writeq_total;
+          if (sample_pending_total > local_pending_max) local_pending_max = sample_pending_total;
+          if (sample_writeq_total > local_writeq_max) local_writeq_max = sample_writeq_total;
+        }
         std::this_thread::sleep_for(sample_interval);
       }
       
-      // Read current values AFTER sampling interval
-      // uint64_t current_started = rpc_started_total_.load(std::memory_order_relaxed);
-      // uint64_t current_completed = rpc_completed_total_.load(std::memory_order_relaxed);
-      // int64_t current_inflight = inflight_now_.load(std::memory_order_relaxed);
-      // int64_t current_max = inflight_max_.load(std::memory_order_relaxed);
-      
-      // Calculate deltas using baseline (from start of interval)
-      // uint64_t started_per_sec = current_started - baseline_started;
-      // uint64_t completed_per_sec = current_completed - baseline_completed;
-      
-      // Calculate average from local samples
-      // double inflight_avg = 0.0;
-      // if (local_sample_count > 0) {
-      //   inflight_avg = static_cast<double>(local_inflight_sum) / static_cast<double>(local_sample_count);
-      // }
-      
-      // Get process ID, thread ID, and object pointer for debugging
-      // pid_t pid = getpid();
-      // pid_t tid = syscall(SYS_gettid);
-      // void* this_ptr = static_cast<void*>(this);
-      
-      // Print statistics with [pid][tid][this] for debugging duplicate instances/threads
-      // fprintf(stderr, "[ClientStats][pid=%d][tid=%d][this=%p] started/s=%llu completed/s=%llu inflight_now=%lld inflight_avg=%.2f inflight_max=%lld",
-      //         pid, tid, this_ptr,
-      //         (unsigned long long)started_per_sec,
-      //         (unsigned long long)completed_per_sec,
-      //         (long long)current_inflight,
-      //         inflight_avg,
-      //         (long long)current_max);
-      
-      // Print per-channel inflight (show top channels if many)
-      // fprintf(stderr, " inflight_per_channel=[");
-      // size_t channels_to_show = std::min(channel_count_, static_cast<size_t>(10));
-      // for (size_t i = 0; i < channels_to_show; ++i) {
-      //   int64_t ch_inflight = inflight_per_channel_[i]->load(std::memory_order_relaxed);
-      //   if (i > 0) fprintf(stderr, ",");
-      //   fprintf(stderr, "%lld", (long long)ch_inflight);
-      // }
-      // if (channel_count_ > channels_to_show) {
-      //   fprintf(stderr, ",...(%zu total)", channel_count_);
-      // }
-      // fprintf(stderr, "]\n");
+      const uint64_t current_enq_ok =
+          stream_enq_ok_total_.load(std::memory_order_relaxed);
+      const uint64_t current_enq_fail =
+          stream_enq_fail_total_.load(std::memory_order_relaxed);
+      const uint64_t current_write_done =
+          stream_write_done_total_.load(std::memory_order_relaxed);
+      const uint64_t current_read_done =
+          stream_read_done_total_.load(std::memory_order_relaxed);
+      const uint64_t current_unmatched =
+          stream_unmatched_resp_total_.load(std::memory_order_relaxed);
+
+      const uint64_t enq_ok_per_sec = current_enq_ok - baseline_enq_ok;
+      const uint64_t enq_fail_per_sec = current_enq_fail - baseline_enq_fail;
+      const uint64_t write_done_per_sec = current_write_done - baseline_write_done;
+      const uint64_t read_done_per_sec = current_read_done - baseline_read_done;
+      const uint64_t unmatched_per_sec = current_unmatched - baseline_unmatched;
+
+      uint64_t read_done_delta_10s = 0;
+      if (read_done_ring_filled >= kRingSize) {
+        read_done_delta_10s = current_read_done - read_done_snapshot_10s_ago[read_done_ring_idx];
+      }
+      read_done_snapshot_10s_ago[read_done_ring_idx] = current_read_done;
+      read_done_ring_idx = (read_done_ring_idx + 1) % kRingSize;
+      if (read_done_ring_filled < kRingSize) {
+        read_done_ring_filled++;
+      }
+
+      double pending_avg = 0.0;
+      double writeq_avg = 0.0;
+      if (local_sample_count > 0) {
+        pending_avg = static_cast<double>(local_pending_sum) / static_cast<double>(local_sample_count);
+        writeq_avg = static_cast<double>(local_writeq_sum) / static_cast<double>(local_sample_count);
+      }
+
+      fprintf(stderr,
+              "[StreamStats] enq=%llu/s fail=%llu/s pending_avg=%.1f pending_max=%zu "
+              "writeq_avg=%.1f writeq_max=%zu write_done=%llu/s read_done=%llu/s "
+              "read_done_total=%llu read_done_Δ=%llu/10s unmatched=%llu/s\n",
+              (unsigned long long)enq_ok_per_sec,
+              (unsigned long long)enq_fail_per_sec, pending_avg,
+              local_pending_max, writeq_avg, local_writeq_max,
+              (unsigned long long)write_done_per_sec,
+              (unsigned long long)read_done_per_sec,
+              (unsigned long long)current_read_done,
+              (unsigned long long)read_done_delta_10s,
+              (unsigned long long)unmatched_per_sec);
     }
   }
   
@@ -1390,6 +1475,7 @@ class BloomCheckServiceClient {
   std::vector<std::thread> cq_poller_threads_;
   std::mutex shutdown_mutex_;
   bool shutdown_;
+  bool stream_stats_enabled_;  // True when BLOOMCHECK_CLIENT_STATS is non-zero
   std::unique_ptr<Semaphore> inflight_semaphore_;  // For limiting concurrent inflight RPCs
   bool use_streaming_ = false;
   size_t streams_per_channel_ = 4;
@@ -1408,6 +1494,11 @@ class BloomCheckServiceClient {
   // RPC throughput statistics
   std::atomic<uint64_t> rpc_started_total_;         // Total RPCs started
   std::atomic<uint64_t> rpc_completed_total_;       // Total RPCs completed
+  std::atomic<uint64_t> stream_enq_ok_total_;       // Total successful stream enqueue
+  std::atomic<uint64_t> stream_enq_fail_total_;     // Total failed stream enqueue
+  std::atomic<uint64_t> stream_write_done_total_;   // Total successful stream write completion
+  std::atomic<uint64_t> stream_read_done_total_;    // Total successful stream read completion
+  std::atomic<uint64_t> stream_unmatched_resp_total_;  // Total unmatched stream responses
   
   // Stats thread
   std::thread stats_thread_;                        // Statistics reporting thread
