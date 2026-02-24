@@ -804,7 +804,7 @@ class BloomCheckServiceClient {
     const auto& key_req = request.reqs(0);
     const uint64_t request_id =
         next_stream_request_id_.fetch_add(1, std::memory_order_relaxed) + 1;
-    auto pending = std::make_shared<PendingStreamCall>();
+    auto pending = MakePendingCall();
     pending->req.set_request_id(request_id);
     pending->req.set_user_key(key_req.user_key());
     for (int i = 0; i < key_req.sst_file_numbers_size(); ++i) {
@@ -985,6 +985,14 @@ class BloomCheckServiceClient {
     bloomcheck::StreamResponse resp;
     std::atomic<uint64_t> signal_us{0};
 
+    void Reset() {
+      req.Clear();
+      resp.Clear();
+      done = false;
+      ok = false;
+      signal_us.store(0, std::memory_order_relaxed);
+    }
+
     void CompleteSuccess(const bloomcheck::StreamResponse& response) {
       {
         std::lock_guard<std::mutex> lock(mu);
@@ -1012,6 +1020,51 @@ class BloomCheckServiceClient {
       return ok;
     }
   };
+
+  struct PendingPool {
+    std::vector<PendingStreamCall*> free_list;
+
+    ~PendingPool() {
+      for (auto* p : free_list) {
+        delete p;
+      }
+    }
+  };
+
+  static constexpr size_t kPendingPoolMaxPerThread = 256;
+
+  static PendingPool& GetPendingPool() {
+    static thread_local PendingPool pool;
+    return pool;
+  }
+
+  static PendingStreamCall* AcquirePending() {
+    auto& free_list = GetPendingPool().free_list;
+    if (free_list.empty()) {
+      return new PendingStreamCall();
+    }
+    PendingStreamCall* call = free_list.back();
+    free_list.pop_back();
+    return call;
+  }
+
+  static void ReleasePending(PendingStreamCall* call) {
+    if (call == nullptr) {
+      return;
+    }
+    call->Reset();
+    auto& free_list = GetPendingPool().free_list;
+    if (free_list.size() >= kPendingPoolMaxPerThread) {
+      delete call;
+      return;
+    }
+    free_list.push_back(call);
+  }
+
+  static std::shared_ptr<PendingStreamCall> MakePendingCall() {
+    return std::shared_ptr<PendingStreamCall>(AcquirePending(),
+                                              &BloomCheckServiceClient::ReleasePending);
+  }
 
   bool IsShutdownRequested() {
     std::lock_guard<std::mutex> lock(shutdown_mutex_);
