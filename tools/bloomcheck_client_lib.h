@@ -802,17 +802,15 @@ class BloomCheckServiceClient {
     }
 
     const auto& key_req = request.reqs(0);
-    bloomcheck::StreamRequest stream_req;
     const uint64_t request_id =
         next_stream_request_id_.fetch_add(1, std::memory_order_relaxed) + 1;
-    stream_req.set_request_id(request_id);
-    stream_req.set_user_key(key_req.user_key());
-    for (int i = 0; i < key_req.sst_file_numbers_size(); ++i) {
-      stream_req.add_sst_file_numbers(key_req.sst_file_numbers(i));
-    }
-
     auto pending = std::make_shared<PendingStreamCall>();
-    bool enqueued = per_channel[stream_idx]->EnqueueRequest(stream_req, pending);
+    pending->req.set_request_id(request_id);
+    pending->req.set_user_key(key_req.user_key());
+    for (int i = 0; i < key_req.sst_file_numbers_size(); ++i) {
+      pending->req.add_sst_file_numbers(key_req.sst_file_numbers(i));
+    }
+    bool enqueued = per_channel[stream_idx]->EnqueueRequest(pending);
     const uint64_t t_after_finish = BloomNowMicros();
     if (!enqueued) {
       return false;
@@ -983,6 +981,7 @@ class BloomCheckServiceClient {
     std::condition_variable cv;
     bool done = false;
     bool ok = false;
+    bloomcheck::StreamRequest req;
     bloomcheck::StreamResponse resp;
     std::atomic<uint64_t> signal_us{0};
 
@@ -1032,8 +1031,7 @@ class BloomCheckServiceClient {
           read_tag_(this, TagType::kRead),
           write_tag_(this, TagType::kWrite) {}
 
-    bool EnqueueRequest(const bloomcheck::StreamRequest& req,
-                        const std::shared_ptr<PendingStreamCall>& call) {
+    bool EnqueueRequest(const std::shared_ptr<PendingStreamCall>& call) {
       std::lock_guard<std::mutex> lock(mu_);
       if (state_ == State::kClosed) {
         if (owner_->stream_stats_enabled_) {
@@ -1047,8 +1045,8 @@ class BloomCheckServiceClient {
         }
         return false;
       }
-      pending_[req.request_id()] = call;
-      write_queue_.push_back(req);
+      pending_[call->req.request_id()] = call;
+      write_queue_.push_back(call);
       if (owner_->stream_stats_enabled_) {
         owner_->stream_enq_ok_total_.fetch_add(1, std::memory_order_relaxed);
       }
@@ -1069,6 +1067,7 @@ class BloomCheckServiceClient {
         CollectAndClearPendingLocked(&to_fail);
         write_queue_.clear();
         write_in_flight_ = false;
+        write_call_.reset();
         read_in_flight_ = false;
         if (ctx_) {
           ctx_->TryCancel();
@@ -1123,10 +1122,10 @@ class BloomCheckServiceClient {
           !stream_) {
         return;
       }
-      write_req_ = std::move(write_queue_.front());
+      write_call_ = std::move(write_queue_.front());
       write_queue_.pop_front();
       write_in_flight_ = true;
-      stream_->Write(write_req_, &write_tag_);
+      stream_->Write(write_call_->req, &write_tag_);
     }
 
     void CollectAndClearPendingLocked(
@@ -1147,6 +1146,7 @@ class BloomCheckServiceClient {
       CollectAndClearPendingLocked(to_fail);
       write_queue_.clear();
       write_in_flight_ = false;
+      write_call_.reset();
       read_in_flight_ = false;
       if (ctx_) {
         ctx_->TryCancel();
@@ -1183,6 +1183,7 @@ class BloomCheckServiceClient {
       {
         std::lock_guard<std::mutex> lock(mu_);
         write_in_flight_ = false;
+        write_call_.reset();
         if (!ok) {
           BreakAndReconnectLocked(&to_fail);
         } else {
@@ -1250,9 +1251,9 @@ class BloomCheckServiceClient {
     std::unique_ptr<grpc::ClientAsyncReaderWriter<bloomcheck::StreamRequest,
                                                   bloomcheck::StreamResponse>>
         stream_;
-    std::deque<bloomcheck::StreamRequest> write_queue_;
+    std::deque<std::shared_ptr<PendingStreamCall>> write_queue_;
     std::unordered_map<uint64_t, std::shared_ptr<PendingStreamCall>> pending_;
-    bloomcheck::StreamRequest write_req_;
+    std::shared_ptr<PendingStreamCall> write_call_;
     bloomcheck::StreamResponse read_resp_;
     bool write_in_flight_ = false;
     bool read_in_flight_ = false;
@@ -1512,4 +1513,3 @@ class BloomCheckServiceClient {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-
