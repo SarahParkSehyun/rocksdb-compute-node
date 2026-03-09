@@ -15,6 +15,7 @@ message KeyResponse {
   bool complete = 2;  // 모든 candidate 파일을 검사했는지 여부
   uint64 checked_count = 3;  // 실제로 검사한 파일 수
   uint64 total_candidates = 4;  // 요청된 전체 candidate 파일 수
+  repeated uint64 path_not_found_sst_file_numbers = 5;
 }
 
 message BatchResponse {
@@ -28,6 +29,12 @@ message NoopResponse {
   optional uint64 server_ts_ns = 1;
 }
 
+service BloomCheck {
+  rpc Check(BatchRequest) returns (BatchResponse);
+  rpc Noop(NoopRequest) returns (NoopResponse);
+  rpc CheckBatchStream(stream StreamRequest) returns (stream StreamResponse);
+}
+
 message StreamRequest {
   uint64 request_id = 1;
   bytes user_key = 2;
@@ -37,14 +44,5 @@ message StreamRequest {
 message StreamResponse {
   uint64 request_id = 1;
   repeated uint64 may_match_sst_file_numbers = 2;
-  bool complete = 3;
-  uint64 checked_count = 4;
-  uint64 total_candidates = 5;
+  repeated uint64 path_not_found_sst_file_numbers = 3;
 }
-
-service BloomCheck {
-  rpc Check(BatchRequest) returns (BatchResponse);
-  rpc Noop(NoopRequest) returns (NoopResponse);
-  rpc CheckBatchStream(stream StreamRequest) returns (stream StreamResponse);
-}
-

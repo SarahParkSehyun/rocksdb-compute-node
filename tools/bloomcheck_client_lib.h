@@ -367,36 +367,8 @@ class BloomCheckServiceClient {
       cqs_.emplace_back(std::make_unique<grpc::CompletionQueue>());
     }
 
-    // Start CQ poller threads with CPU affinity
-    // Poller threads are pinned to top cores to avoid mlx5_async hot cores (e.g., CPU24)
-    // ch=4: cores [25, 27, 29, 31]
-    // ch=8: cores [17, 19, 21, 23, 25, 27, 29, 31]
-    std::vector<int> poller_cores;
-    if (channel_count_ <= 4) {
-      // For 4 channels: use top 4 odd cores (avoid CPU24 which is mlx5_async hot)
-      poller_cores = {25, 27, 29, 31};
-    } else if (channel_count_ <= 8) {
-      // For 8 channels: use top 8 odd cores
-      poller_cores = {17, 19, 21, 23, 25, 27, 29, 31};
-    } else {
-      // For more than 8 channels: extend downward (can be adjusted based on softirq results)
-      poller_cores = {9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31};
-      // If still not enough, add more cores (but avoid CPU24)
-      while (poller_cores.size() < channel_count_) {
-        for (int cpu = 7; cpu >= 1 && poller_cores.size() < channel_count_; cpu -= 2) {
-          if (cpu != 24) {  // Avoid CPU24
-            poller_cores.push_back(cpu);
-          }
-        }
-      }
-    }
-    
-    // Ensure we don't exceed available cores
-    if (channel_count_ > poller_cores.size()) {
-      // fprintf(stderr, "[BloomCheckClient] Warning: channel_count (%zu) > available poller cores (%zu), "
-      //         "will use round-robin mapping\n", channel_count_, poller_cores.size());
-    }
-    
+    // Start CQ poller threads without CPU affinity pinning.
+
     // Optional poller RT priority override (default: 10)
     int poller_fifo_prio = 10;
     int fifo_min_prio = sched_get_priority_min(SCHED_FIFO);
@@ -406,10 +378,6 @@ class BloomCheckServiceClient {
       int requested = std::atoi(poller_prio_env);
       if (requested >= fifo_min_prio && requested <= fifo_max_prio) {
         poller_fifo_prio = requested;
-      } else {
-        // fprintf(stderr,
-        //         "[BloomCheckClient] Invalid BLOOMCHECK_POLLER_FIFO_PRIO=%d (valid range: %d-%d), using default=%d\n",
-        //         requested, fifo_min_prio, fifo_max_prio, poller_fifo_prio);
       }
     }
 
@@ -417,37 +385,14 @@ class BloomCheckServiceClient {
     for (size_t i = 0; i < cq_count; ++i) {
       cq_poller_threads_.emplace_back(
           std::thread(&BloomCheckServiceClient::CQPollerThread, this, i));
-      
-      // Select poller core from predefined list (top cores, avoiding CPU24)
-      int cpu_id = poller_cores[i % poller_cores.size()];
-      cpu_set_t cpuset;
-      CPU_ZERO(&cpuset);
-      CPU_SET(cpu_id, &cpuset);
-      
       pthread_t thread_handle = cq_poller_threads_.back().native_handle();
-      int ret = pthread_setaffinity_np(thread_handle, sizeof(cpu_set_t), &cpuset);
-      if (ret == 0) {
-        // Set SCHED_FIFO with low priority (10-20 range)
-        // This gives poller threads real-time scheduling but with low priority to avoid starvation
-        struct sched_param param;
-        param.sched_priority = poller_fifo_prio;
-        int sched_ret = pthread_setschedparam(thread_handle, SCHED_FIFO, &param);
-        if (sched_ret == 0) {
-          // fprintf(stderr, "[BloomCheckClient] CQ poller thread %zu pinned to CPU %d with SCHED_FIFO priority %d\n", 
-          //         i, cpu_id, param.sched_priority);
-        } else {
-          // fprintf(stderr, "[BloomCheckClient] CQ poller thread %zu pinned to CPU %d with default priority (SCHED_FIFO failed: %d)\n", 
-          //         i, cpu_id, sched_ret);
-        }
-      } else {
-        // fprintf(stderr, "[BloomCheckClient] Warning: Failed to pin CQ poller thread %zu to CPU %d (errno=%d)\n", 
-        //         i, cpu_id, ret);
-      }
+      struct sched_param param;
+      param.sched_priority = poller_fifo_prio;
+      (void)pthread_setschedparam(thread_handle, SCHED_FIFO, &param);
     }
-    
-    // Log poller core assignment summary
-    // fprintf(stderr, "[BloomCheckClient] Poller isolation: %d poller threads pinned to top cores with SCHED_FIFO priority %d, "
-    //         "RocksDB workers use system default scheduling\n",
+
+    // Log poller summary
+    // fprintf(stderr, "[BloomCheckClient] Poller threads started without CPU pinning, count=%d, fifo_prio=%d\n",
     //         static_cast<int>(cq_count), poller_fifo_prio);
     
     // Log initialization info
@@ -842,12 +787,14 @@ class BloomCheckServiceClient {
     if (ok) {
       response->Clear();
       auto* out = response->add_resps();
-      out->set_complete(pending->resp.complete());
-      out->set_checked_count(pending->resp.checked_count());
-      out->set_total_candidates(pending->resp.total_candidates());
       for (int i = 0; i < pending->resp.may_match_sst_file_numbers_size(); ++i) {
         out->add_may_match_sst_file_numbers(
             pending->resp.may_match_sst_file_numbers(i));
+      }
+      for (int i = 0; i < pending->resp.path_not_found_sst_file_numbers_size();
+           ++i) {
+        out->add_path_not_found_sst_file_numbers(
+            pending->resp.path_not_found_sst_file_numbers(i));
       }
     }
     const uint64_t t_parse_end = BloomNowMicros();
