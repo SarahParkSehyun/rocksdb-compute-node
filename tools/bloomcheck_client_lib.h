@@ -4,7 +4,6 @@
 #pragma once
 
 #include <atomic>
-#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -368,38 +367,17 @@ class BloomCheckServiceClient {
       cqs_.emplace_back(std::make_unique<grpc::CompletionQueue>());
     }
 
-    // Start CQ poller threads pinned to a fixed CPU set.
-    const std::array<int, 4> poller_cores = {25, 27, 29, 31};
-
-    // Optional poller RT priority override (default: 10)
-    int poller_fifo_prio = 10;
-    int fifo_min_prio = sched_get_priority_min(SCHED_FIFO);
-    int fifo_max_prio = sched_get_priority_max(SCHED_FIFO);
-    const char* poller_prio_env = std::getenv("BLOOMCHECK_POLLER_FIFO_PRIO");
-    if (poller_prio_env != nullptr) {
-      int requested = std::atoi(poller_prio_env);
-      if (requested >= fifo_min_prio && requested <= fifo_max_prio) {
-        poller_fifo_prio = requested;
-      }
-    }
+    // Start CQ poller threads with default scheduler policy and no CPU pinning.
 
     cq_poller_threads_.reserve(cq_count);
     for (size_t i = 0; i < cq_count; ++i) {
       cq_poller_threads_.emplace_back(
           std::thread(&BloomCheckServiceClient::CQPollerThread, this, i));
-      pthread_t thread_handle = cq_poller_threads_.back().native_handle();
-      cpu_set_t cpuset;
-      CPU_ZERO(&cpuset);
-      CPU_SET(poller_cores[i % poller_cores.size()], &cpuset);
-      (void)pthread_setaffinity_np(thread_handle, sizeof(cpu_set_t), &cpuset);
-      struct sched_param param;
-      param.sched_priority = poller_fifo_prio;
-      (void)pthread_setschedparam(thread_handle, SCHED_FIFO, &param);
     }
 
     // Log poller summary
-    // fprintf(stderr, "[BloomCheckClient] Poller threads pinned to [25,27,29,31], count=%d, fifo_prio=%d\n",
-    //         static_cast<int>(cq_count), poller_fifo_prio);
+    // fprintf(stderr, "[BloomCheckClient] Poller threads started with default scheduling, count=%d\n",
+    //         static_cast<int>(cq_count));
     
     // Log initialization info
     // fprintf(stderr, "[BloomCheckClient] Initialized: stubs_.size()=%zu, cqs_.size()=%zu, poller_thread_count=%zu\n",

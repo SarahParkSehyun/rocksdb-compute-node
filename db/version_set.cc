@@ -2762,8 +2762,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   std::unique_ptr<std::unordered_set<uint64_t>> bloomcheck_may_match_files;
   // 아래 조건을 만족하면 bloomcheck 프리체크가 켜졌다는 플래그
   bool bloomcheck_enabled = false;
-  // RPC가 성공하고 응답이 정상적으로 수신되었는지 명확히 표현
-  bool bloomcheck_ok = false;
+  BloomCheckServiceClient* bloomcheck_client = nullptr;
+  std::string bloomcheck_user_key_str;
 
   // NOOP_ONLY 모드: 환경변수로 활성화 (측정 전용)
   static bool noop_only_mode = []() {
@@ -2818,16 +2818,17 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   if (read_options.bloomcheck_client != nullptr &&
       read_options.read_tier == kReadAllTier) {
     // 실제 구현 타입 BloomCheckServiceClient*로 캐스팅해서 사용 준비
-    BloomCheckServiceClient* client =
+    bloomcheck_client =
         static_cast<BloomCheckServiceClient*>(read_options.bloomcheck_client);
     bloomcheck_enabled = true;
+    bloomcheck_user_key_str = user_key.ToString();
 
     // NOOP_ONLY 모드: Noop RPC만 호출하고 나머지 로직은 건너뛰기
     if (noop_only_mode) {
       // uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
       size_t channel_idx = 0;
       BloomCheckServiceClient::RpcTimingBreakdown rpc_timing;
-      bool noop_ok = client->AsyncNoop(&channel_idx, &rpc_timing);  // Use async version to avoid gRPC mutex contention
+      bool noop_ok = bloomcheck_client->AsyncNoop(&channel_idx, &rpc_timing);  // Use async version to avoid gRPC mutex contention
       // uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
       // size_t channel_count = client->GetChannelCount();
       (void)noop_ok;  // Suppress unused variable warning
@@ -2859,105 +2860,11 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       // (baseline RocksDB 동작으로 진행)
       bloomcheck_enabled = false;  // 이후 로직에서 bloomcheck 사용 안 함
     } else {
-
-    // FilePicker dry-run: 실제로 순회할 파일 목록 수집
-    // file_number만 수집 (경로 문자열은 사용하지 않음)
-    FilePicker fp_probe(user_key, ikey, &storage_info_.level_files_brief_,
-                        storage_info_.num_non_empty_levels_,
-                        &storage_info_.file_indexer_, user_comparator(),
-                        internal_comparator());
-
-    // 후보 파일 번호만 수집 (중복 제거)
-    std::unordered_set<uint64_t> candidate_file_numbers;
-
-    // fp_probe.GetNextFile()로 Get이 방문할 다음 SST 후보를 하나 가져옴
-    FdWithKeyRange* f_probe = fp_probe.GetNextFile();
-    while (f_probe != nullptr) {
-      uint64_t file_number = f_probe->file_metadata->fd.GetNumber();
-      candidate_file_numbers.insert(file_number);
-      f_probe = fp_probe.GetNextFile();
-    }
-
-    // 단일 키 gRPC 호출
-    if (!candidate_file_numbers.empty()) {
-      std::string user_key_str = user_key.ToString();
-
-      // Initialize bloomcheck_may_match_files if not already done
+      // No dry-run mode: decide per-file while iterating below.
       if (!bloomcheck_may_match_files) {
-        bloomcheck_may_match_files = std::make_unique<std::unordered_set<uint64_t>>();
+        bloomcheck_may_match_files =
+            std::make_unique<std::unordered_set<uint64_t>>();
       }
-
-      // Build single-key batch request
-      bloomcheck::BatchRequest request;
-      bloomcheck::KeyRequest* key_req = request.add_reqs();
-      key_req->set_user_key(user_key_str);
-      for (uint64_t file_number : candidate_file_numbers) {
-        key_req->add_sst_file_numbers(file_number);
-      }
-      // const size_t request_bytes = static_cast<size_t>(request.ByteSizeLong());
-
-      // Execute async RPC (blocks on condition_variable, NOT on gRPC polling)
-      bloomcheck::BatchResponse response;
-      size_t channel_idx = 0;
-      // size_t channel_count = client->GetChannelCount();
-      BloomCheckServiceClient::RpcTimingBreakdown rpc_timing;
-      
-      // uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
-      bool check_ok = client->AsyncCheckBatch(request, &response, &channel_idx, &rpc_timing);
-      // uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
-      (void)rpc_timing;  // Suppress unused variable warning
-
-      // Map response back to may_match_files
-      if (check_ok && response.resps_size() == 1) {
-        const auto& key_resp = response.resps(0);
-        for (int j = 0; j < key_resp.may_match_sst_file_numbers_size(); ++j) {
-          bloomcheck_may_match_files->insert(key_resp.may_match_sst_file_numbers(j));
-        }
-      } else {
-        // On error, mark all as may_match (safe default)
-        for (uint64_t file_number : candidate_file_numbers) {
-          bloomcheck_may_match_files->insert(file_number);
-        }
-      }
-
-      // Logging
-      // if (rpc_log_enabled) {
-      //   static std::atomic<uint64_t> rpc_counter(0);
-      //   uint64_t counter = rpc_counter.fetch_add(1, std::memory_order_relaxed);
-      //   if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
-      //     int total_may = check_ok && response.resps_size() > 0
-      //         ? response.resps(0).may_match_sst_file_numbers_size() : 0;
-      //     if (info_log_) {
-      //       ROCKS_LOG_INFO(info_log_,
-      //                      "[BloomCheckRPC] channels=%zu idx=%zu streaming=%d req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d",
-      //                      channel_count, channel_idx,
-      //                      bloomcheck_use_streaming ? 1 : 0,
-      //                      request_bytes,
-      //                      (unsigned long long)rpc_us,
-      //                      (unsigned long long)rpc_timing.acquire_wait_us,
-      //                      (unsigned long long)rpc_timing.submit_prep_us,
-      //                      (unsigned long long)rpc_timing.wait_completion_us,
-      //                      (unsigned long long)rpc_timing.wake_up_us,
-      //                      (unsigned long long)rpc_timing.response_parse_us,
-      //                      check_ok ? 1 : 0, total_may);
-      //     } else {
-      //       fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu streaming=%d req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d\n",
-      //               channel_count, channel_idx,
-      //               bloomcheck_use_streaming ? 1 : 0,
-      //               request_bytes,
-      //               (unsigned long long)rpc_us,
-      //               (unsigned long long)rpc_timing.acquire_wait_us,
-      //               (unsigned long long)rpc_timing.submit_prep_us,
-      //               (unsigned long long)rpc_timing.wait_completion_us,
-      //               (unsigned long long)rpc_timing.wake_up_us,
-      //               (unsigned long long)rpc_timing.response_parse_us,
-      //               check_ok ? 1 : 0, total_may);
-      //     }
-      //   }
-      // }
-      
-      bloomcheck_ok = check_ok;
-    }
     }  // else (normal bloomcheck mode)
   }
   // ===== BloomCheck precheck 끝 =====
@@ -2978,6 +2885,82 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     }
 
     uint64_t file_number = f->file_metadata->fd.GetNumber();
+    bool bloomcheck_may_match_for_file = true;
+    bool bloomcheck_ok_for_file = false;
+    bool bloomcheck_local_fallback_for_file = false;
+
+    if (bloomcheck_enabled && bloomcheck_client != nullptr &&
+        bloomcheck_may_match_files != nullptr &&
+        read_options.read_tier == kReadAllTier) {
+      bloomcheck::BatchRequest request;
+      bloomcheck::KeyRequest* key_req = request.add_reqs();
+      key_req->set_user_key(bloomcheck_user_key_str);
+      key_req->add_sst_file_numbers(file_number);
+
+      bloomcheck::BatchResponse response;
+      size_t channel_idx = 0;
+      BloomCheckServiceClient::RpcTimingBreakdown rpc_timing;
+      bool check_ok = bloomcheck_client->AsyncCheckBatch(
+          request, &response, &channel_idx, &rpc_timing);
+      (void)channel_idx;
+      (void)rpc_timing;
+
+      if (check_ok && response.resps_size() == 1) {
+        bloomcheck_ok_for_file = true;
+        bloomcheck_may_match_for_file = false;
+        bool path_not_found = false;
+        const auto& key_resp = response.resps(0);
+        for (int j = 0; j < key_resp.may_match_sst_file_numbers_size(); ++j) {
+          if (key_resp.may_match_sst_file_numbers(j) == file_number) {
+            bloomcheck_may_match_for_file = true;
+            break;
+          }
+        }
+        for (int j = 0; j < key_resp.path_not_found_sst_file_numbers_size();
+             ++j) {
+          if (key_resp.path_not_found_sst_file_numbers(j) == file_number) {
+            path_not_found = true;
+            break;
+          }
+        }
+
+        if (path_not_found) {
+          bool local_may_match = true;  // fail-open default
+          Status key_status;
+          KeyContext key_ctx(nullptr, user_key, nullptr, nullptr, nullptr,
+                             &key_status);
+          autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE> sorted_keys;
+          sorted_keys.emplace_back(&key_ctx);
+          MultiGetContext mget_ctx(&sorted_keys, 0, 1, kMaxSequenceNumber,
+                                   read_options, cfd_->ioptions().fs.get(),
+                                   db_statistics_);
+          auto mget_range = mget_ctx.GetMultiGetRange();
+          TableCache::TypedHandle* table_handle = nullptr;
+          int level = static_cast<int>(fp.GetHitFileLevel());
+          Status filter_status = table_cache_->MultiGetFilter(
+              read_options, *internal_comparator(), *f->file_metadata,
+              mutable_cf_options_,
+              cfd_->internal_stats()->GetFileReadHist(level), level,
+              &mget_range, &table_handle);
+          if (table_handle != nullptr) {
+            table_cache_->get_cache().Release(table_handle);
+          }
+          if (filter_status.ok()) {
+            local_may_match = !mget_range.empty();
+          }
+          bloomcheck_may_match_for_file = local_may_match;
+          if (local_may_match) {
+            bloomcheck_local_fallback_for_file = true;
+          }
+        }
+      } else {
+        bloomcheck_may_match_for_file = true;  // fail-open
+      }
+
+      if (bloomcheck_may_match_for_file) {
+        bloomcheck_may_match_files->insert(file_number);
+      }
+    }
 
     // BloomCheck 필터링: may_match=false인 파일은 스킵
     if (bloomcheck_enabled && bloomcheck_may_match_files != nullptr) {
@@ -2999,12 +2982,14 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                                                fp.IsHitFileLastInLevel());
     
     // 2. remote bloomcheck가 성공했고 이 SST가 may_match=true인 경우
-    //    (이 지점까지 왔다는 건 find(file_number) != end() 이므로 may_match=true)
     bool skip_filters_remote = false;
-    if (bloomcheck_enabled && bloomcheck_ok && bloomcheck_may_match_files != nullptr) {
+    if (bloomcheck_enabled && bloomcheck_ok_for_file &&
+        bloomcheck_may_match_for_file) {
       // kBlockCacheTier 모드는 no-IO semantics가 중요하므로 remote 스킵 적용 금지
       if (read_options.read_tier != kBlockCacheTier) {
-        skip_filters_remote = true;
+        if (!bloomcheck_local_fallback_for_file) {
+          skip_filters_remote = true;
+        }
       }
     }
     
