@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -367,7 +368,8 @@ class BloomCheckServiceClient {
       cqs_.emplace_back(std::make_unique<grpc::CompletionQueue>());
     }
 
-    // Start CQ poller threads without CPU affinity pinning.
+    // Start CQ poller threads pinned to a fixed CPU set.
+    const std::array<int, 4> poller_cores = {25, 27, 29, 31};
 
     // Optional poller RT priority override (default: 10)
     int poller_fifo_prio = 10;
@@ -386,13 +388,17 @@ class BloomCheckServiceClient {
       cq_poller_threads_.emplace_back(
           std::thread(&BloomCheckServiceClient::CQPollerThread, this, i));
       pthread_t thread_handle = cq_poller_threads_.back().native_handle();
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      CPU_SET(poller_cores[i % poller_cores.size()], &cpuset);
+      (void)pthread_setaffinity_np(thread_handle, sizeof(cpu_set_t), &cpuset);
       struct sched_param param;
       param.sched_priority = poller_fifo_prio;
       (void)pthread_setschedparam(thread_handle, SCHED_FIFO, &param);
     }
 
     // Log poller summary
-    // fprintf(stderr, "[BloomCheckClient] Poller threads started without CPU pinning, count=%d, fifo_prio=%d\n",
+    // fprintf(stderr, "[BloomCheckClient] Poller threads pinned to [25,27,29,31], count=%d, fifo_prio=%d\n",
     //         static_cast<int>(cq_count), poller_fifo_prio);
     
     // Log initialization info
