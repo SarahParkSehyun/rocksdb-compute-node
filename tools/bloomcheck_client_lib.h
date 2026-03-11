@@ -246,21 +246,18 @@ class BloomCheckServiceClient {
       }
     }
 
-    // Read CQ count from environment variable (default: 1 per channel, ensuring 1:1 mapping)
-    size_t cq_count = channel_count_;
+    // Read per-channel CQ count from environment variable.
+    // Default: 8 CQs per channel for multi-CQ experiments.
+    size_t cqs_per_channel = 8;
     const char* cq_env = std::getenv("BLOOMCHECK_CQS");
     if (cq_env != nullptr) {
       int count = std::atoi(cq_env);
       if (count > 0) {
-        cq_count = static_cast<size_t>(count);
+        cqs_per_channel = static_cast<size_t>(count);
       }
     }
-    
-    // Ensure CQ count matches channel count for 1:1 mapping
-    if (cq_count != channel_count_) {
-      // fprintf(stderr, "[BloomCheckClient] Warning: CQ count (%zu) != channel count (%zu), adjusting CQ count to match\n", cq_count, channel_count_);
-      cq_count = channel_count_;
-    }
+    cqs_per_channel_ = cqs_per_channel;
+    const size_t cq_count = channel_count_ * cqs_per_channel_;
 
     // Read MAX_INFLIGHT from environment variable (default: unlimited, 0 means unlimited)
     size_t max_inflight = 0;  // 0 means unlimited
@@ -389,7 +386,7 @@ class BloomCheckServiceClient {
         auto& per_channel = stream_sessions_[ch];
         per_channel.reserve(streams_per_channel_);
         for (size_t s = 0; s < streams_per_channel_; ++s) {
-          size_t cq_idx = ch % cqs_.size();
+          size_t cq_idx = ch * cqs_per_channel_ + (s % cqs_per_channel_);
           per_channel.emplace_back(std::make_unique<StreamSession>(
               this, ch, s, cq_idx, stream_max_pending_));
         }
@@ -620,7 +617,7 @@ class BloomCheckServiceClient {
 
     // Select channel and CQ
     size_t stub_idx = GetChannelIndex();
-    size_t cq_idx = stub_idx % cqs_.size();
+    size_t cq_idx = SelectCQIndex(stub_idx);
     
     if (channel_idx != nullptr) {
       *channel_idx = stub_idx;
@@ -840,7 +837,7 @@ class BloomCheckServiceClient {
 
     // Select channel and CQ
     size_t stub_idx = GetChannelIndex();
-    size_t cq_idx = stub_idx % cqs_.size();
+    size_t cq_idx = SelectCQIndex(stub_idx);
     
     if (channel_idx != nullptr) {
       *channel_idx = stub_idx;
@@ -904,6 +901,13 @@ class BloomCheckServiceClient {
       //         i, status.ok() ? "OK" : "FAILED");
     }
     // fprintf(stderr, "[BloomCheckClient] Warmup: Completed warm-up for %zu channels\n", channel_count_);
+  }
+
+  // Select a CQ belonging to the given channel.
+  size_t SelectCQIndex(size_t channel_idx) {
+    const uint64_t pick = next_cq_pick_.fetch_add(1, std::memory_order_relaxed);
+    const size_t cq_subidx = static_cast<size_t>(pick % cqs_per_channel_);
+    return channel_idx * cqs_per_channel_ + cq_subidx;
   }
 
  private:
@@ -1429,6 +1433,17 @@ class BloomCheckServiceClient {
   void CQPollerThread(size_t cq_idx) {
     // Set thread name for debugging/monitoring
     pthread_setname_np(pthread_self(), "bloom_poller");
+#ifdef __linux__
+    // Pin CQ pollers to odd CPUs from the tail:
+    // cq_idx=0 -> 31, 1 -> 29, 2 -> 27, ...
+    const int cpu = 31 - static_cast<int>(2 * cq_idx);
+    if (cpu >= 0 && cpu < CPU_SETSIZE) {
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      CPU_SET(cpu, &cpuset);
+      pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    }
+#endif
     
     void* tag;
     bool ok;
@@ -1462,10 +1477,12 @@ class BloomCheckServiceClient {
   bool shutdown_;
   bool stream_stats_enabled_;  // True when BLOOMCHECK_CLIENT_STATS is non-zero
   std::unique_ptr<Semaphore> inflight_semaphore_;  // For limiting concurrent inflight RPCs
+  size_t cqs_per_channel_ = 8;
   bool use_streaming_ = false;
   size_t streams_per_channel_ = 4;
   size_t stream_max_pending_ = 4096;
   std::atomic<uint64_t> next_stream_request_id_{0};
+  std::atomic<uint64_t> next_cq_pick_{0};
   std::vector<std::vector<std::unique_ptr<StreamSession>>> stream_sessions_;
   
   // Inflight RPC statistics
