@@ -35,6 +35,7 @@ inline uint64_t BloomNowMicros() {
 }
 
 // Simple semaphore implementation for inflight RPC limiting
+// EVOLVE-BLOCK-START
 class Semaphore {
  public:
   explicit Semaphore(size_t max_count) 
@@ -100,6 +101,7 @@ class Semaphore {
   uint64_t wait_us_total_;    // Total wait time in microseconds
   uint64_t max_wait_us_;      // Maximum single wait time in microseconds
 };
+// EVOLVE-BLOCK-END
 
 // RAII wrapper for semaphore acquire/release
 class SemaphoreGuard {
@@ -246,16 +248,8 @@ class BloomCheckServiceClient {
       }
     }
 
-    // Read per-channel CQ count from environment variable.
-    // Default: 8 CQs per channel for multi-CQ experiments.
-    size_t cqs_per_channel = 8;
-    const char* cq_env = std::getenv("BLOOMCHECK_CQS");
-    if (cq_env != nullptr) {
-      int count = std::atoi(cq_env);
-      if (count > 0) {
-        cqs_per_channel = static_cast<size_t>(count);
-      }
-    }
+    // Use a fixed 1 CQ per channel.
+    size_t cqs_per_channel = 1;
     cqs_per_channel_ = cqs_per_channel;
     const size_t cq_count = channel_count_ * cqs_per_channel_;
 
@@ -1434,9 +1428,9 @@ class BloomCheckServiceClient {
     // Set thread name for debugging/monitoring
     pthread_setname_np(pthread_self(), "bloom_poller");
 #ifdef __linux__
-    // Pin CQ pollers to odd CPUs from the tail:
-    // cq_idx=0 -> 31, 1 -> 29, 2 -> 27, ...
-    const int cpu = 31 - static_cast<int>(2 * cq_idx);
+    // Pin CQ pollers to fixed cores in round-robin: 25, 27, 29, 31.
+    static constexpr int kPollerPinnedCpus[4] = {25, 27, 29, 31};
+    const int cpu = kPollerPinnedCpus[cq_idx % 4];
     if (cpu >= 0 && cpu < CPU_SETSIZE) {
       cpu_set_t cpuset;
       CPU_ZERO(&cpuset);
