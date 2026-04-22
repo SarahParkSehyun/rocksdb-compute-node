@@ -39,6 +39,7 @@ message StreamRequest {
   uint64 request_id = 1;
   bytes user_key = 2;
   repeated uint64 sst_file_numbers = 3;
+  bool noop_only = 4;
 }
 
 message StreamResponse {

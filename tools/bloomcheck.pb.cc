@@ -112,6 +112,7 @@ PROTOBUF_CONSTEXPR StreamRequest::StreamRequest(
   , /*decltype(_impl_._sst_file_numbers_cached_byte_size_)*/{0}
   , /*decltype(_impl_.user_key_)*/{&::_pbi::fixed_address_empty_string, ::_pbi::ConstantInitialized{}}
   , /*decltype(_impl_.request_id_)*/uint64_t{0u}
+  , /*decltype(_impl_.noop_only_)*/false
   , /*decltype(_impl_._cached_size_)*/{}} {}
 struct StreamRequestDefaultTypeInternal {
   PROTOBUF_CONSTEXPR StreamRequestDefaultTypeInternal()
@@ -201,6 +202,7 @@ const uint32_t TableStruct_bloomcheck_2eproto::offsets[] PROTOBUF_SECTION_VARIAB
   PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamRequest, _impl_.request_id_),
   PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamRequest, _impl_.user_key_),
   PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamRequest, _impl_.sst_file_numbers_),
+  PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamRequest, _impl_.noop_only_),
   ~0u,  // no _has_bits_
   PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamResponse, _internal_metadata_),
   ~0u,  // no _extensions_
@@ -219,7 +221,7 @@ static const ::_pbi::MigrationSchema schemas[] PROTOBUF_SECTION_VARIABLE(protode
   { 33, -1, -1, sizeof(::bloomcheck::NoopRequest)},
   { 39, 46, -1, sizeof(::bloomcheck::NoopResponse)},
   { 47, -1, -1, sizeof(::bloomcheck::StreamRequest)},
-  { 56, -1, -1, sizeof(::bloomcheck::StreamResponse)},
+  { 57, -1, -1, sizeof(::bloomcheck::StreamResponse)},
 };
 
 static const ::_pb::Message* const file_default_instances[] = {
@@ -244,22 +246,22 @@ const char descriptor_table_protodef_bloomcheck_2eproto[] PROTOBUF_SECTION_VARIA
   "sst_file_numbers\030\005 \003(\004\"7\n\rBatchResponse\022"
   "&\n\005resps\030\001 \003(\0132\027.bloomcheck.KeyResponse\""
   "\r\n\013NoopRequest\":\n\014NoopResponse\022\031\n\014server"
-  "_ts_ns\030\001 \001(\004H\000\210\001\001B\017\n\r_server_ts_ns\"O\n\rSt"
+  "_ts_ns\030\001 \001(\004H\000\210\001\001B\017\n\r_server_ts_ns\"b\n\rSt"
   "reamRequest\022\022\n\nrequest_id\030\001 \001(\004\022\020\n\010user_"
-  "key\030\002 \001(\014\022\030\n\020sst_file_numbers\030\003 \003(\004\"q\n\016S"
-  "treamResponse\022\022\n\nrequest_id\030\001 \001(\004\022\"\n\032may"
-  "_match_sst_file_numbers\030\002 \003(\004\022\'\n\037path_no"
-  "t_found_sst_file_numbers\030\003 \003(\0042\324\001\n\nBloom"
-  "Check\022<\n\005Check\022\030.bloomcheck.BatchRequest"
-  "\032\031.bloomcheck.BatchResponse\0229\n\004Noop\022\027.bl"
-  "oomcheck.NoopRequest\032\030.bloomcheck.NoopRe"
-  "sponse\022M\n\020CheckBatchStream\022\031.bloomcheck."
-  "StreamRequest\032\032.bloomcheck.StreamRespons"
-  "e(\0010\001b\006proto3"
+  "key\030\002 \001(\014\022\030\n\020sst_file_numbers\030\003 \003(\004\022\021\n\tn"
+  "oop_only\030\004 \001(\010\"q\n\016StreamResponse\022\022\n\nrequ"
+  "est_id\030\001 \001(\004\022\"\n\032may_match_sst_file_numbe"
+  "rs\030\002 \003(\004\022\'\n\037path_not_found_sst_file_numb"
+  "ers\030\003 \003(\0042\324\001\n\nBloomCheck\022<\n\005Check\022\030.bloo"
+  "mcheck.BatchRequest\032\031.bloomcheck.BatchRe"
+  "sponse\0229\n\004Noop\022\027.bloomcheck.NoopRequest\032"
+  "\030.bloomcheck.NoopResponse\022M\n\020CheckBatchS"
+  "tream\022\031.bloomcheck.StreamRequest\032\032.bloom"
+  "check.StreamResponse(\0010\001b\006proto3"
   ;
 static ::_pbi::once_flag descriptor_table_bloomcheck_2eproto_once;
 const ::_pbi::DescriptorTable descriptor_table_bloomcheck_2eproto = {
-    false, false, 853, descriptor_table_protodef_bloomcheck_2eproto,
+    false, false, 872, descriptor_table_protodef_bloomcheck_2eproto,
     "bloomcheck.proto",
     &descriptor_table_bloomcheck_2eproto_once, nullptr, 0, 8,
     schemas, file_default_instances, TableStruct_bloomcheck_2eproto::offsets,
@@ -1453,6 +1455,7 @@ StreamRequest::StreamRequest(const StreamRequest& from)
     , /*decltype(_impl_._sst_file_numbers_cached_byte_size_)*/{0}
     , decltype(_impl_.user_key_){}
     , decltype(_impl_.request_id_){}
+    , decltype(_impl_.noop_only_){}
     , /*decltype(_impl_._cached_size_)*/{}};
 
   _internal_metadata_.MergeFrom<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(from._internal_metadata_);
@@ -1464,7 +1467,9 @@ StreamRequest::StreamRequest(const StreamRequest& from)
     _this->_impl_.user_key_.Set(from._internal_user_key(), 
       _this->GetArenaForAllocation());
   }
-  _this->_impl_.request_id_ = from._impl_.request_id_;
+  ::memcpy(&_impl_.request_id_, &from._impl_.request_id_,
+    static_cast<size_t>(reinterpret_cast<char*>(&_impl_.noop_only_) -
+    reinterpret_cast<char*>(&_impl_.request_id_)) + sizeof(_impl_.noop_only_));
   // @@protoc_insertion_point(copy_constructor:bloomcheck.StreamRequest)
 }
 
@@ -1477,6 +1482,7 @@ inline void StreamRequest::SharedCtor(
     , /*decltype(_impl_._sst_file_numbers_cached_byte_size_)*/{0}
     , decltype(_impl_.user_key_){}
     , decltype(_impl_.request_id_){uint64_t{0u}}
+    , decltype(_impl_.noop_only_){false}
     , /*decltype(_impl_._cached_size_)*/{}
   };
   _impl_.user_key_.InitDefault();
@@ -1512,7 +1518,9 @@ void StreamRequest::Clear() {
 
   _impl_.sst_file_numbers_.Clear();
   _impl_.user_key_.ClearToEmpty();
-  _impl_.request_id_ = uint64_t{0u};
+  ::memset(&_impl_.request_id_, 0, static_cast<size_t>(
+      reinterpret_cast<char*>(&_impl_.noop_only_) -
+      reinterpret_cast<char*>(&_impl_.request_id_)) + sizeof(_impl_.noop_only_));
   _internal_metadata_.Clear<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>();
 }
 
@@ -1546,6 +1554,14 @@ const char* StreamRequest::_InternalParse(const char* ptr, ::_pbi::ParseContext*
           CHK_(ptr);
         } else if (static_cast<uint8_t>(tag) == 24) {
           _internal_add_sst_file_numbers(::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr));
+          CHK_(ptr);
+        } else
+          goto handle_unusual;
+        continue;
+      // bool noop_only = 4;
+      case 4:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 32)) {
+          _impl_.noop_only_ = ::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr);
           CHK_(ptr);
         } else
           goto handle_unusual;
@@ -1600,6 +1616,12 @@ uint8_t* StreamRequest::_InternalSerialize(
     }
   }
 
+  // bool noop_only = 4;
+  if (this->_internal_noop_only() != 0) {
+    target = stream->EnsureSpace(target);
+    target = ::_pbi::WireFormatLite::WriteBoolToArray(4, this->_internal_noop_only(), target);
+  }
+
   if (PROTOBUF_PREDICT_FALSE(_internal_metadata_.have_unknown_fields())) {
     target = ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
         _internal_metadata_.unknown_fields<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(::PROTOBUF_NAMESPACE_ID::UnknownFieldSet::default_instance), target, stream);
@@ -1642,6 +1664,11 @@ size_t StreamRequest::ByteSizeLong() const {
     total_size += ::_pbi::WireFormatLite::UInt64SizePlusOne(this->_internal_request_id());
   }
 
+  // bool noop_only = 4;
+  if (this->_internal_noop_only() != 0) {
+    total_size += 1 + 1;
+  }
+
   return MaybeComputeUnknownFieldsSize(total_size, &_impl_._cached_size_);
 }
 
@@ -1667,6 +1694,9 @@ void StreamRequest::MergeImpl(::PROTOBUF_NAMESPACE_ID::Message& to_msg, const ::
   if (from._internal_request_id() != 0) {
     _this->_internal_set_request_id(from._internal_request_id());
   }
+  if (from._internal_noop_only() != 0) {
+    _this->_internal_set_noop_only(from._internal_noop_only());
+  }
   _this->_internal_metadata_.MergeFrom<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(from._internal_metadata_);
 }
 
@@ -1691,7 +1721,12 @@ void StreamRequest::InternalSwap(StreamRequest* other) {
       &_impl_.user_key_, lhs_arena,
       &other->_impl_.user_key_, rhs_arena
   );
-  swap(_impl_.request_id_, other->_impl_.request_id_);
+  ::PROTOBUF_NAMESPACE_ID::internal::memswap<
+      PROTOBUF_FIELD_OFFSET(StreamRequest, _impl_.noop_only_)
+      + sizeof(StreamRequest::_impl_.noop_only_)
+      - PROTOBUF_FIELD_OFFSET(StreamRequest, _impl_.request_id_)>(
+          reinterpret_cast<char*>(&_impl_.request_id_),
+          reinterpret_cast<char*>(&other->_impl_.request_id_));
 }
 
 ::PROTOBUF_NAMESPACE_ID::Metadata StreamRequest::GetMetadata() const {

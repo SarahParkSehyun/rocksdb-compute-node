@@ -602,6 +602,23 @@ class BloomCheckServiceClient {
                                 t_acquire_begin, t_after_acquire);
   }
 
+  bool AsyncCheckBatchNoopOnly(const bloomcheck::BatchRequest& request,
+                               bloomcheck::BatchResponse* response,
+                               size_t* channel_idx = nullptr,
+                               RpcTimingBreakdown* timing = nullptr) {
+    const uint64_t t_acquire_begin = BloomNowMicros();
+    SemaphoreGuard guard(inflight_semaphore_.get());
+    const uint64_t t_after_acquire = BloomNowMicros();
+
+    if (use_streaming_ && request.reqs_size() == 1) {
+      return AsyncCheckBatchStreaming(request, response, channel_idx, timing,
+                                      t_acquire_begin, t_after_acquire,
+                                      true /* noop_only */);
+    }
+
+    return false;
+  }
+
  private:
   bool AsyncCheckBatchUnary(const bloomcheck::BatchRequest& request,
                             bloomcheck::BatchResponse* response,
@@ -698,8 +715,12 @@ class BloomCheckServiceClient {
                                 bloomcheck::BatchResponse* response,
                                 size_t* channel_idx, RpcTimingBreakdown* timing,
                                 uint64_t t_acquire_begin,
-                                uint64_t t_after_acquire) {
+                                uint64_t t_after_acquire,
+                                bool noop_only = false) {
     if (stream_sessions_.empty()) {
+      if (noop_only) {
+        return false;
+      }
       return AsyncCheckBatchUnary(request, response, channel_idx, timing,
                                   t_acquire_begin, t_after_acquire);
     }
@@ -717,6 +738,9 @@ class BloomCheckServiceClient {
 
     auto& per_channel = stream_sessions_[stub_idx];
     if (stream_idx >= per_channel.size() || per_channel[stream_idx] == nullptr) {
+      if (noop_only) {
+        return false;
+      }
       return AsyncCheckBatchUnary(request, response, channel_idx, timing,
                                   t_acquire_begin, t_after_acquire);
     }
@@ -730,6 +754,7 @@ class BloomCheckServiceClient {
     for (int i = 0; i < key_req.sst_file_numbers_size(); ++i) {
       pending->req.add_sst_file_numbers(key_req.sst_file_numbers(i));
     }
+    pending->req.set_noop_only(noop_only);
     bool enqueued = per_channel[stream_idx]->EnqueueRequest(pending);
     const uint64_t t_after_finish = BloomNowMicros();
     if (!enqueued) {

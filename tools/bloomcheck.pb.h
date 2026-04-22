@@ -1192,6 +1192,7 @@ class StreamRequest final :
     kSstFileNumbersFieldNumber = 3,
     kUserKeyFieldNumber = 2,
     kRequestIdFieldNumber = 1,
+    kNoopOnlyFieldNumber = 4,
   };
   // repeated uint64 sst_file_numbers = 3;
   int sst_file_numbers_size() const;
@@ -1238,6 +1239,15 @@ class StreamRequest final :
   void _internal_set_request_id(uint64_t value);
   public:
 
+  // bool noop_only = 4;
+  void clear_noop_only();
+  bool noop_only() const;
+  void set_noop_only(bool value);
+  private:
+  bool _internal_noop_only() const;
+  void _internal_set_noop_only(bool value);
+  public:
+
   // @@protoc_insertion_point(class_scope:bloomcheck.StreamRequest)
  private:
   class _Internal;
@@ -1250,6 +1260,7 @@ class StreamRequest final :
     mutable std::atomic<int> _sst_file_numbers_cached_byte_size_;
     ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr user_key_;
     uint64_t request_id_;
+    bool noop_only_;
     mutable ::PROTOBUF_NAMESPACE_ID::internal::CachedSize _cached_size_;
   };
   union { Impl_ _impl_; };
@@ -1962,6 +1973,25 @@ inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
 StreamRequest::mutable_sst_file_numbers() {
   // @@protoc_insertion_point(field_mutable_list:bloomcheck.StreamRequest.sst_file_numbers)
   return _internal_mutable_sst_file_numbers();
+}
+
+// bool noop_only = 4;
+inline void StreamRequest::clear_noop_only() {
+  _impl_.noop_only_ = false;
+}
+inline bool StreamRequest::_internal_noop_only() const {
+  return _impl_.noop_only_;
+}
+inline bool StreamRequest::noop_only() const {
+  // @@protoc_insertion_point(field_get:bloomcheck.StreamRequest.noop_only)
+  return _internal_noop_only();
+}
+inline void StreamRequest::_internal_set_noop_only(bool value) {
+  _impl_.noop_only_ = value;
+}
+inline void StreamRequest::set_noop_only(bool value) {
+  _internal_set_noop_only(value);
+  // @@protoc_insertion_point(field_set:bloomcheck.StreamRequest.noop_only)
 }
 
 // -------------------------------------------------------------------
