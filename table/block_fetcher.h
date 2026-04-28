@@ -18,6 +18,13 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+struct BlockCacheLookupContext;
+
+void SetCountBlockPreadsForGet(bool enabled);
+uint64_t GetAndResetDataBlockPreadsForGet();
+uint64_t GetAndResetIndexBlockPreadsForGet();
+uint64_t GetAndResetFilterBlockPreadsForGet();
+
 // Retrieves a single block of a given file. Utilizes the prefetch buffer and/or
 // persistent cache provided (if any) to try to avoid reading from the file
 // directly. Note that both the prefetch buffer and the persistent cache are
@@ -51,7 +58,8 @@ class BlockFetcher {
                const PersistentCacheOptions& cache_options /* ref retained */,
                MemoryAllocator* memory_allocator = nullptr,
                MemoryAllocator* memory_allocator_compressed = nullptr,
-               bool for_compaction = false)
+               bool for_compaction = false,
+               const BlockCacheLookupContext* lookup_context = nullptr)
       : file_(file),
         prefetch_buffer_(prefetch_buffer),
         footer_(footer),
@@ -68,7 +76,8 @@ class BlockFetcher {
         cache_options_(cache_options),
         memory_allocator_(memory_allocator),
         memory_allocator_compressed_(memory_allocator_compressed),
-        for_compaction_(for_compaction) {
+        for_compaction_(for_compaction),
+        lookup_context_(lookup_context) {
     io_status_.PermitUncheckedError();  // TODO(AR) can we improve on this?
     if (CheckFSFeatureSupport(ioptions_.fs.get(), FSSupportedOps::kFSBuffer)) {
       use_fs_scratch_ = true;
@@ -138,6 +147,7 @@ class BlockFetcher {
   char stack_buf_[kDefaultStackBufferSize];
   bool got_from_prefetch_buffer_ = false;
   bool for_compaction_ = false;
+  const BlockCacheLookupContext* lookup_context_ = nullptr;
   bool use_fs_scratch_ = false;
   bool retry_corrupt_read_ = false;
   FSAllocationPtr fs_buf_;

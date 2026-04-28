@@ -29,6 +29,60 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+
+std::atomic<bool> count_block_preads_for_get{false};
+std::atomic<uint64_t> data_block_preads_for_get{0};
+std::atomic<uint64_t> index_block_preads_for_get{0};
+std::atomic<uint64_t> filter_block_preads_for_get{0};
+
+inline void RecordBlockPreadForGet(const BlockCacheLookupContext* lookup_context,
+                                   BlockType block_type) {
+  if (!count_block_preads_for_get.load(std::memory_order_relaxed) ||
+      lookup_context == nullptr ||
+      lookup_context->caller != TableReaderCaller::kUserGet) {
+    return;
+  }
+
+  switch (block_type) {
+    case BlockType::kData:
+      data_block_preads_for_get.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case BlockType::kIndex:
+      // Top-level index and index partition reads are both represented as
+      // BlockType::kIndex in this codebase, so both land in index preads.
+      index_block_preads_for_get.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case BlockType::kFilter:
+    case BlockType::kFilterPartitionIndex:
+      // Partitioned filter index blocks are counted as filter preads to match
+      // the baseline interpretation of filter partition index + filter
+      // partition block belonging to the filter family.
+      filter_block_preads_for_get.fetch_add(1, std::memory_order_relaxed);
+      break;
+    default:
+      break;
+  }
+}
+
+}  // namespace
+
+void SetCountBlockPreadsForGet(bool enabled) {
+  count_block_preads_for_get.store(enabled, std::memory_order_relaxed);
+}
+
+uint64_t GetAndResetDataBlockPreadsForGet() {
+  return data_block_preads_for_get.exchange(0, std::memory_order_relaxed);
+}
+
+uint64_t GetAndResetIndexBlockPreadsForGet() {
+  return index_block_preads_for_get.exchange(0, std::memory_order_relaxed);
+}
+
+uint64_t GetAndResetFilterBlockPreadsForGet() {
+  return filter_block_preads_for_get.exchange(0, std::memory_order_relaxed);
+}
+
 inline void BlockFetcher::ProcessTrailerIfPresent() {
   if (footer_.GetBlockTrailerSize() > 0) {
     assert(footer_.GetBlockTrailerSize() == BlockBasedTable::kBlockTrailerSize);
@@ -262,6 +316,9 @@ void BlockFetcher::ReadBlock(bool retry) {
           file_->Read(opts, handle_.offset(), block_size_with_trailer_, &slice_,
                       /*scratch=*/nullptr, &direct_io_buf_, &dbg);
       PERF_COUNTER_ADD(block_read_count, 1);
+      if (io_status_.ok()) {
+        RecordBlockPreadForGet(lookup_context_, block_type_);
+      }
       used_buf_ = const_cast<char*>(slice_.data());
     } else if (use_fs_scratch_) {
       PERF_TIMER_GUARD(block_read_time);
@@ -274,6 +331,9 @@ void BlockFetcher::ReadBlock(bool retry) {
       io_status_ = file_->MultiRead(opts, &read_req, /*num_reqs=*/1,
                                     /*AlignedBuf* =*/nullptr, &dbg);
       PERF_COUNTER_ADD(block_read_count, 1);
+      if (io_status_.ok()) {
+        RecordBlockPreadForGet(lookup_context_, block_type_);
+      }
 
       slice_ = Slice(read_req.result.data(), read_req.result.size());
       used_buf_ = const_cast<char*>(slice_.data());
@@ -291,6 +351,9 @@ void BlockFetcher::ReadBlock(bool retry) {
                       /*result*/ &slice_, /*scratch*/ used_buf_,
                       /*aligned_buf=*/nullptr, &dbg);
       PERF_COUNTER_ADD(block_read_count, 1);
+      if (io_status_.ok()) {
+        RecordBlockPreadForGet(lookup_context_, block_type_);
+      }
 #ifndef NDEBUG
       if (slice_.data() == &stack_buf_[0]) {
         num_stack_buf_memcpy_++;

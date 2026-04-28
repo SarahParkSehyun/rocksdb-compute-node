@@ -99,6 +99,7 @@
 #include "memory/memkind_kmem_allocator.h"
 #endif
 #include "tools/bloomcheck_client_lib.h"
+#include "table/block_fetcher.h"
 
 #ifdef OS_WIN
 #include <io.h>  // open/close
@@ -108,6 +109,59 @@ using GFLAGS_NAMESPACE::ParseCommandLineFlags;
 using GFLAGS_NAMESPACE::RegisterFlagValidator;
 using GFLAGS_NAMESPACE::SetUsageMessage;
 using GFLAGS_NAMESPACE::SetVersionString;
+
+namespace {
+
+uint64_t total_data_preads_for_get = 0;
+uint64_t total_index_preads_for_get = 0;
+uint64_t total_filter_preads_for_get = 0;
+
+void ResetBlockPreadsForGetCounters() {
+  ROCKSDB_NAMESPACE::GetAndResetDataBlockPreadsForGet();
+  ROCKSDB_NAMESPACE::GetAndResetIndexBlockPreadsForGet();
+  ROCKSDB_NAMESPACE::GetAndResetFilterBlockPreadsForGet();
+  total_data_preads_for_get = 0;
+  total_index_preads_for_get = 0;
+  total_filter_preads_for_get = 0;
+}
+
+void PrintIntervalBlockPreadsForGetToStderr() {
+  const uint64_t data_preads =
+      ROCKSDB_NAMESPACE::GetAndResetDataBlockPreadsForGet();
+  const uint64_t index_preads =
+      ROCKSDB_NAMESPACE::GetAndResetIndexBlockPreadsForGet();
+  const uint64_t filter_preads =
+      ROCKSDB_NAMESPACE::GetAndResetFilterBlockPreadsForGet();
+  total_data_preads_for_get += data_preads;
+  total_index_preads_for_get += index_preads;
+  total_filter_preads_for_get += filter_preads;
+  fprintf(stderr, "[FilterCount] interval_data_pread=%" PRIu64 "\n",
+          data_preads);
+  fprintf(stderr, "[FilterCount] interval_index_pread=%" PRIu64 "\n",
+          index_preads);
+  fprintf(stderr, "[FilterCount] interval_filter_pread=%" PRIu64 "\n",
+          filter_preads);
+}
+
+void PrintFinalBlockPreadsForGetToStderr() {
+  const uint64_t data_preads =
+      ROCKSDB_NAMESPACE::GetAndResetDataBlockPreadsForGet();
+  const uint64_t index_preads =
+      ROCKSDB_NAMESPACE::GetAndResetIndexBlockPreadsForGet();
+  const uint64_t filter_preads =
+      ROCKSDB_NAMESPACE::GetAndResetFilterBlockPreadsForGet();
+  total_data_preads_for_get += data_preads;
+  total_index_preads_for_get += index_preads;
+  total_filter_preads_for_get += filter_preads;
+  fprintf(stderr, "[FilterCount] final_data_pread=%" PRIu64 "\n",
+          total_data_preads_for_get);
+  fprintf(stderr, "[FilterCount] final_index_pread=%" PRIu64 "\n",
+          total_index_preads_for_get);
+  fprintf(stderr, "[FilterCount] final_filter_pread=%" PRIu64 "\n",
+          total_filter_preads_for_get);
+}
+
+}  // namespace
 
 DEFINE_string(
     benchmarks,
@@ -2515,6 +2569,9 @@ class Stats {
                 }
               }
             }
+            if (FLAGS_use_stderr_info_logger) {
+              PrintIntervalBlockPreadsForGetToStderr();
+            }
           }
 
           next_report_ += FLAGS_stats_interval;
@@ -2569,6 +2626,9 @@ class Stats {
       assert(counted_fs);
       fprintf(stdout, "%s", counted_fs->PrintCounters().c_str());
       counted_fs->ResetCounters();
+    }
+    if (FLAGS_use_stderr_info_logger) {
+      PrintFinalBlockPreadsForGetToStderr();
     }
     fflush(stdout);
   }
@@ -4122,6 +4182,9 @@ class Benchmark {
 
   Stats RunBenchmark(int n, Slice name,
                      void (Benchmark::*method)(ThreadState*)) {
+    ROCKSDB_NAMESPACE::SetCountBlockPreadsForGet(FLAGS_use_stderr_info_logger);
+    ResetBlockPreadsForGetCounters();
+
     SharedState shared;
     shared.total = n;
     shared.num_initialized = 0;

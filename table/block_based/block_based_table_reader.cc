@@ -204,7 +204,8 @@ Status ReadAndParseBlockFromFile(
     BlockCreateContext& create_context, bool maybe_compressed,
     UnownedPtr<Decompressor> decomp,
     const PersistentCacheOptions& cache_options,
-    MemoryAllocator* memory_allocator, bool for_compaction, bool async_read) {
+    MemoryAllocator* memory_allocator, bool for_compaction, bool async_read,
+    const BlockCacheLookupContext* lookup_context = nullptr) {
   assert(result);
 
   BlockContents contents;
@@ -212,7 +213,7 @@ Status ReadAndParseBlockFromFile(
       file, prefetch_buffer, footer, options, handle, &contents, ioptions,
       /*do_uncompress*/ maybe_compressed, maybe_compressed,
       TBlocklike::kBlockType, decomp, cache_options, memory_allocator, nullptr,
-      for_compaction);
+      for_compaction, lookup_context);
   Status s;
   // If prefetch_buffer is not allocated, it will fallback to synchronous
   // reading of block contents.
@@ -1914,7 +1915,7 @@ BlockBasedTable::MaybeReadBlockAndLoadToCache(
             &tmp_contents, rep_->ioptions, do_uncompress, maybe_compressed,
             TBlocklike::kBlockType, decomp, rep_->persistent_cache_options,
             GetMemoryAllocator(rep_->table_options),
-            /*allocator=*/nullptr);
+            /*allocator=*/nullptr, for_compaction, lookup_context);
 
         // If prefetch_buffer is not allocated, it will fallback to synchronous
         // reading of block contents.
@@ -2135,7 +2136,7 @@ WithBlocklikeCheck<Status, TBlocklike> BlockBasedTable::RetrieveBlock(
         rep_->file.get(), prefetch_buffer, rep_->footer, ro, handle, &block,
         rep_->ioptions, rep_->create_context, maybe_compressed, decomp,
         rep_->persistent_cache_options, GetMemoryAllocator(rep_->table_options),
-        for_compaction, async_read);
+        for_compaction, async_read, lookup_context);
 
     if (get_context) {
       switch (TBlocklike::kBlockType) {
