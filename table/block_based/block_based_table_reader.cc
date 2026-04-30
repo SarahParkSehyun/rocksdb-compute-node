@@ -21,6 +21,7 @@
 
 #include "block_cache.h"
 #include "cache/cache_entry_roles.h"
+#include "cache/cache_helpers.h"
 #include "cache/cache_key.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
@@ -3168,6 +3169,62 @@ bool BlockBasedTable::TEST_FilterBlockInCache() const {
   assert(rep_ != nullptr);
   return rep_->filter_type != Rep::FilterType::kNoFilter &&
          TEST_BlockInCache(rep_->filter_handle);
+}
+
+bool BlockBasedTable::IsFilterPartitionCached(
+    const ReadOptions& read_options, const Slice& key,
+    const Slice* const_ikey_ptr) const {
+  (void)key;
+  assert(rep_ != nullptr);
+
+  if (rep_->filter_type == Rep::FilterType::kNoFilter ||
+      rep_->filter == nullptr) {
+    return false;
+  }
+
+  switch (rep_->filter_type) {
+    case Rep::FilterType::kFullFilter:
+      return TEST_FilterBlockInCache();
+    case Rep::FilterType::kPartitionedFilter:
+      if (const_ikey_ptr == nullptr) {
+        return false;
+      }
+      return static_cast<PartitionedFilterBlockReader*>(rep_->filter.get())
+          ->IsFilterPartitionCached(*const_ikey_ptr, read_options);
+    case Rep::FilterType::kNoFilter:
+      return false;
+  }
+
+  return false;
+}
+
+Status BlockBasedTable::WarmFilterPartitionCache(
+    uint64_t filter_partition_offset, const Slice& filter_partition) {
+  assert(rep_ != nullptr);
+
+  Cache* block_cache = rep_->table_options.block_cache.get();
+  auto helper =
+      GetCacheItemHelper(BlockType::kFilter, rep_->ioptions.lowest_used_cache_tier);
+  if (block_cache == nullptr || helper == nullptr || helper->create_cb == nullptr) {
+    return Status::NotSupported();
+  }
+
+  BlockHandle handle;
+  handle.set_offset(filter_partition_offset);
+  CacheKey key = GetCacheKey(rep_->base_cache_key, handle);
+
+  size_t charge = 0;
+  Status s = WarmInCache(block_cache, key.AsSlice(), filter_partition,
+                         &rep_->create_context, helper,
+                         GetCachePriority<ParsedFullFilterBlock>(), &charge);
+  if (s.ok()) {
+    UpdateCacheInsertionMetrics(BlockType::kFilter, nullptr /* get_context */,
+                                charge, s.IsOkOverwritten(),
+                                rep_->ioptions.stats);
+  } else {
+    RecordTick(rep_->ioptions.stats, BLOCK_CACHE_ADD_FAILURES);
+  }
+  return s;
 }
 
 bool BlockBasedTable::TEST_IndexBlockInCache() const {

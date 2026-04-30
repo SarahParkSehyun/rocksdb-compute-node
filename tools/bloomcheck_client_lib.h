@@ -771,6 +771,10 @@ class BloomCheckServiceClient {
         out->add_path_not_found_sst_file_numbers(
             pending->resp.path_not_found_sst_file_numbers(i));
       }
+      for (int i = 0; i < pending->resp.filter_partition_blocks_size(); ++i) {
+        *out->add_filter_partition_blocks() =
+            pending->resp.filter_partition_blocks(i);
+      }
     }
     const uint64_t t_parse_end = BloomNowMicros();
 

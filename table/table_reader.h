@@ -121,6 +121,18 @@ class TableReader {
   // Report an approximation of how much memory has been used.
   virtual size_t ApproximateMemoryUsage() const = 0;
 
+  // Returns whether the filter block needed for `key` is already available
+  // without reading it from the SST.
+  virtual bool IsFilterPartitionCached(const ReadOptions& /*read_options*/,
+                                       const Slice& /*key*/,
+                                       const Slice* /*const_ikey_ptr*/) const {
+    return false;
+  }
+  virtual Status WarmFilterPartitionCache(uint64_t /*filter_partition_offset*/,
+                                          const Slice& /*filter_partition*/) {
+    return Status::NotSupported();
+  }
+
   // Calls get_context->SaveValue() repeatedly, starting with
   // the entry found after a call to Seek(key), until it returns false.
   // May not make such a call if filter policy says that key is not present.

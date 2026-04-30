@@ -620,6 +620,72 @@ Status TableCache::GetTableProperties(
   return s;
 }
 
+Status TableCache::IsFilterPartitionCached(
+    const ReadOptions& read_options,
+    const InternalKeyComparator& internal_comparator,
+    const FileMetaData& file_meta, const Slice& user_key,
+    const Slice* const_ikey_ptr,
+    const MutableCFOptions& mutable_cf_options, bool* is_cached) {
+  assert(is_cached != nullptr);
+  *is_cached = false;
+
+  TableReader* table_reader = file_meta.fd.table_reader;
+  TypedHandle* table_handle = nullptr;
+  Status s;
+  if (table_reader == nullptr) {
+    s = FindTable(read_options, file_options_, internal_comparator, file_meta,
+                  &table_handle, mutable_cf_options, false /* no_io */);
+    if (!s.ok()) {
+      return s;
+    }
+    table_reader = cache_.Value(table_handle);
+  }
+
+  if (table_reader != nullptr) {
+    *is_cached = table_reader->IsFilterPartitionCached(read_options, user_key,
+                                                       const_ikey_ptr);
+  }
+
+  if (table_handle != nullptr) {
+    cache_.Release(table_handle);
+  }
+  return Status::OK();
+}
+
+Status TableCache::WarmFilterPartitionCache(
+    const ReadOptions& read_options,
+    const InternalKeyComparator& internal_comparator,
+    const FileMetaData& file_meta, uint64_t filter_partition_offset,
+    const Slice& filter_partition_contents,
+    const MutableCFOptions& mutable_cf_options) {
+  TableReader* table_reader = file_meta.fd.table_reader;
+  TypedHandle* table_handle = nullptr;
+  Status s;
+  if (table_reader == nullptr) {
+    s = FindTable(read_options, file_options_, internal_comparator, file_meta,
+                  &table_handle, mutable_cf_options, false /* no_io */);
+    if (!s.ok()) {
+      return s;
+    }
+    table_reader = cache_.Value(table_handle);
+  }
+
+  if (table_reader == nullptr) {
+    if (table_handle != nullptr) {
+      cache_.Release(table_handle);
+    }
+    return Status::NotFound("Table reader unavailable for warming filter cache");
+  }
+
+  s = table_reader->WarmFilterPartitionCache(filter_partition_offset,
+                                             filter_partition_contents);
+
+  if (table_handle != nullptr) {
+    cache_.Release(table_handle);
+  }
+  return s;
+}
+
 Status TableCache::ApproximateKeyAnchors(
     const ReadOptions& ro, const InternalKeyComparator& internal_comparator,
     const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,

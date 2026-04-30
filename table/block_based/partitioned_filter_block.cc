@@ -558,6 +558,38 @@ void PartitionedFilterBlockReader::MayMatch(
   }
 }
 
+bool PartitionedFilterBlockReader::IsFilterPartitionCached(
+    const Slice& entry, const ReadOptions& read_options) const {
+  CachableEntry<Block_kFilterPartitionIndex> filter_block;
+  if (HasFilterBlockLoaded()) {
+    GetLoadedFilterBlock(&filter_block);
+  } else {
+    Status s = table()->LookupAndPinBlocksInCache(
+        read_options, table()->get_rep()->filter_handle, &filter_block);
+    if (!s.ok() || filter_block.GetValue() == nullptr) {
+      return false;
+    }
+  }
+
+  if (filter_block.GetValue()->size() == 0) {
+    return false;
+  }
+
+  BlockHandle filter_handle = GetFilterPartitionHandle(filter_block, entry);
+  if (filter_handle.size() == 0) {
+    return false;
+  }
+
+  if (!filter_map_.empty()) {
+    auto iter = filter_map_.find(filter_handle.offset());
+    if (iter != filter_map_.end()) {
+      return true;
+    }
+  }
+
+  return table()->TEST_BlockInCache(filter_handle);
+}
+
 void PartitionedFilterBlockReader::MayMatchPartition(
     MultiGetRange* range, const SliceTransform* prefix_extractor,
     BlockHandle filter_handle, BlockCacheLookupContext* lookup_context,

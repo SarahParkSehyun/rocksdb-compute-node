@@ -49,12 +49,28 @@ struct BatchRequestDefaultTypeInternal {
   };
 };
 PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 BatchRequestDefaultTypeInternal _BatchRequest_default_instance_;
+PROTOBUF_CONSTEXPR FilterPartitionBlock::FilterPartitionBlock(
+    ::_pbi::ConstantInitialized): _impl_{
+    /*decltype(_impl_.filter_partition_contents_)*/{&::_pbi::fixed_address_empty_string, ::_pbi::ConstantInitialized{}}
+  , /*decltype(_impl_.sst_file_number_)*/uint64_t{0u}
+  , /*decltype(_impl_.filter_partition_offset_)*/uint64_t{0u}
+  , /*decltype(_impl_._cached_size_)*/{}} {}
+struct FilterPartitionBlockDefaultTypeInternal {
+  PROTOBUF_CONSTEXPR FilterPartitionBlockDefaultTypeInternal()
+      : _instance(::_pbi::ConstantInitialized{}) {}
+  ~FilterPartitionBlockDefaultTypeInternal() {}
+  union {
+    FilterPartitionBlock _instance;
+  };
+};
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 FilterPartitionBlockDefaultTypeInternal _FilterPartitionBlock_default_instance_;
 PROTOBUF_CONSTEXPR KeyResponse::KeyResponse(
     ::_pbi::ConstantInitialized): _impl_{
     /*decltype(_impl_.may_match_sst_file_numbers_)*/{}
   , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
   , /*decltype(_impl_.path_not_found_sst_file_numbers_)*/{}
   , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
+  , /*decltype(_impl_.filter_partition_blocks_)*/{}
   , /*decltype(_impl_.checked_count_)*/uint64_t{0u}
   , /*decltype(_impl_.total_candidates_)*/uint64_t{0u}
   , /*decltype(_impl_.complete_)*/false
@@ -128,6 +144,7 @@ PROTOBUF_CONSTEXPR StreamResponse::StreamResponse(
   , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
   , /*decltype(_impl_.path_not_found_sst_file_numbers_)*/{}
   , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
+  , /*decltype(_impl_.filter_partition_blocks_)*/{}
   , /*decltype(_impl_.request_id_)*/uint64_t{0u}
   , /*decltype(_impl_._cached_size_)*/{}} {}
 struct StreamResponseDefaultTypeInternal {
@@ -140,7 +157,7 @@ struct StreamResponseDefaultTypeInternal {
 };
 PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 StreamResponseDefaultTypeInternal _StreamResponse_default_instance_;
 }  // namespace bloomcheck
-static ::_pb::Metadata file_level_metadata_bloomcheck_2eproto[8];
+static ::_pb::Metadata file_level_metadata_bloomcheck_2eproto[9];
 static constexpr ::_pb::EnumDescriptor const** file_level_enum_descriptors_bloomcheck_2eproto = nullptr;
 static constexpr ::_pb::ServiceDescriptor const** file_level_service_descriptors_bloomcheck_2eproto = nullptr;
 
@@ -161,6 +178,15 @@ const uint32_t TableStruct_bloomcheck_2eproto::offsets[] PROTOBUF_SECTION_VARIAB
   ~0u,  // no _inlined_string_donated_
   PROTOBUF_FIELD_OFFSET(::bloomcheck::BatchRequest, _impl_.reqs_),
   ~0u,  // no _has_bits_
+  PROTOBUF_FIELD_OFFSET(::bloomcheck::FilterPartitionBlock, _internal_metadata_),
+  ~0u,  // no _extensions_
+  ~0u,  // no _oneof_case_
+  ~0u,  // no _weak_field_map_
+  ~0u,  // no _inlined_string_donated_
+  PROTOBUF_FIELD_OFFSET(::bloomcheck::FilterPartitionBlock, _impl_.sst_file_number_),
+  PROTOBUF_FIELD_OFFSET(::bloomcheck::FilterPartitionBlock, _impl_.filter_partition_offset_),
+  PROTOBUF_FIELD_OFFSET(::bloomcheck::FilterPartitionBlock, _impl_.filter_partition_contents_),
+  ~0u,  // no _has_bits_
   PROTOBUF_FIELD_OFFSET(::bloomcheck::KeyResponse, _internal_metadata_),
   ~0u,  // no _extensions_
   ~0u,  // no _oneof_case_
@@ -171,6 +197,7 @@ const uint32_t TableStruct_bloomcheck_2eproto::offsets[] PROTOBUF_SECTION_VARIAB
   PROTOBUF_FIELD_OFFSET(::bloomcheck::KeyResponse, _impl_.checked_count_),
   PROTOBUF_FIELD_OFFSET(::bloomcheck::KeyResponse, _impl_.total_candidates_),
   PROTOBUF_FIELD_OFFSET(::bloomcheck::KeyResponse, _impl_.path_not_found_sst_file_numbers_),
+  PROTOBUF_FIELD_OFFSET(::bloomcheck::KeyResponse, _impl_.filter_partition_blocks_),
   ~0u,  // no _has_bits_
   PROTOBUF_FIELD_OFFSET(::bloomcheck::BatchResponse, _internal_metadata_),
   ~0u,  // no _extensions_
@@ -210,21 +237,24 @@ const uint32_t TableStruct_bloomcheck_2eproto::offsets[] PROTOBUF_SECTION_VARIAB
   PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamResponse, _impl_.request_id_),
   PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamResponse, _impl_.may_match_sst_file_numbers_),
   PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamResponse, _impl_.path_not_found_sst_file_numbers_),
+  PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamResponse, _impl_.filter_partition_blocks_),
 };
 static const ::_pbi::MigrationSchema schemas[] PROTOBUF_SECTION_VARIABLE(protodesc_cold) = {
   { 0, -1, -1, sizeof(::bloomcheck::KeyRequest)},
   { 8, -1, -1, sizeof(::bloomcheck::BatchRequest)},
-  { 15, -1, -1, sizeof(::bloomcheck::KeyResponse)},
-  { 26, -1, -1, sizeof(::bloomcheck::BatchResponse)},
-  { 33, -1, -1, sizeof(::bloomcheck::NoopRequest)},
-  { 39, 46, -1, sizeof(::bloomcheck::NoopResponse)},
-  { 47, -1, -1, sizeof(::bloomcheck::StreamRequest)},
-  { 56, -1, -1, sizeof(::bloomcheck::StreamResponse)},
+  { 15, -1, -1, sizeof(::bloomcheck::FilterPartitionBlock)},
+  { 24, -1, -1, sizeof(::bloomcheck::KeyResponse)},
+  { 36, -1, -1, sizeof(::bloomcheck::BatchResponse)},
+  { 43, -1, -1, sizeof(::bloomcheck::NoopRequest)},
+  { 49, 56, -1, sizeof(::bloomcheck::NoopResponse)},
+  { 57, -1, -1, sizeof(::bloomcheck::StreamRequest)},
+  { 66, -1, -1, sizeof(::bloomcheck::StreamResponse)},
 };
 
 static const ::_pb::Message* const file_default_instances[] = {
   &::bloomcheck::_KeyRequest_default_instance_._instance,
   &::bloomcheck::_BatchRequest_default_instance_._instance,
+  &::bloomcheck::_FilterPartitionBlock_default_instance_._instance,
   &::bloomcheck::_KeyResponse_default_instance_._instance,
   &::bloomcheck::_BatchResponse_default_instance_._instance,
   &::bloomcheck::_NoopRequest_default_instance_._instance,
@@ -237,31 +267,37 @@ const char descriptor_table_protodef_bloomcheck_2eproto[] PROTOBUF_SECTION_VARIA
   "\n\020bloomcheck.proto\022\nbloomcheck\"8\n\nKeyReq"
   "uest\022\020\n\010user_key\030\001 \001(\014\022\030\n\020sst_file_numbe"
   "rs\030\002 \003(\004\"4\n\014BatchRequest\022$\n\004reqs\030\001 \003(\0132\026"
-  ".bloomcheck.KeyRequest\"\235\001\n\013KeyResponse\022\""
-  "\n\032may_match_sst_file_numbers\030\001 \003(\004\022\020\n\010co"
-  "mplete\030\002 \001(\010\022\025\n\rchecked_count\030\003 \001(\004\022\030\n\020t"
-  "otal_candidates\030\004 \001(\004\022\'\n\037path_not_found_"
-  "sst_file_numbers\030\005 \003(\004\"7\n\rBatchResponse\022"
-  "&\n\005resps\030\001 \003(\0132\027.bloomcheck.KeyResponse\""
-  "\r\n\013NoopRequest\":\n\014NoopResponse\022\031\n\014server"
-  "_ts_ns\030\001 \001(\004H\000\210\001\001B\017\n\r_server_ts_ns\"O\n\rSt"
-  "reamRequest\022\022\n\nrequest_id\030\001 \001(\004\022\020\n\010user_"
-  "key\030\002 \001(\014\022\030\n\020sst_file_numbers\030\003 \003(\004\"q\n\016S"
-  "treamResponse\022\022\n\nrequest_id\030\001 \001(\004\022\"\n\032may"
-  "_match_sst_file_numbers\030\002 \003(\004\022\'\n\037path_no"
-  "t_found_sst_file_numbers\030\003 \003(\0042\324\001\n\nBloom"
-  "Check\022<\n\005Check\022\030.bloomcheck.BatchRequest"
-  "\032\031.bloomcheck.BatchResponse\0229\n\004Noop\022\027.bl"
-  "oomcheck.NoopRequest\032\030.bloomcheck.NoopRe"
-  "sponse\022M\n\020CheckBatchStream\022\031.bloomcheck."
-  "StreamRequest\032\032.bloomcheck.StreamRespons"
-  "e(\0010\001b\006proto3"
+  ".bloomcheck.KeyRequest\"s\n\024FilterPartitio"
+  "nBlock\022\027\n\017sst_file_number\030\001 \001(\004\022\037\n\027filte"
+  "r_partition_offset\030\002 \001(\004\022!\n\031filter_parti"
+  "tion_contents\030\003 \001(\014\"\340\001\n\013KeyResponse\022\"\n\032m"
+  "ay_match_sst_file_numbers\030\001 \003(\004\022\020\n\010compl"
+  "ete\030\002 \001(\010\022\025\n\rchecked_count\030\003 \001(\004\022\030\n\020tota"
+  "l_candidates\030\004 \001(\004\022\'\n\037path_not_found_sst"
+  "_file_numbers\030\005 \003(\004\022A\n\027filter_partition_"
+  "blocks\030\006 \003(\0132 .bloomcheck.FilterPartitio"
+  "nBlock\"7\n\rBatchResponse\022&\n\005resps\030\001 \003(\0132\027"
+  ".bloomcheck.KeyResponse\"\r\n\013NoopRequest\":"
+  "\n\014NoopResponse\022\031\n\014server_ts_ns\030\001 \001(\004H\000\210\001"
+  "\001B\017\n\r_server_ts_ns\"O\n\rStreamRequest\022\022\n\nr"
+  "equest_id\030\001 \001(\004\022\020\n\010user_key\030\002 \001(\014\022\030\n\020sst"
+  "_file_numbers\030\003 \003(\004\"\264\001\n\016StreamResponse\022\022"
+  "\n\nrequest_id\030\001 \001(\004\022\"\n\032may_match_sst_file"
+  "_numbers\030\002 \003(\004\022\'\n\037path_not_found_sst_fil"
+  "e_numbers\030\003 \003(\004\022A\n\027filter_partition_bloc"
+  "ks\030\004 \003(\0132 .bloomcheck.FilterPartitionBlo"
+  "ck2\324\001\n\nBloomCheck\022<\n\005Check\022\030.bloomcheck."
+  "BatchRequest\032\031.bloomcheck.BatchResponse\022"
+  "9\n\004Noop\022\027.bloomcheck.NoopRequest\032\030.bloom"
+  "check.NoopResponse\022M\n\020CheckBatchStream\022\031"
+  ".bloomcheck.StreamRequest\032\032.bloomcheck.S"
+  "treamResponse(\0010\001b\006proto3"
   ;
 static ::_pbi::once_flag descriptor_table_bloomcheck_2eproto_once;
 const ::_pbi::DescriptorTable descriptor_table_bloomcheck_2eproto = {
-    false, false, 853, descriptor_table_protodef_bloomcheck_2eproto,
+    false, false, 1105, descriptor_table_protodef_bloomcheck_2eproto,
     "bloomcheck.proto",
-    &descriptor_table_bloomcheck_2eproto_once, nullptr, 0, 8,
+    &descriptor_table_bloomcheck_2eproto_once, nullptr, 0, 9,
     schemas, file_default_instances, TableStruct_bloomcheck_2eproto::offsets,
     file_level_metadata_bloomcheck_2eproto, file_level_enum_descriptors_bloomcheck_2eproto,
     file_level_service_descriptors_bloomcheck_2eproto,
@@ -301,7 +337,7 @@ KeyRequest::KeyRequest(const KeyRequest& from)
     _impl_.user_key_.Set("", GetArenaForAllocation());
   #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
   if (!from._internal_user_key().empty()) {
-    _this->_impl_.user_key_.Set(from._internal_user_key(), 
+    _this->_impl_.user_key_.Set(from._internal_user_key(),
       _this->GetArenaForAllocation());
   }
   // @@protoc_insertion_point(copy_constructor:bloomcheck.KeyRequest)
@@ -701,6 +737,264 @@ void BatchRequest::InternalSwap(BatchRequest* other) {
 
 // ===================================================================
 
+class FilterPartitionBlock::_Internal {
+ public:
+};
+
+FilterPartitionBlock::FilterPartitionBlock(::PROTOBUF_NAMESPACE_ID::Arena* arena,
+                         bool is_message_owned)
+  : ::PROTOBUF_NAMESPACE_ID::Message(arena, is_message_owned) {
+  SharedCtor(arena, is_message_owned);
+  // @@protoc_insertion_point(arena_constructor:bloomcheck.FilterPartitionBlock)
+}
+FilterPartitionBlock::FilterPartitionBlock(const FilterPartitionBlock& from)
+  : ::PROTOBUF_NAMESPACE_ID::Message() {
+  FilterPartitionBlock* const _this = this; (void)_this;
+  new (&_impl_) Impl_{
+      decltype(_impl_.filter_partition_contents_){}
+    , decltype(_impl_.sst_file_number_){}
+    , decltype(_impl_.filter_partition_offset_){}
+    , /*decltype(_impl_._cached_size_)*/{}};
+
+  _internal_metadata_.MergeFrom<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(from._internal_metadata_);
+  _impl_.filter_partition_contents_.InitDefault();
+  #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
+    _impl_.filter_partition_contents_.Set("", GetArenaForAllocation());
+  #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  if (!from._internal_filter_partition_contents().empty()) {
+    _this->_impl_.filter_partition_contents_.Set(from._internal_filter_partition_contents(),
+      _this->GetArenaForAllocation());
+  }
+  ::memcpy(&_impl_.sst_file_number_, &from._impl_.sst_file_number_,
+    static_cast<size_t>(reinterpret_cast<char*>(&_impl_.filter_partition_offset_) -
+    reinterpret_cast<char*>(&_impl_.sst_file_number_)) + sizeof(_impl_.filter_partition_offset_));
+  // @@protoc_insertion_point(copy_constructor:bloomcheck.FilterPartitionBlock)
+}
+
+inline void FilterPartitionBlock::SharedCtor(
+    ::_pb::Arena* arena, bool is_message_owned) {
+  (void)arena;
+  (void)is_message_owned;
+  new (&_impl_) Impl_{
+      decltype(_impl_.filter_partition_contents_){}
+    , decltype(_impl_.sst_file_number_){uint64_t{0u}}
+    , decltype(_impl_.filter_partition_offset_){uint64_t{0u}}
+    , /*decltype(_impl_._cached_size_)*/{}
+  };
+  _impl_.filter_partition_contents_.InitDefault();
+  #ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
+    _impl_.filter_partition_contents_.Set("", GetArenaForAllocation());
+  #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
+}
+
+FilterPartitionBlock::~FilterPartitionBlock() {
+  // @@protoc_insertion_point(destructor:bloomcheck.FilterPartitionBlock)
+  if (auto *arena = _internal_metadata_.DeleteReturnArena<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>()) {
+  (void)arena;
+    return;
+  }
+  SharedDtor();
+}
+
+inline void FilterPartitionBlock::SharedDtor() {
+  GOOGLE_DCHECK(GetArenaForAllocation() == nullptr);
+  _impl_.filter_partition_contents_.Destroy();
+}
+
+void FilterPartitionBlock::SetCachedSize(int size) const {
+  _impl_._cached_size_.Set(size);
+}
+
+void FilterPartitionBlock::Clear() {
+// @@protoc_insertion_point(message_clear_start:bloomcheck.FilterPartitionBlock)
+  uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  _impl_.filter_partition_contents_.ClearToEmpty();
+  ::memset(&_impl_.sst_file_number_, 0, static_cast<size_t>(
+      reinterpret_cast<char*>(&_impl_.filter_partition_offset_) -
+      reinterpret_cast<char*>(&_impl_.sst_file_number_)) + sizeof(_impl_.filter_partition_offset_));
+  _internal_metadata_.Clear<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>();
+}
+
+const char* FilterPartitionBlock::_InternalParse(const char* ptr, ::_pbi::ParseContext* ctx) {
+#define CHK_(x) if (PROTOBUF_PREDICT_FALSE(!(x))) goto failure
+  while (!ctx->Done(&ptr)) {
+    uint32_t tag;
+    ptr = ::_pbi::ReadTag(ptr, &tag);
+    switch (tag >> 3) {
+      // uint64 sst_file_number = 1;
+      case 1:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 8)) {
+          _impl_.sst_file_number_ = ::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr);
+          CHK_(ptr);
+        } else
+          goto handle_unusual;
+        continue;
+      // uint64 filter_partition_offset = 2;
+      case 2:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 16)) {
+          _impl_.filter_partition_offset_ = ::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr);
+          CHK_(ptr);
+        } else
+          goto handle_unusual;
+        continue;
+      // bytes filter_partition_contents = 3;
+      case 3:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 26)) {
+          auto str = _internal_mutable_filter_partition_contents();
+          ptr = ::_pbi::InlineGreedyStringParser(str, ptr, ctx);
+          CHK_(ptr);
+        } else
+          goto handle_unusual;
+        continue;
+      default:
+        goto handle_unusual;
+    }  // switch
+  handle_unusual:
+    if ((tag == 0) || ((tag & 7) == 4)) {
+      CHK_(ptr);
+      ctx->SetLastTag(tag);
+      goto message_done;
+    }
+    ptr = UnknownFieldParse(
+        tag,
+        _internal_metadata_.mutable_unknown_fields<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(),
+        ptr, ctx);
+    CHK_(ptr != nullptr);
+  }  // while
+message_done:
+  return ptr;
+failure:
+  ptr = nullptr;
+  goto message_done;
+#undef CHK_
+}
+
+uint8_t* FilterPartitionBlock::_InternalSerialize(
+    uint8_t* target, ::PROTOBUF_NAMESPACE_ID::io::EpsCopyOutputStream* stream) const {
+  // @@protoc_insertion_point(serialize_to_array_start:bloomcheck.FilterPartitionBlock)
+  uint32_t cached_has_bits = 0;
+  (void) cached_has_bits;
+
+  // uint64 sst_file_number = 1;
+  if (this->_internal_sst_file_number() != 0) {
+    target = stream->EnsureSpace(target);
+    target = ::_pbi::WireFormatLite::WriteUInt64ToArray(1, this->_internal_sst_file_number(), target);
+  }
+
+  // uint64 filter_partition_offset = 2;
+  if (this->_internal_filter_partition_offset() != 0) {
+    target = stream->EnsureSpace(target);
+    target = ::_pbi::WireFormatLite::WriteUInt64ToArray(2, this->_internal_filter_partition_offset(), target);
+  }
+
+  // bytes filter_partition_contents = 3;
+  if (!this->_internal_filter_partition_contents().empty()) {
+    target = stream->WriteBytesMaybeAliased(
+        3, this->_internal_filter_partition_contents(), target);
+  }
+
+  if (PROTOBUF_PREDICT_FALSE(_internal_metadata_.have_unknown_fields())) {
+    target = ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+        _internal_metadata_.unknown_fields<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(::PROTOBUF_NAMESPACE_ID::UnknownFieldSet::default_instance), target, stream);
+  }
+  // @@protoc_insertion_point(serialize_to_array_end:bloomcheck.FilterPartitionBlock)
+  return target;
+}
+
+size_t FilterPartitionBlock::ByteSizeLong() const {
+// @@protoc_insertion_point(message_byte_size_start:bloomcheck.FilterPartitionBlock)
+  size_t total_size = 0;
+
+  uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  // bytes filter_partition_contents = 3;
+  if (!this->_internal_filter_partition_contents().empty()) {
+    total_size += 1 +
+      ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::BytesSize(
+        this->_internal_filter_partition_contents());
+  }
+
+  // uint64 sst_file_number = 1;
+  if (this->_internal_sst_file_number() != 0) {
+    total_size += ::_pbi::WireFormatLite::UInt64SizePlusOne(this->_internal_sst_file_number());
+  }
+
+  // uint64 filter_partition_offset = 2;
+  if (this->_internal_filter_partition_offset() != 0) {
+    total_size += ::_pbi::WireFormatLite::UInt64SizePlusOne(this->_internal_filter_partition_offset());
+  }
+
+  return MaybeComputeUnknownFieldsSize(total_size, &_impl_._cached_size_);
+}
+
+const ::PROTOBUF_NAMESPACE_ID::Message::ClassData FilterPartitionBlock::_class_data_ = {
+    ::PROTOBUF_NAMESPACE_ID::Message::CopyWithSourceCheck,
+    FilterPartitionBlock::MergeImpl
+};
+const ::PROTOBUF_NAMESPACE_ID::Message::ClassData*FilterPartitionBlock::GetClassData() const { return &_class_data_; }
+
+
+void FilterPartitionBlock::MergeImpl(::PROTOBUF_NAMESPACE_ID::Message& to_msg, const ::PROTOBUF_NAMESPACE_ID::Message& from_msg) {
+  auto* const _this = static_cast<FilterPartitionBlock*>(&to_msg);
+  auto& from = static_cast<const FilterPartitionBlock&>(from_msg);
+  // @@protoc_insertion_point(class_specific_merge_from_start:bloomcheck.FilterPartitionBlock)
+  GOOGLE_DCHECK_NE(&from, _this);
+  uint32_t cached_has_bits = 0;
+  (void) cached_has_bits;
+
+  if (!from._internal_filter_partition_contents().empty()) {
+    _this->_internal_set_filter_partition_contents(from._internal_filter_partition_contents());
+  }
+  if (from._internal_sst_file_number() != 0) {
+    _this->_internal_set_sst_file_number(from._internal_sst_file_number());
+  }
+  if (from._internal_filter_partition_offset() != 0) {
+    _this->_internal_set_filter_partition_offset(from._internal_filter_partition_offset());
+  }
+  _this->_internal_metadata_.MergeFrom<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(from._internal_metadata_);
+}
+
+void FilterPartitionBlock::CopyFrom(const FilterPartitionBlock& from) {
+// @@protoc_insertion_point(class_specific_copy_from_start:bloomcheck.FilterPartitionBlock)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+bool FilterPartitionBlock::IsInitialized() const {
+  return true;
+}
+
+void FilterPartitionBlock::InternalSwap(FilterPartitionBlock* other) {
+  using std::swap;
+  auto* lhs_arena = GetArenaForAllocation();
+  auto* rhs_arena = other->GetArenaForAllocation();
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr::InternalSwap(
+      &_impl_.filter_partition_contents_, lhs_arena,
+      &other->_impl_.filter_partition_contents_, rhs_arena
+  );
+  ::PROTOBUF_NAMESPACE_ID::internal::memswap<
+      PROTOBUF_FIELD_OFFSET(FilterPartitionBlock, _impl_.filter_partition_offset_)
+      + sizeof(FilterPartitionBlock::_impl_.filter_partition_offset_)
+      - PROTOBUF_FIELD_OFFSET(FilterPartitionBlock, _impl_.sst_file_number_)>(
+          reinterpret_cast<char*>(&_impl_.sst_file_number_),
+          reinterpret_cast<char*>(&other->_impl_.sst_file_number_));
+}
+
+::PROTOBUF_NAMESPACE_ID::Metadata FilterPartitionBlock::GetMetadata() const {
+  return ::_pbi::AssignDescriptors(
+      &descriptor_table_bloomcheck_2eproto_getter, &descriptor_table_bloomcheck_2eproto_once,
+      file_level_metadata_bloomcheck_2eproto[2]);
+}
+
+// ===================================================================
+
 class KeyResponse::_Internal {
  public:
 };
@@ -719,6 +1013,7 @@ KeyResponse::KeyResponse(const KeyResponse& from)
     , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
     , decltype(_impl_.path_not_found_sst_file_numbers_){from._impl_.path_not_found_sst_file_numbers_}
     , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
+    , decltype(_impl_.filter_partition_blocks_){from._impl_.filter_partition_blocks_}
     , decltype(_impl_.checked_count_){}
     , decltype(_impl_.total_candidates_){}
     , decltype(_impl_.complete_){}
@@ -740,6 +1035,7 @@ inline void KeyResponse::SharedCtor(
     , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
     , decltype(_impl_.path_not_found_sst_file_numbers_){arena}
     , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
+    , decltype(_impl_.filter_partition_blocks_){arena}
     , decltype(_impl_.checked_count_){uint64_t{0u}}
     , decltype(_impl_.total_candidates_){uint64_t{0u}}
     , decltype(_impl_.complete_){false}
@@ -760,6 +1056,7 @@ inline void KeyResponse::SharedDtor() {
   GOOGLE_DCHECK(GetArenaForAllocation() == nullptr);
   _impl_.may_match_sst_file_numbers_.~RepeatedField();
   _impl_.path_not_found_sst_file_numbers_.~RepeatedField();
+  _impl_.filter_partition_blocks_.~RepeatedPtrField();
 }
 
 void KeyResponse::SetCachedSize(int size) const {
@@ -774,6 +1071,7 @@ void KeyResponse::Clear() {
 
   _impl_.may_match_sst_file_numbers_.Clear();
   _impl_.path_not_found_sst_file_numbers_.Clear();
+  _impl_.filter_partition_blocks_.Clear();
   ::memset(&_impl_.checked_count_, 0, static_cast<size_t>(
       reinterpret_cast<char*>(&_impl_.complete_) -
       reinterpret_cast<char*>(&_impl_.checked_count_)) + sizeof(_impl_.complete_));
@@ -829,6 +1127,19 @@ const char* KeyResponse::_InternalParse(const char* ptr, ::_pbi::ParseContext* c
         } else if (static_cast<uint8_t>(tag) == 40) {
           _internal_add_path_not_found_sst_file_numbers(::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr));
           CHK_(ptr);
+        } else
+          goto handle_unusual;
+        continue;
+      // repeated .bloomcheck.FilterPartitionBlock filter_partition_blocks = 6;
+      case 6:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 50)) {
+          ptr -= 1;
+          do {
+            ptr += 1;
+            ptr = ctx->ParseMessage(_internal_add_filter_partition_blocks(), ptr);
+            CHK_(ptr);
+            if (!ctx->DataAvailable(ptr)) break;
+          } while (::PROTOBUF_NAMESPACE_ID::internal::ExpectTag<50>(ptr));
         } else
           goto handle_unusual;
         continue;
@@ -897,6 +1208,14 @@ uint8_t* KeyResponse::_InternalSerialize(
     }
   }
 
+  // repeated .bloomcheck.FilterPartitionBlock filter_partition_blocks = 6;
+  for (unsigned i = 0,
+      n = static_cast<unsigned>(this->_internal_filter_partition_blocks_size()); i < n; i++) {
+    const auto& repfield = this->_internal_filter_partition_blocks(i);
+    target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::
+        InternalWriteMessage(6, repfield, repfield.GetCachedSize(), target, stream);
+  }
+
   if (PROTOBUF_PREDICT_FALSE(_internal_metadata_.have_unknown_fields())) {
     target = ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
         _internal_metadata_.unknown_fields<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(::PROTOBUF_NAMESPACE_ID::UnknownFieldSet::default_instance), target, stream);
@@ -941,6 +1260,13 @@ size_t KeyResponse::ByteSizeLong() const {
     total_size += data_size;
   }
 
+  // repeated .bloomcheck.FilterPartitionBlock filter_partition_blocks = 6;
+  total_size += 1UL * this->_internal_filter_partition_blocks_size();
+  for (const auto& msg : this->_impl_.filter_partition_blocks_) {
+    total_size +=
+      ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::MessageSize(msg);
+  }
+
   // uint64 checked_count = 3;
   if (this->_internal_checked_count() != 0) {
     total_size += ::_pbi::WireFormatLite::UInt64SizePlusOne(this->_internal_checked_count());
@@ -976,6 +1302,7 @@ void KeyResponse::MergeImpl(::PROTOBUF_NAMESPACE_ID::Message& to_msg, const ::PR
 
   _this->_impl_.may_match_sst_file_numbers_.MergeFrom(from._impl_.may_match_sst_file_numbers_);
   _this->_impl_.path_not_found_sst_file_numbers_.MergeFrom(from._impl_.path_not_found_sst_file_numbers_);
+  _this->_impl_.filter_partition_blocks_.MergeFrom(from._impl_.filter_partition_blocks_);
   if (from._internal_checked_count() != 0) {
     _this->_internal_set_checked_count(from._internal_checked_count());
   }
@@ -1004,6 +1331,7 @@ void KeyResponse::InternalSwap(KeyResponse* other) {
   _internal_metadata_.InternalSwap(&other->_internal_metadata_);
   _impl_.may_match_sst_file_numbers_.InternalSwap(&other->_impl_.may_match_sst_file_numbers_);
   _impl_.path_not_found_sst_file_numbers_.InternalSwap(&other->_impl_.path_not_found_sst_file_numbers_);
+  _impl_.filter_partition_blocks_.InternalSwap(&other->_impl_.filter_partition_blocks_);
   ::PROTOBUF_NAMESPACE_ID::internal::memswap<
       PROTOBUF_FIELD_OFFSET(KeyResponse, _impl_.complete_)
       + sizeof(KeyResponse::_impl_.complete_)
@@ -1015,7 +1343,7 @@ void KeyResponse::InternalSwap(KeyResponse* other) {
 ::PROTOBUF_NAMESPACE_ID::Metadata KeyResponse::GetMetadata() const {
   return ::_pbi::AssignDescriptors(
       &descriptor_table_bloomcheck_2eproto_getter, &descriptor_table_bloomcheck_2eproto_once,
-      file_level_metadata_bloomcheck_2eproto[2]);
+      file_level_metadata_bloomcheck_2eproto[3]);
 }
 
 // ===================================================================
@@ -1200,7 +1528,7 @@ void BatchResponse::InternalSwap(BatchResponse* other) {
 ::PROTOBUF_NAMESPACE_ID::Metadata BatchResponse::GetMetadata() const {
   return ::_pbi::AssignDescriptors(
       &descriptor_table_bloomcheck_2eproto_getter, &descriptor_table_bloomcheck_2eproto_once,
-      file_level_metadata_bloomcheck_2eproto[3]);
+      file_level_metadata_bloomcheck_2eproto[4]);
 }
 
 // ===================================================================
@@ -1240,7 +1568,7 @@ const ::PROTOBUF_NAMESPACE_ID::Message::ClassData*NoopRequest::GetClassData() co
 ::PROTOBUF_NAMESPACE_ID::Metadata NoopRequest::GetMetadata() const {
   return ::_pbi::AssignDescriptors(
       &descriptor_table_bloomcheck_2eproto_getter, &descriptor_table_bloomcheck_2eproto_once,
-      file_level_metadata_bloomcheck_2eproto[4]);
+      file_level_metadata_bloomcheck_2eproto[5]);
 }
 
 // ===================================================================
@@ -1430,7 +1758,7 @@ void NoopResponse::InternalSwap(NoopResponse* other) {
 ::PROTOBUF_NAMESPACE_ID::Metadata NoopResponse::GetMetadata() const {
   return ::_pbi::AssignDescriptors(
       &descriptor_table_bloomcheck_2eproto_getter, &descriptor_table_bloomcheck_2eproto_once,
-      file_level_metadata_bloomcheck_2eproto[5]);
+      file_level_metadata_bloomcheck_2eproto[6]);
 }
 
 // ===================================================================
@@ -1461,7 +1789,7 @@ StreamRequest::StreamRequest(const StreamRequest& from)
     _impl_.user_key_.Set("", GetArenaForAllocation());
   #endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
   if (!from._internal_user_key().empty()) {
-    _this->_impl_.user_key_.Set(from._internal_user_key(), 
+    _this->_impl_.user_key_.Set(from._internal_user_key(),
       _this->GetArenaForAllocation());
   }
   _this->_impl_.request_id_ = from._impl_.request_id_;
@@ -1697,7 +2025,7 @@ void StreamRequest::InternalSwap(StreamRequest* other) {
 ::PROTOBUF_NAMESPACE_ID::Metadata StreamRequest::GetMetadata() const {
   return ::_pbi::AssignDescriptors(
       &descriptor_table_bloomcheck_2eproto_getter, &descriptor_table_bloomcheck_2eproto_once,
-      file_level_metadata_bloomcheck_2eproto[6]);
+      file_level_metadata_bloomcheck_2eproto[7]);
 }
 
 // ===================================================================
@@ -1720,6 +2048,7 @@ StreamResponse::StreamResponse(const StreamResponse& from)
     , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
     , decltype(_impl_.path_not_found_sst_file_numbers_){from._impl_.path_not_found_sst_file_numbers_}
     , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
+    , decltype(_impl_.filter_partition_blocks_){from._impl_.filter_partition_blocks_}
     , decltype(_impl_.request_id_){}
     , /*decltype(_impl_._cached_size_)*/{}};
 
@@ -1737,6 +2066,7 @@ inline void StreamResponse::SharedCtor(
     , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
     , decltype(_impl_.path_not_found_sst_file_numbers_){arena}
     , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
+    , decltype(_impl_.filter_partition_blocks_){arena}
     , decltype(_impl_.request_id_){uint64_t{0u}}
     , /*decltype(_impl_._cached_size_)*/{}
   };
@@ -1755,6 +2085,7 @@ inline void StreamResponse::SharedDtor() {
   GOOGLE_DCHECK(GetArenaForAllocation() == nullptr);
   _impl_.may_match_sst_file_numbers_.~RepeatedField();
   _impl_.path_not_found_sst_file_numbers_.~RepeatedField();
+  _impl_.filter_partition_blocks_.~RepeatedPtrField();
 }
 
 void StreamResponse::SetCachedSize(int size) const {
@@ -1769,6 +2100,7 @@ void StreamResponse::Clear() {
 
   _impl_.may_match_sst_file_numbers_.Clear();
   _impl_.path_not_found_sst_file_numbers_.Clear();
+  _impl_.filter_partition_blocks_.Clear();
   _impl_.request_id_ = uint64_t{0u};
   _internal_metadata_.Clear<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>();
 }
@@ -1806,6 +2138,19 @@ const char* StreamResponse::_InternalParse(const char* ptr, ::_pbi::ParseContext
         } else if (static_cast<uint8_t>(tag) == 24) {
           _internal_add_path_not_found_sst_file_numbers(::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr));
           CHK_(ptr);
+        } else
+          goto handle_unusual;
+        continue;
+      // repeated .bloomcheck.FilterPartitionBlock filter_partition_blocks = 4;
+      case 4:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 34)) {
+          ptr -= 1;
+          do {
+            ptr += 1;
+            ptr = ctx->ParseMessage(_internal_add_filter_partition_blocks(), ptr);
+            CHK_(ptr);
+            if (!ctx->DataAvailable(ptr)) break;
+          } while (::PROTOBUF_NAMESPACE_ID::internal::ExpectTag<34>(ptr));
         } else
           goto handle_unusual;
         continue;
@@ -1862,6 +2207,14 @@ uint8_t* StreamResponse::_InternalSerialize(
     }
   }
 
+  // repeated .bloomcheck.FilterPartitionBlock filter_partition_blocks = 4;
+  for (unsigned i = 0,
+      n = static_cast<unsigned>(this->_internal_filter_partition_blocks_size()); i < n; i++) {
+    const auto& repfield = this->_internal_filter_partition_blocks(i);
+    target = ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::
+        InternalWriteMessage(4, repfield, repfield.GetCachedSize(), target, stream);
+  }
+
   if (PROTOBUF_PREDICT_FALSE(_internal_metadata_.have_unknown_fields())) {
     target = ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
         _internal_metadata_.unknown_fields<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(::PROTOBUF_NAMESPACE_ID::UnknownFieldSet::default_instance), target, stream);
@@ -1906,6 +2259,13 @@ size_t StreamResponse::ByteSizeLong() const {
     total_size += data_size;
   }
 
+  // repeated .bloomcheck.FilterPartitionBlock filter_partition_blocks = 4;
+  total_size += 1UL * this->_internal_filter_partition_blocks_size();
+  for (const auto& msg : this->_impl_.filter_partition_blocks_) {
+    total_size +=
+      ::PROTOBUF_NAMESPACE_ID::internal::WireFormatLite::MessageSize(msg);
+  }
+
   // uint64 request_id = 1;
   if (this->_internal_request_id() != 0) {
     total_size += ::_pbi::WireFormatLite::UInt64SizePlusOne(this->_internal_request_id());
@@ -1931,6 +2291,7 @@ void StreamResponse::MergeImpl(::PROTOBUF_NAMESPACE_ID::Message& to_msg, const :
 
   _this->_impl_.may_match_sst_file_numbers_.MergeFrom(from._impl_.may_match_sst_file_numbers_);
   _this->_impl_.path_not_found_sst_file_numbers_.MergeFrom(from._impl_.path_not_found_sst_file_numbers_);
+  _this->_impl_.filter_partition_blocks_.MergeFrom(from._impl_.filter_partition_blocks_);
   if (from._internal_request_id() != 0) {
     _this->_internal_set_request_id(from._internal_request_id());
   }
@@ -1953,13 +2314,14 @@ void StreamResponse::InternalSwap(StreamResponse* other) {
   _internal_metadata_.InternalSwap(&other->_internal_metadata_);
   _impl_.may_match_sst_file_numbers_.InternalSwap(&other->_impl_.may_match_sst_file_numbers_);
   _impl_.path_not_found_sst_file_numbers_.InternalSwap(&other->_impl_.path_not_found_sst_file_numbers_);
+  _impl_.filter_partition_blocks_.InternalSwap(&other->_impl_.filter_partition_blocks_);
   swap(_impl_.request_id_, other->_impl_.request_id_);
 }
 
 ::PROTOBUF_NAMESPACE_ID::Metadata StreamResponse::GetMetadata() const {
   return ::_pbi::AssignDescriptors(
       &descriptor_table_bloomcheck_2eproto_getter, &descriptor_table_bloomcheck_2eproto_once,
-      file_level_metadata_bloomcheck_2eproto[7]);
+      file_level_metadata_bloomcheck_2eproto[8]);
 }
 
 // @@protoc_insertion_point(namespace_scope)
@@ -1972,6 +2334,10 @@ Arena::CreateMaybeMessage< ::bloomcheck::KeyRequest >(Arena* arena) {
 template<> PROTOBUF_NOINLINE ::bloomcheck::BatchRequest*
 Arena::CreateMaybeMessage< ::bloomcheck::BatchRequest >(Arena* arena) {
   return Arena::CreateMessageInternal< ::bloomcheck::BatchRequest >(arena);
+}
+template<> PROTOBUF_NOINLINE ::bloomcheck::FilterPartitionBlock*
+Arena::CreateMaybeMessage< ::bloomcheck::FilterPartitionBlock >(Arena* arena) {
+  return Arena::CreateMessageInternal< ::bloomcheck::FilterPartitionBlock >(arena);
 }
 template<> PROTOBUF_NOINLINE ::bloomcheck::KeyResponse*
 Arena::CreateMaybeMessage< ::bloomcheck::KeyResponse >(Arena* arena) {

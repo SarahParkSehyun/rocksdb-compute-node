@@ -57,6 +57,12 @@ class FilterBlockReaderCommon : public FilterBlockReader {
   const SliceTransform* table_prefix_extractor() const;
   bool whole_key_filtering() const;
   bool cache_filter_blocks() const;
+  bool HasFilterBlockLoaded() const { return !filter_block_.IsEmpty(); }
+  void GetLoadedFilterBlock(CachableEntry<TBlocklike>* filter_block) const {
+    assert(filter_block != nullptr);
+    assert(!filter_block_.IsEmpty());
+    filter_block->SetUnownedValue(filter_block_.GetValue());
+  }
 
   Status GetOrReadFilterBlock(GetContext* get_context,
                               BlockCacheLookupContext* lookup_context,

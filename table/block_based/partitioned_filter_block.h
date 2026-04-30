@@ -175,6 +175,8 @@ class PartitionedFilterBlockReader
                         const SliceTransform* prefix_extractor,
                         BlockCacheLookupContext* lookup_context,
                         const ReadOptions& read_options) override;
+  bool IsFilterPartitionCached(const Slice& entry,
+                               const ReadOptions& read_options) const;
 
   size_t ApproximateMemoryUsage() const override;
 

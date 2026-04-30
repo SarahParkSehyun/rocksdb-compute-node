@@ -199,6 +199,18 @@ class TableCache {
                             std::shared_ptr<const TableProperties>* properties,
                             const MutableCFOptions& mutable_cf_options,
                             bool no_io = false);
+  Status IsFilterPartitionCached(
+      const ReadOptions& read_options,
+      const InternalKeyComparator& internal_comparator,
+      const FileMetaData& file_meta, const Slice& user_key,
+      const Slice* const_ikey_ptr,
+      const MutableCFOptions& mutable_cf_options, bool* is_cached);
+  Status WarmFilterPartitionCache(
+      const ReadOptions& read_options,
+      const InternalKeyComparator& internal_comparator,
+      const FileMetaData& file_meta, uint64_t filter_partition_offset,
+      const Slice& filter_partition_contents,
+      const MutableCFOptions& mutable_cf_options);
 
   Status ApproximateKeyAnchors(const ReadOptions& ro,
                                const InternalKeyComparator& internal_comparator,

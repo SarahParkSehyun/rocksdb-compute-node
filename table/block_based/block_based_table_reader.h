@@ -185,6 +185,11 @@ class BlockBasedTable : public TableReader {
 
   Status ApproximateKeyAnchors(const ReadOptions& read_options,
                                std::vector<Anchor>& anchors) override;
+  bool IsFilterPartitionCached(const ReadOptions& read_options,
+                               const Slice& key,
+                               const Slice* const_ikey_ptr) const override;
+  Status WarmFilterPartitionCache(uint64_t filter_partition_offset,
+                                  const Slice& filter_partition) override;
 
   bool EraseFromCache(const BlockHandle& handle) const;
 

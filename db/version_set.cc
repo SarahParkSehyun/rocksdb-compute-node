@@ -2760,6 +2760,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   // bloomcheck 결과로 true라고 나온 SST들의 file number만 모아두려는 용도
   // unique_ptr인 이유는 bloomcheck 쓰는 경우에만 생성하려고
   std::unique_ptr<std::unordered_set<uint64_t>> bloomcheck_may_match_files;
+  std::unique_ptr<std::unordered_set<uint64_t>> local_filter_cached_files;
   // 아래 조건을 만족하면 bloomcheck 프리체크가 켜졌다는 플래그
   bool bloomcheck_enabled = false;
   // RPC가 성공하고 응답이 정상적으로 수신되었는지 명확히 표현
@@ -2867,19 +2868,42 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                         &storage_info_.file_indexer_, user_comparator(),
                         internal_comparator());
 
-    // 후보 파일 번호만 수집 (중복 제거)
-    std::unordered_set<uint64_t> candidate_file_numbers;
+    std::unordered_map<uint64_t, const FileMetaData*> candidate_file_meta_by_number;
+    std::unordered_set<uint64_t> candidate_file_numbers_for_rpc;
 
     // fp_probe.GetNextFile()로 Get이 방문할 다음 SST 후보를 하나 가져옴
     FdWithKeyRange* f_probe = fp_probe.GetNextFile();
     while (f_probe != nullptr) {
       uint64_t file_number = f_probe->file_metadata->fd.GetNumber();
-      candidate_file_numbers.insert(file_number);
+      candidate_file_meta_by_number[file_number] = f_probe->file_metadata;
+      bool filter_partition_cached = false;
+      Status cache_status = table_cache_->IsFilterPartitionCached(
+          read_options, *internal_comparator(), *f_probe->file_metadata,
+          user_key, &ikey, mutable_cf_options_, &filter_partition_cached);
+      if (cache_status.ok() && filter_partition_cached) {
+        if (!local_filter_cached_files) {
+          local_filter_cached_files =
+              std::make_unique<std::unordered_set<uint64_t>>();
+        }
+        local_filter_cached_files->insert(file_number);
+      } else {
+        candidate_file_numbers_for_rpc.insert(file_number);
+      }
       f_probe = fp_probe.GetNextFile();
     }
 
+    if (info_log_ != nullptr) {
+      ROCKS_LOG_INFO(
+          info_log_,
+          "[BloomCheckRPCDispatch] local_filter_cached=%zu rpc_candidates=%zu",
+          local_filter_cached_files != nullptr
+              ? local_filter_cached_files->size()
+              : static_cast<size_t>(0),
+          candidate_file_numbers_for_rpc.size());
+    }
+
     // 단일 키 gRPC 호출
-    if (!candidate_file_numbers.empty()) {
+    if (!candidate_file_numbers_for_rpc.empty()) {
       std::string user_key_str = user_key.ToString();
 
       // Initialize bloomcheck_may_match_files if not already done
@@ -2891,7 +2915,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       bloomcheck::BatchRequest request;
       bloomcheck::KeyRequest* key_req = request.add_reqs();
       key_req->set_user_key(user_key_str);
-      for (uint64_t file_number : candidate_file_numbers) {
+      for (uint64_t file_number : candidate_file_numbers_for_rpc) {
         key_req->add_sst_file_numbers(file_number);
       }
       // const size_t request_bytes = static_cast<size_t>(request.ByteSizeLong());
@@ -2913,9 +2937,24 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         for (int j = 0; j < key_resp.may_match_sst_file_numbers_size(); ++j) {
           bloomcheck_may_match_files->insert(key_resp.may_match_sst_file_numbers(j));
         }
+        for (int j = 0; j < key_resp.filter_partition_blocks_size(); ++j) {
+          const auto& partition_block = key_resp.filter_partition_blocks(j);
+          auto meta_iter = candidate_file_meta_by_number.find(
+              partition_block.sst_file_number());
+          if (meta_iter == candidate_file_meta_by_number.end()) {
+            continue;
+          }
+
+          Slice partition_contents(partition_block.filter_partition_contents());
+          Status warm_status = table_cache_->WarmFilterPartitionCache(
+              read_options, *internal_comparator(), *meta_iter->second,
+              partition_block.filter_partition_offset(), partition_contents,
+              mutable_cf_options_);
+          IGNORE_STATUS_IF_ERROR(warm_status);
+        }
       } else {
         // On error, mark all as may_match (safe default)
-        for (uint64_t file_number : candidate_file_numbers) {
+        for (uint64_t file_number : candidate_file_numbers_for_rpc) {
           bloomcheck_may_match_files->insert(file_number);
         }
       }
@@ -2979,8 +3018,14 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
 
     uint64_t file_number = f->file_metadata->fd.GetNumber();
 
+    bool use_local_filter_cache =
+        local_filter_cached_files != nullptr &&
+        local_filter_cached_files->find(file_number) !=
+            local_filter_cached_files->end();
+
     // BloomCheck 필터링: may_match=false인 파일은 스킵
-    if (bloomcheck_enabled && bloomcheck_may_match_files != nullptr) {
+    if (bloomcheck_enabled && !use_local_filter_cache &&
+        bloomcheck_may_match_files != nullptr) {
       if (bloomcheck_may_match_files->find(file_number) ==
           bloomcheck_may_match_files->end()) {
         // may_match=false인 파일은 스킵하고 다음 파일로
@@ -3001,7 +3046,8 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     // 2. remote bloomcheck가 성공했고 이 SST가 may_match=true인 경우
     //    (이 지점까지 왔다는 건 find(file_number) != end() 이므로 may_match=true)
     bool skip_filters_remote = false;
-    if (bloomcheck_enabled && bloomcheck_ok && bloomcheck_may_match_files != nullptr) {
+    if (bloomcheck_enabled && !use_local_filter_cache && bloomcheck_ok &&
+        bloomcheck_may_match_files != nullptr) {
       // kBlockCacheTier 모드는 no-IO semantics가 중요하므로 remote 스킵 적용 금지
       if (read_options.read_tier != kBlockCacheTier) {
         skip_filters_remote = true;
