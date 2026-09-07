@@ -1432,9 +1432,14 @@ class BloomCheckServiceClient {
     // Set thread name for debugging/monitoring
     pthread_setname_np(pthread_self(), "bloom_poller");
 #ifdef __linux__
-    // Pin CQ pollers to fixed cores in round-robin: 25, 27, 29, 31.
-    static constexpr int kPollerPinnedCpus[4] = {25, 27, 29, 31};
-    const int cpu = kPollerPinnedCpus[cq_idx % 4];
+    // Pin CQ pollers to fixed odd cores, mapped back-to-front in round-robin:
+    // cq_idx 0 -> 31, 1 -> 29, 2 -> 27, ... wrapping after 16 channels.
+    static constexpr int kPollerPinnedCpus[16] = {1,  3,  5,  7,  9,  11, 13, 15,
+                                                   17, 19, 21, 23, 25, 27, 29, 31};
+    static constexpr int kNumPinnedCpus =
+        sizeof(kPollerPinnedCpus) / sizeof(kPollerPinnedCpus[0]);
+    const int cpu =
+        kPollerPinnedCpus[kNumPinnedCpus - 1 - (cq_idx % kNumPinnedCpus)];
     if (cpu >= 0 && cpu < CPU_SETSIZE) {
       cpu_set_t cpuset;
       CPU_ZERO(&cpuset);
