@@ -2765,6 +2765,12 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   bool bloomcheck_enabled = false;
   // RPC가 성공하고 응답이 정상적으로 수신되었는지 명확히 표현
   bool bloomcheck_ok = false;
+  // 비동기로 보낸 bloomcheck RPC. 결과가 필요해지는 시점에만 Wait하고,
+  // 그 전에 Get이 끝나면 소멸자에서 cancel됨.
+  std::unique_ptr<BloomCheckServiceClient::PendingCheck> pending_bloomcheck;
+  // RPC로 보낸 SST file number (cached filter가 없는 파일들)
+  std::unique_ptr<std::unordered_set<uint64_t>> rpc_candidate_files;
+  std::unordered_map<uint64_t, const FileMetaData*> rpc_candidate_meta_by_number;
 
   // NOOP_ONLY 모드: 환경변수로 활성화 (측정 전용)
   static bool noop_only_mode = []() {
@@ -2902,100 +2908,20 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           candidate_file_numbers_for_rpc.size());
     }
 
-    // 단일 키 gRPC 호출
+    // 단일 키 gRPC 호출: 비동기로 보내기만 하고 여기서 기다리지 않음.
+    // 결과는 아래 레벨 순서 탐색에서 RPC 후보 파일에 처음 도달할 때 기다림.
+    // 그 전에 local cached filter로 키를 찾으면 pending_bloomcheck 소멸 시 cancel.
     if (!candidate_file_numbers_for_rpc.empty()) {
-      std::string user_key_str = user_key.ToString();
-
-      // Initialize bloomcheck_may_match_files if not already done
-      if (!bloomcheck_may_match_files) {
-        bloomcheck_may_match_files = std::make_unique<std::unordered_set<uint64_t>>();
-      }
-
-      // Build single-key batch request
       bloomcheck::BatchRequest request;
       bloomcheck::KeyRequest* key_req = request.add_reqs();
-      key_req->set_user_key(user_key_str);
+      key_req->set_user_key(user_key.data(), user_key.size());
       for (uint64_t file_number : candidate_file_numbers_for_rpc) {
         key_req->add_sst_file_numbers(file_number);
       }
-      // const size_t request_bytes = static_cast<size_t>(request.ByteSizeLong());
-
-      // Execute async RPC (blocks on condition_variable, NOT on gRPC polling)
-      bloomcheck::BatchResponse response;
-      size_t channel_idx = 0;
-      // size_t channel_count = client->GetChannelCount();
-      BloomCheckServiceClient::RpcTimingBreakdown rpc_timing;
-      
-      // uint64_t rpc_start_us = storage_info_.clock_->NowMicros();
-      bool check_ok = client->AsyncCheckBatch(request, &response, &channel_idx, &rpc_timing);
-      // uint64_t rpc_us = storage_info_.clock_->NowMicros() - rpc_start_us;
-      (void)rpc_timing;  // Suppress unused variable warning
-
-      // Map response back to may_match_files
-      if (check_ok && response.resps_size() == 1) {
-        const auto& key_resp = response.resps(0);
-        for (int j = 0; j < key_resp.may_match_sst_file_numbers_size(); ++j) {
-          bloomcheck_may_match_files->insert(key_resp.may_match_sst_file_numbers(j));
-        }
-        for (int j = 0; j < key_resp.filter_partition_blocks_size(); ++j) {
-          const auto& partition_block = key_resp.filter_partition_blocks(j);
-          auto meta_iter = candidate_file_meta_by_number.find(
-              partition_block.sst_file_number());
-          if (meta_iter == candidate_file_meta_by_number.end()) {
-            continue;
-          }
-
-          Slice partition_contents(partition_block.filter_partition_contents());
-          Status warm_status = table_cache_->WarmFilterPartitionCache(
-              read_options, *internal_comparator(), *meta_iter->second,
-              partition_block.filter_partition_offset(), partition_contents,
-              mutable_cf_options_);
-          IGNORE_STATUS_IF_ERROR(warm_status);
-        }
-      } else {
-        // On error, mark all as may_match (safe default)
-        for (uint64_t file_number : candidate_file_numbers_for_rpc) {
-          bloomcheck_may_match_files->insert(file_number);
-        }
-      }
-
-      // Logging
-      // if (rpc_log_enabled) {
-      //   static std::atomic<uint64_t> rpc_counter(0);
-      //   uint64_t counter = rpc_counter.fetch_add(1, std::memory_order_relaxed);
-      //   if (rpc_log_sample_rate == 1 || counter % rpc_log_sample_rate == 0) {
-      //     int total_may = check_ok && response.resps_size() > 0
-      //         ? response.resps(0).may_match_sst_file_numbers_size() : 0;
-      //     if (info_log_) {
-      //       ROCKS_LOG_INFO(info_log_,
-      //                      "[BloomCheckRPC] channels=%zu idx=%zu streaming=%d req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d",
-      //                      channel_count, channel_idx,
-      //                      bloomcheck_use_streaming ? 1 : 0,
-      //                      request_bytes,
-      //                      (unsigned long long)rpc_us,
-      //                      (unsigned long long)rpc_timing.acquire_wait_us,
-      //                      (unsigned long long)rpc_timing.submit_prep_us,
-      //                      (unsigned long long)rpc_timing.wait_completion_us,
-      //                      (unsigned long long)rpc_timing.wake_up_us,
-      //                      (unsigned long long)rpc_timing.response_parse_us,
-      //                      check_ok ? 1 : 0, total_may);
-      //     } else {
-      //       fprintf(stderr, "[BloomCheckRPC] channels=%zu idx=%zu streaming=%d req_bytes=%zu rpc_us=%llu acq_us=%llu submit_prep_us=%llu wait_completion_us=%llu wake_up_us=%llu parse_us=%llu ok=%d total_may=%d\n",
-      //               channel_count, channel_idx,
-      //               bloomcheck_use_streaming ? 1 : 0,
-      //               request_bytes,
-      //               (unsigned long long)rpc_us,
-      //               (unsigned long long)rpc_timing.acquire_wait_us,
-      //               (unsigned long long)rpc_timing.submit_prep_us,
-      //               (unsigned long long)rpc_timing.wait_completion_us,
-      //               (unsigned long long)rpc_timing.wake_up_us,
-      //               (unsigned long long)rpc_timing.response_parse_us,
-      //               check_ok ? 1 : 0, total_may);
-      //     }
-      //   }
-      // }
-      
-      bloomcheck_ok = check_ok;
+      pending_bloomcheck = client->StartCheckBatch(request);
+      rpc_candidate_files = std::make_unique<std::unordered_set<uint64_t>>(
+          std::move(candidate_file_numbers_for_rpc));
+      rpc_candidate_meta_by_number = std::move(candidate_file_meta_by_number);
     }
     }  // else (normal bloomcheck mode)
   }
@@ -3022,6 +2948,47 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         local_filter_cached_files != nullptr &&
         local_filter_cached_files->find(file_number) !=
             local_filter_cached_files->end();
+
+    // RPC로 보낸 파일에 처음 도달한 시점에만 RPC 결과를 기다림.
+    // 여기까지 오는 동안 앞 레벨의 cached filter는 baseline처럼 순서대로 이미
+    // 연산되었고 키를 못 찾은 상태. 결과를 받은 뒤에도 순서대로 계속 진행하므로
+    // RPC가 반환한 SST 이전 레벨의 cached filter가 먼저 연산되고, 거기서 키를
+    // 찾으면 RPC 결과 SST는 보지 않고 종료함.
+    if (pending_bloomcheck != nullptr && !pending_bloomcheck->IsFinished() &&
+        !use_local_filter_cache && rpc_candidate_files != nullptr &&
+        rpc_candidate_files->count(file_number) > 0) {
+      bloomcheck_may_match_files =
+          std::make_unique<std::unordered_set<uint64_t>>();
+      bloomcheck::BatchResponse response;
+      bool check_ok = pending_bloomcheck->Wait(&response);
+      if (check_ok && response.resps_size() == 1) {
+        const auto& key_resp = response.resps(0);
+        for (int j = 0; j < key_resp.may_match_sst_file_numbers_size(); ++j) {
+          bloomcheck_may_match_files->insert(key_resp.may_match_sst_file_numbers(j));
+        }
+        for (int j = 0; j < key_resp.filter_partition_blocks_size(); ++j) {
+          const auto& partition_block = key_resp.filter_partition_blocks(j);
+          auto meta_iter = rpc_candidate_meta_by_number.find(
+              partition_block.sst_file_number());
+          if (meta_iter == rpc_candidate_meta_by_number.end()) {
+            continue;
+          }
+
+          Slice partition_contents(partition_block.filter_partition_contents());
+          Status warm_status = table_cache_->WarmFilterPartitionCache(
+              read_options, *internal_comparator(), *meta_iter->second,
+              partition_block.filter_partition_offset(), partition_contents,
+              mutable_cf_options_);
+          IGNORE_STATUS_IF_ERROR(warm_status);
+        }
+        bloomcheck_ok = true;
+      } else {
+        // On error, mark all as may_match (safe default)
+        for (uint64_t rpc_file_number : *rpc_candidate_files) {
+          bloomcheck_may_match_files->insert(rpc_file_number);
+        }
+      }
+    }
 
     // BloomCheck 필터링: may_match=false인 파일은 스킵
     if (bloomcheck_enabled && !use_local_filter_cache &&

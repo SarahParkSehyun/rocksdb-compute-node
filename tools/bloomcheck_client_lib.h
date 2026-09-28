@@ -177,6 +177,15 @@ class AsyncBloomCheckCall : public AsyncRPCCallBase {
   grpc::ClientContext context_;
   bloomcheck::BatchRequest request_;
   bloomcheck::BatchResponse response_;
+  // Declared after context_ so it is destroyed first (arena-allocated in the call)
+  std::unique_ptr<grpc::ClientAsyncResponseReader<bloomcheck::BatchResponse>> rpc_;
+  // StartCheckBatch 경로: 호출자가 cancel 후 먼저 떠나도 CQ tag가 올 때까지 살아있게 함
+  std::shared_ptr<AsyncBloomCheckCall> self_;
+
+  void Proceed(bool ok) override {
+    std::shared_ptr<AsyncBloomCheckCall> self = std::move(self_);
+    AsyncRPCCallBase::Proceed(ok);
+  }
 };
 
 // Per-RPC state object for async Noop calls
@@ -1308,7 +1317,164 @@ class BloomCheckServiceClient {
     std::atomic<int64_t>* channel_max_;
     bool active_;
   };
-  
+
+ public:
+  // Handle for a BloomCheck RPC started with StartCheckBatch().
+  // Wait()는 결과가 필요한 시점에만 블록하고, Cancel()(또는 소멸자)은 기다리지
+  // 않고 RPC를 버림. unary는 TryCancel, streaming은 응답을 무시함.
+  class PendingCheck {
+   public:
+    PendingCheck() = default;
+    ~PendingCheck() { Cancel(); }
+
+    PendingCheck(const PendingCheck&) = delete;
+    PendingCheck& operator=(const PendingCheck&) = delete;
+
+    bool IsFinished() const { return finished_; }
+    bool IsCancelled() const { return cancelled_; }
+
+    // Blocks until the RPC completes. Returns false on RPC failure.
+    bool Wait(bloomcheck::BatchResponse* response) {
+      if (finished_) {
+        return false;
+      }
+      bool ok = false;
+      if (unary_) {
+        unary_->Wait();
+        ok = unary_->status_.ok();
+        if (ok) {
+          *response = std::move(unary_->response_);
+        }
+      } else if (stream_) {
+        ok = stream_->Wait();
+        if (ok) {
+          response->Clear();
+          auto* out = response->add_resps();
+          const auto& resp = stream_->resp;
+          for (int i = 0; i < resp.may_match_sst_file_numbers_size(); ++i) {
+            out->add_may_match_sst_file_numbers(
+                resp.may_match_sst_file_numbers(i));
+          }
+          for (int i = 0; i < resp.path_not_found_sst_file_numbers_size(); ++i) {
+            out->add_path_not_found_sst_file_numbers(
+                resp.path_not_found_sst_file_numbers(i));
+          }
+          for (int i = 0; i < resp.filter_partition_blocks_size(); ++i) {
+            *out->add_filter_partition_blocks() =
+                resp.filter_partition_blocks(i);
+          }
+        }
+      }
+      Finish();
+      return ok;
+    }
+
+    // Abandons the RPC without waiting for its result.
+    void Cancel() {
+      if (finished_) {
+        return;
+      }
+      if (unary_) {
+        unary_->context_.TryCancel();
+      }
+      cancelled_ = true;
+      Finish();
+    }
+
+   private:
+    friend class BloomCheckServiceClient;
+
+    void Finish() {
+      finished_ = true;
+      unary_.reset();
+      stream_.reset();
+      if (inflight_guard_) {
+        inflight_guard_.reset();
+        if (completed_total_ != nullptr) {
+          completed_total_->fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      if (semaphore_ != nullptr) {
+        semaphore_->Release();
+        semaphore_ = nullptr;
+      }
+    }
+
+    std::shared_ptr<AsyncBloomCheckCall> unary_;
+    std::shared_ptr<PendingStreamCall> stream_;
+    std::unique_ptr<InflightGuard> inflight_guard_;
+    std::atomic<uint64_t>* completed_total_ = nullptr;
+    Semaphore* semaphore_ = nullptr;
+    bool finished_ = false;
+    bool cancelled_ = false;
+  };
+
+  // Non-blocking version of AsyncCheckBatch: submits the RPC and returns
+  // immediately. The result is consumed via PendingCheck::Wait().
+  std::unique_ptr<PendingCheck> StartCheckBatch(
+      const bloomcheck::BatchRequest& request, size_t* channel_idx = nullptr) {
+    std::unique_ptr<PendingCheck> pending(new PendingCheck());
+    if (inflight_semaphore_) {
+      inflight_semaphore_->Acquire();
+      pending->semaphore_ = inflight_semaphore_.get();
+    }
+
+    size_t stub_idx = 0;
+    bool submitted = false;
+    if (use_streaming_ && request.reqs_size() == 1 && !stream_sessions_.empty()) {
+      const uint64_t h = GetThreadHash();
+      stub_idx = static_cast<size_t>(h % channel_count_);
+      const uint64_t h2 = SplitMix64(h ^ 0x9e3779b97f4a7c15ULL);
+      const size_t stream_idx = static_cast<size_t>(h2 % streams_per_channel_);
+      auto& per_channel = stream_sessions_[stub_idx];
+      if (stream_idx < per_channel.size() && per_channel[stream_idx] != nullptr) {
+        const auto& key_req = request.reqs(0);
+        const uint64_t request_id =
+            next_stream_request_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+        auto call = MakePendingCall();
+        call->req.set_request_id(request_id);
+        call->req.set_user_key(key_req.user_key());
+        for (int i = 0; i < key_req.sst_file_numbers_size(); ++i) {
+          call->req.add_sst_file_numbers(key_req.sst_file_numbers(i));
+        }
+        if (!per_channel[stream_idx]->EnqueueRequest(call)) {
+          // Enqueue 실패: Wait()가 false를 반환하도록 finished 상태로 반환
+          pending->Finish();
+          return pending;
+        }
+        pending->stream_ = std::move(call);
+        submitted = true;
+      }
+    }
+
+    if (!submitted) {
+      stub_idx = GetChannelIndex();
+      const size_t cq_idx = SelectCQIndex(stub_idx);
+      auto call = std::make_shared<AsyncBloomCheckCall>();
+      call->request_ = request;
+      call->channel_idx_ = stub_idx;
+      call->rpc_ = stubs_[stub_idx]->AsyncCheck(&call->context_, call->request_,
+                                                cqs_[cq_idx].get());
+      call->self_ = call;
+      call->rpc_->Finish(&call->response_, &call->status_, call.get());
+      pending->unary_ = std::move(call);
+    }
+
+    if (channel_idx != nullptr) {
+      *channel_idx = stub_idx;
+    }
+    if (stream_stats_enabled_) {
+      pending->inflight_guard_.reset(new InflightGuard(
+          &inflight_now_, inflight_per_channel_[stub_idx].get(), &inflight_max_,
+          inflight_per_channel_max_[stub_idx].get()));
+      pending->completed_total_ = &rpc_completed_total_;
+      rpc_started_total_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return pending;
+  }
+
+ private:
+
   // Stats thread function: 1s마다 출력, read_done은 10초 구간 누적/Δ도 함께 출력
   void StatsThread() {
     pthread_setname_np(pthread_self(), "bloom_stats");
