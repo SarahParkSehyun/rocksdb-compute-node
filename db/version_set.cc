@@ -2698,6 +2698,57 @@ void Version::MultiGetBlob(
   }
 }
 
+namespace {
+// Lazy async bloomcheck 동작 확인용 카운터.
+// BLOOMCHECK_LAZY_STATS=N 이면 bloomcheck Get N번마다 누적값을 stderr에 출력.
+struct LazyBloomCheckStats {
+  std::atomic<uint64_t> gets{0};
+  std::atomic<uint64_t> no_rpc{0};         // 후보 전부 cached -> RPC 안 보냄
+  std::atomic<uint64_t> rpc_sent{0};
+  std::atomic<uint64_t> rpc_waited{0};     // RPC 후보 파일에 도달해 Wait
+  std::atomic<uint64_t> rpc_cancelled{0};  // Wait 전에 끝나서 cancel
+  std::atomic<uint64_t> local_files{0};    // 파일 단위: cached filter로 탐색
+  std::atomic<uint64_t> rpc_files{0};      // 파일 단위: RPC로 보냄
+  std::atomic<uint64_t> hit_local_before_wait{0};
+  std::atomic<uint64_t> hit_local_after_wait{0};
+  std::atomic<uint64_t> hit_rpc_file{0};
+  std::atomic<uint64_t> hit_local_no_rpc{0};
+};
+
+LazyBloomCheckStats& GetLazyBloomCheckStats() {
+  static LazyBloomCheckStats stats;
+  return stats;
+}
+
+uint64_t LazyBloomCheckStatsInterval() {
+  static const uint64_t interval = []() -> uint64_t {
+    const char* env = std::getenv("BLOOMCHECK_LAZY_STATS");
+    return env != nullptr ? std::strtoull(env, nullptr, 10) : 0;
+  }();
+  return interval;
+}
+
+void MaybePrintLazyBloomCheckStats(uint64_t gets) {
+  const uint64_t interval = LazyBloomCheckStatsInterval();
+  if (interval == 0 || gets % interval != 0) {
+    return;
+  }
+  auto& s = GetLazyBloomCheckStats();
+  auto ld = [](const std::atomic<uint64_t>& v) {
+    return static_cast<unsigned long long>(v.load(std::memory_order_relaxed));
+  };
+  fprintf(stderr,
+          "[LazyBloomCheck] gets=%llu no_rpc=%llu rpc_sent=%llu "
+          "rpc_waited=%llu rpc_cancelled=%llu local_files=%llu rpc_files=%llu "
+          "hit_local_no_rpc=%llu hit_local_before_wait=%llu "
+          "hit_local_after_wait=%llu hit_rpc_file=%llu\n",
+          ld(s.gets), ld(s.no_rpc), ld(s.rpc_sent), ld(s.rpc_waited),
+          ld(s.rpc_cancelled), ld(s.local_files), ld(s.rpc_files),
+          ld(s.hit_local_no_rpc), ld(s.hit_local_before_wait),
+          ld(s.hit_local_after_wait), ld(s.hit_rpc_file));
+}
+}  // namespace
+
 void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                   PinnableSlice* value, PinnableWideColumns* columns,
                   std::string* timestamp, Status* status,
@@ -2771,6 +2822,26 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   // RPC로 보낸 SST file number (cached filter가 없는 파일들)
   std::unique_ptr<std::unordered_set<uint64_t>> rpc_candidate_files;
   std::unordered_map<uint64_t, const FileMetaData*> rpc_candidate_meta_by_number;
+  // BLOOMCHECK_LAZY_STATS 카운터. pending_bloomcheck보다 뒤에 선언해서
+  // pending_bloomcheck의 소멸자(cancel)보다 먼저 소멸되게 함.
+  struct LazyStatsGuard {
+    const std::unique_ptr<BloomCheckServiceClient::PendingCheck>& pending;
+    bool active = false;
+    ~LazyStatsGuard() {
+      if (!active) {
+        return;
+      }
+      auto& s = GetLazyBloomCheckStats();
+      if (pending == nullptr) {
+        s.no_rpc.fetch_add(1, std::memory_order_relaxed);
+      } else if (!pending->IsFinished()) {
+        s.rpc_cancelled.fetch_add(1, std::memory_order_relaxed);
+      }
+      MaybePrintLazyBloomCheckStats(
+          s.gets.fetch_add(1, std::memory_order_relaxed) + 1);
+    }
+  } lazy_stats_guard{pending_bloomcheck};
+  bool lazy_stats_enabled = LazyBloomCheckStatsInterval() > 0;
 
   // NOOP_ONLY 모드: 환경변수로 활성화 (측정 전용)
   static bool noop_only_mode = []() {
@@ -2898,7 +2969,12 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       f_probe = fp_probe.GetNextFile();
     }
 
-    if (info_log_ != nullptr) {
+    // Get마다 찍혀서 5분 실행에 LOG가 수 GB 쌓이므로 env로 켤 때만 출력
+    static const bool dispatch_log_enabled = []() {
+      const char* env = std::getenv("BLOOMCHECK_DISPATCH_LOG");
+      return env != nullptr && std::string(env) == "1";
+    }();
+    if (dispatch_log_enabled && info_log_ != nullptr) {
       ROCKS_LOG_INFO(
           info_log_,
           "[BloomCheckRPCDispatch] local_filter_cached=%zu rpc_candidates=%zu",
@@ -2906,6 +2982,19 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
               ? local_filter_cached_files->size()
               : static_cast<size_t>(0),
           candidate_file_numbers_for_rpc.size());
+    }
+    if (lazy_stats_enabled) {
+      auto& s = GetLazyBloomCheckStats();
+      lazy_stats_guard.active = true;
+      s.local_files.fetch_add(local_filter_cached_files != nullptr
+                                  ? local_filter_cached_files->size()
+                                  : 0,
+                              std::memory_order_relaxed);
+      s.rpc_files.fetch_add(candidate_file_numbers_for_rpc.size(),
+                            std::memory_order_relaxed);
+      if (!candidate_file_numbers_for_rpc.empty()) {
+        s.rpc_sent.fetch_add(1, std::memory_order_relaxed);
+      }
     }
 
     // 단일 키 gRPC 호출: 비동기로 보내기만 하고 여기서 기다리지 않음.
@@ -2961,6 +3050,10 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           std::make_unique<std::unordered_set<uint64_t>>();
       bloomcheck::BatchResponse response;
       bool check_ok = pending_bloomcheck->Wait(&response);
+      if (lazy_stats_guard.active) {
+        GetLazyBloomCheckStats().rpc_waited.fetch_add(
+            1, std::memory_order_relaxed);
+      }
       if (check_ok && response.resps_size() == 1) {
         const auto& key_resp = response.resps(0);
         for (int j = 0; j < key_resp.may_match_sst_file_numbers_size(); ++j) {
@@ -3051,6 +3144,20 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         get_context.State() != GetContext::kMerge &&
         db_statistics_ != nullptr) {
       get_context.ReportCounters();
+    }
+    if (lazy_stats_guard.active &&
+        (get_context.State() == GetContext::kFound ||
+         get_context.State() == GetContext::kDeleted)) {
+      auto& s = GetLazyBloomCheckStats();
+      if (!use_local_filter_cache) {
+        s.hit_rpc_file.fetch_add(1, std::memory_order_relaxed);
+      } else if (pending_bloomcheck == nullptr) {
+        s.hit_local_no_rpc.fetch_add(1, std::memory_order_relaxed);
+      } else if (pending_bloomcheck->IsFinished()) {
+        s.hit_local_after_wait.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        s.hit_local_before_wait.fetch_add(1, std::memory_order_relaxed);
+      }
     }
     switch (get_context.State()) {
       case GetContext::kNotFound:

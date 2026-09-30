@@ -3213,6 +3213,14 @@ Status BlockBasedTable::WarmFilterPartitionCache(
   handle.set_offset(filter_partition_offset);
   CacheKey key = GetCacheKey(rep_->base_cache_key, handle);
 
+  // AutoHCC는 같은 key를 dedupe하지 않으므로 이미 있으면 다시 넣지 않음.
+  // (중복 insert가 한 chain에 쌓여 SplitForGrow abort가 났었음)
+  Cache::Handle* existing = block_cache->Lookup(key.AsSlice());
+  if (existing != nullptr) {
+    block_cache->Release(existing);
+    return Status::OK();
+  }
+
   size_t charge = 0;
   Status s = WarmInCache(block_cache, key.AsSlice(), filter_partition,
                          &rep_->create_context, helper,

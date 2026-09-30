@@ -560,15 +560,16 @@ void PartitionedFilterBlockReader::MayMatch(
 
 bool PartitionedFilterBlockReader::IsFilterPartitionCached(
     const Slice& entry, const ReadOptions& read_options) const {
+  // offload 모드에서 compute는 top-level filter index를 직접 읽을 일이 없어서
+  // cache lookup만 하면 항상 miss -> 모든 파일이 RPC로 감.
+  // top-level은 SST당 한 번만 읽고 block cache에 올리면 되므로 여기서 읽음
+  // (read_tier가 kBlockCacheTier면 GetOrReadFilterBlock이 I/O 없이 실패함).
   CachableEntry<Block_kFilterPartitionIndex> filter_block;
-  if (HasFilterBlockLoaded()) {
-    GetLoadedFilterBlock(&filter_block);
-  } else {
-    Status s = table()->LookupAndPinBlocksInCache(
-        read_options, table()->get_rep()->filter_handle, &filter_block);
-    if (!s.ok() || filter_block.GetValue() == nullptr) {
-      return false;
-    }
+  BlockCacheLookupContext lookup_context{TableReaderCaller::kUserGet};
+  Status s = GetOrReadFilterBlock(nullptr /* get_context */, &lookup_context,
+                                  &filter_block, read_options);
+  if (!s.ok() || filter_block.GetValue() == nullptr) {
+    return false;
   }
 
   if (filter_block.GetValue()->size() == 0) {
