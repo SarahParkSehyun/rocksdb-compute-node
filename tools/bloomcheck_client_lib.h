@@ -1332,21 +1332,31 @@ class BloomCheckServiceClient {
 
     bool IsFinished() const { return finished_; }
     bool IsCancelled() const { return cancelled_; }
+    // Wait() 이후 유효: submit -> 응답 도착(CQ poller signal), Wait()에서 블록된 시간
+    uint64_t rtt_us() const { return rtt_us_; }
+    uint64_t blocked_us() const { return blocked_us_; }
+    // submit -> Wait() 진입: RPC가 날아가는 동안 로컬 탐색에 쓴 시간
+    uint64_t lead_us() const { return lead_us_; }
 
     // Blocks until the RPC completes. Returns false on RPC failure.
     bool Wait(bloomcheck::BatchResponse* response) {
       if (finished_) {
         return false;
       }
+      const uint64_t wait_begin_us = BloomNowMicros();
+      lead_us_ = wait_begin_us - submit_us_;
       bool ok = false;
+      uint64_t signal_us = 0;
       if (unary_) {
         unary_->Wait();
+        signal_us = unary_->signal_us_.load(std::memory_order_acquire);
         ok = unary_->status_.ok();
         if (ok) {
           *response = std::move(unary_->response_);
         }
       } else if (stream_) {
         ok = stream_->Wait();
+        signal_us = stream_->signal_us.load(std::memory_order_acquire);
         if (ok) {
           response->Clear();
           auto* out = response->add_resps();
@@ -1365,6 +1375,9 @@ class BloomCheckServiceClient {
           }
         }
       }
+      const uint64_t wait_end_us = BloomNowMicros();
+      blocked_us_ = wait_end_us - wait_begin_us;
+      rtt_us_ = (signal_us > submit_us_) ? signal_us - submit_us_ : 0;
       Finish();
       return ok;
     }
@@ -1405,6 +1418,10 @@ class BloomCheckServiceClient {
     std::unique_ptr<InflightGuard> inflight_guard_;
     std::atomic<uint64_t>* completed_total_ = nullptr;
     Semaphore* semaphore_ = nullptr;
+    uint64_t submit_us_ = 0;
+    uint64_t rtt_us_ = 0;
+    uint64_t blocked_us_ = 0;
+    uint64_t lead_us_ = 0;
     bool finished_ = false;
     bool cancelled_ = false;
   };
@@ -1414,6 +1431,7 @@ class BloomCheckServiceClient {
   std::unique_ptr<PendingCheck> StartCheckBatch(
       const bloomcheck::BatchRequest& request, size_t* channel_idx = nullptr) {
     std::unique_ptr<PendingCheck> pending(new PendingCheck());
+    pending->submit_us_ = BloomNowMicros();
     if (inflight_semaphore_) {
       inflight_semaphore_->Acquire();
       pending->semaphore_ = inflight_semaphore_.get();

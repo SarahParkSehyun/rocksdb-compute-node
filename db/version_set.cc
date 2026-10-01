@@ -2713,6 +2713,11 @@ struct LazyBloomCheckStats {
   std::atomic<uint64_t> hit_local_after_wait{0};
   std::atomic<uint64_t> hit_rpc_file{0};
   std::atomic<uint64_t> hit_local_no_rpc{0};
+  // Wait()한 RPC 기준 누적 시간(us)
+  std::atomic<uint64_t> rpc_rtt_us{0};      // submit -> 응답 도착
+  std::atomic<uint64_t> rpc_lead_us{0};     // submit -> Wait 진입 (로컬 탐색)
+  std::atomic<uint64_t> rpc_blocked_us{0};  // Wait에서 실제로 블록된 시간
+  std::atomic<uint64_t> rpc_ready_at_wait{0};  // Wait 진입 시 이미 도착(블록<5us)
 };
 
 LazyBloomCheckStats& GetLazyBloomCheckStats() {
@@ -2737,15 +2742,26 @@ void MaybePrintLazyBloomCheckStats(uint64_t gets) {
   auto ld = [](const std::atomic<uint64_t>& v) {
     return static_cast<unsigned long long>(v.load(std::memory_order_relaxed));
   };
+  const double waited =
+      static_cast<double>(s.rpc_waited.load(std::memory_order_relaxed));
+  auto avg = [&](const std::atomic<uint64_t>& v) {
+    return waited > 0
+               ? static_cast<double>(v.load(std::memory_order_relaxed)) / waited
+               : 0.0;
+  };
   fprintf(stderr,
           "[LazyBloomCheck] gets=%llu no_rpc=%llu rpc_sent=%llu "
           "rpc_waited=%llu rpc_cancelled=%llu local_files=%llu rpc_files=%llu "
           "hit_local_no_rpc=%llu hit_local_before_wait=%llu "
-          "hit_local_after_wait=%llu hit_rpc_file=%llu\n",
+          "hit_local_after_wait=%llu hit_rpc_file=%llu "
+          "rpc_rtt_avg_us=%.1f rpc_lead_avg_us=%.1f rpc_blocked_avg_us=%.1f "
+          "rpc_ready_at_wait=%llu\n",
           ld(s.gets), ld(s.no_rpc), ld(s.rpc_sent), ld(s.rpc_waited),
           ld(s.rpc_cancelled), ld(s.local_files), ld(s.rpc_files),
           ld(s.hit_local_no_rpc), ld(s.hit_local_before_wait),
-          ld(s.hit_local_after_wait), ld(s.hit_rpc_file));
+          ld(s.hit_local_after_wait), ld(s.hit_rpc_file),
+          avg(s.rpc_rtt_us), avg(s.rpc_lead_us), avg(s.rpc_blocked_us),
+          ld(s.rpc_ready_at_wait));
 }
 }  // namespace
 
@@ -3051,8 +3067,17 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       bloomcheck::BatchResponse response;
       bool check_ok = pending_bloomcheck->Wait(&response);
       if (lazy_stats_guard.active) {
-        GetLazyBloomCheckStats().rpc_waited.fetch_add(
-            1, std::memory_order_relaxed);
+        auto& s = GetLazyBloomCheckStats();
+        s.rpc_waited.fetch_add(1, std::memory_order_relaxed);
+        s.rpc_rtt_us.fetch_add(pending_bloomcheck->rtt_us(),
+                               std::memory_order_relaxed);
+        s.rpc_lead_us.fetch_add(pending_bloomcheck->lead_us(),
+                                std::memory_order_relaxed);
+        s.rpc_blocked_us.fetch_add(pending_bloomcheck->blocked_us(),
+                                   std::memory_order_relaxed);
+        if (pending_bloomcheck->blocked_us() < 5) {
+          s.rpc_ready_at_wait.fetch_add(1, std::memory_order_relaxed);
+        }
       }
       if (check_ok && response.resps_size() == 1) {
         const auto& key_resp = response.resps(0);
