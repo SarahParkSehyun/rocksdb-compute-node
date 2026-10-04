@@ -2718,6 +2718,10 @@ struct LazyBloomCheckStats {
   std::atomic<uint64_t> rpc_lead_us{0};     // submit -> Wait 진입 (로컬 탐색)
   std::atomic<uint64_t> rpc_blocked_us{0};  // Wait에서 실제로 블록된 시간
   std::atomic<uint64_t> rpc_ready_at_wait{0};  // Wait 진입 시 이미 도착(블록<5us)
+  // RPC 후보가 BLOOMCHECK_MIN_RPC_FILES 미만이라 RPC 없이 baseline처럼 처리
+  std::atomic<uint64_t> rpc_skipped_below_min{0};  // Get 단위
+  std::atomic<uint64_t> fallback_files{0};         // 파일 단위
+  std::atomic<uint64_t> hit_fallback_file{0};
 };
 
 LazyBloomCheckStats& GetLazyBloomCheckStats() {
@@ -2731,6 +2735,22 @@ uint64_t LazyBloomCheckStatsInterval() {
     return env != nullptr ? std::strtoull(env, nullptr, 10) : 0;
   }();
   return interval;
+}
+
+// RPC 후보(캐시에 filter partition이 없는 SST)가 이 값 미만이면 RPC를 보내지
+// 않고 그 SST들을 baseline처럼 로컬에서 읽음. 기본 1 = 후보가 있으면 항상 RPC
+size_t BloomCheckMinRpcFiles() {
+  static const size_t min_files = []() -> size_t {
+    const char* env = std::getenv("BLOOMCHECK_MIN_RPC_FILES");
+    if (env != nullptr) {
+      unsigned long long v = std::strtoull(env, nullptr, 10);
+      if (v > 0) {
+        return static_cast<size_t>(v);
+      }
+    }
+    return 1;
+  }();
+  return min_files;
 }
 
 void MaybePrintLazyBloomCheckStats(uint64_t gets) {
@@ -2755,13 +2775,16 @@ void MaybePrintLazyBloomCheckStats(uint64_t gets) {
           "hit_local_no_rpc=%llu hit_local_before_wait=%llu "
           "hit_local_after_wait=%llu hit_rpc_file=%llu "
           "rpc_rtt_avg_us=%.1f rpc_lead_avg_us=%.1f rpc_blocked_avg_us=%.1f "
-          "rpc_ready_at_wait=%llu\n",
+          "rpc_ready_at_wait=%llu min_rpc_files=%zu rpc_skipped_below_min=%llu "
+          "fallback_files=%llu hit_fallback_file=%llu\n",
           ld(s.gets), ld(s.no_rpc), ld(s.rpc_sent), ld(s.rpc_waited),
           ld(s.rpc_cancelled), ld(s.local_files), ld(s.rpc_files),
           ld(s.hit_local_no_rpc), ld(s.hit_local_before_wait),
           ld(s.hit_local_after_wait), ld(s.hit_rpc_file),
           avg(s.rpc_rtt_us), avg(s.rpc_lead_us), avg(s.rpc_blocked_us),
-          ld(s.rpc_ready_at_wait));
+          ld(s.rpc_ready_at_wait), BloomCheckMinRpcFiles(),
+          ld(s.rpc_skipped_below_min), ld(s.fallback_files),
+          ld(s.hit_fallback_file));
 }
 }  // namespace
 
@@ -2843,12 +2866,15 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   struct LazyStatsGuard {
     const std::unique_ptr<BloomCheckServiceClient::PendingCheck>& pending;
     bool active = false;
+    bool skipped_below_min = false;
     ~LazyStatsGuard() {
       if (!active) {
         return;
       }
       auto& s = GetLazyBloomCheckStats();
-      if (pending == nullptr) {
+      if (skipped_below_min) {
+        s.rpc_skipped_below_min.fetch_add(1, std::memory_order_relaxed);
+      } else if (pending == nullptr) {
         s.no_rpc.fetch_add(1, std::memory_order_relaxed);
       } else if (!pending->IsFinished()) {
         s.rpc_cancelled.fetch_add(1, std::memory_order_relaxed);
@@ -2999,6 +3025,13 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
               : static_cast<size_t>(0),
           candidate_file_numbers_for_rpc.size());
     }
+    // RPC 후보가 BLOOMCHECK_MIN_RPC_FILES 미만이면 RPC를 보내지 않음.
+    // 그 SST들은 rpc_candidate_files에 안 들어가므로 아래 탐색에서
+    // skip_filters 없이 table_cache_->Get()을 타서 baseline과 같은 경로
+    // (block cache 조회 -> miss면 로컬 read)로 filter를 확인함
+    const bool skip_rpc_below_min =
+        !candidate_file_numbers_for_rpc.empty() &&
+        candidate_file_numbers_for_rpc.size() < BloomCheckMinRpcFiles();
     if (lazy_stats_enabled) {
       auto& s = GetLazyBloomCheckStats();
       lazy_stats_guard.active = true;
@@ -3006,11 +3039,20 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                                   ? local_filter_cached_files->size()
                                   : 0,
                               std::memory_order_relaxed);
-      s.rpc_files.fetch_add(candidate_file_numbers_for_rpc.size(),
-                            std::memory_order_relaxed);
-      if (!candidate_file_numbers_for_rpc.empty()) {
-        s.rpc_sent.fetch_add(1, std::memory_order_relaxed);
+      if (skip_rpc_below_min) {
+        lazy_stats_guard.skipped_below_min = true;
+        s.fallback_files.fetch_add(candidate_file_numbers_for_rpc.size(),
+                                   std::memory_order_relaxed);
+      } else {
+        s.rpc_files.fetch_add(candidate_file_numbers_for_rpc.size(),
+                              std::memory_order_relaxed);
+        if (!candidate_file_numbers_for_rpc.empty()) {
+          s.rpc_sent.fetch_add(1, std::memory_order_relaxed);
+        }
       }
+    }
+    if (skip_rpc_below_min) {
+      candidate_file_numbers_for_rpc.clear();
     }
 
     // 단일 키 gRPC 호출: 비동기로 보내기만 하고 여기서 기다리지 않음.
@@ -3174,7 +3216,9 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         (get_context.State() == GetContext::kFound ||
          get_context.State() == GetContext::kDeleted)) {
       auto& s = GetLazyBloomCheckStats();
-      if (!use_local_filter_cache) {
+      if (!use_local_filter_cache && lazy_stats_guard.skipped_below_min) {
+        s.hit_fallback_file.fetch_add(1, std::memory_order_relaxed);
+      } else if (!use_local_filter_cache) {
         s.hit_rpc_file.fetch_add(1, std::memory_order_relaxed);
       } else if (pending_bloomcheck == nullptr) {
         s.hit_local_no_rpc.fetch_add(1, std::memory_order_relaxed);
